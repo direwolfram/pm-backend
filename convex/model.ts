@@ -37,11 +37,21 @@ export type PaymentStatus =
 export type PromotionKind = "banner" | "carousel" | "coupon" | "product_discount";
 export type DiscountType = "percent" | "fixed" | "free_delivery";
 export type HomeSectionKind =
-  | "product_carousel"
-  | "category_grid"
+  | "header"
+  | "search_bar"
+  | "category_tabs"
+  | "hero_banner"
   | "bestseller_grid"
   | "promo_banner"
-  | "shopping_list_card";
+  | "promo_carousel"
+  | "shopping_list_card"
+  | "category_grid"
+  | "themed_product_section"
+  | "product_carousel"
+  | "featured_products"
+  | "store_inventory_section"
+  | "custom_cta"
+  | "spacer";
 export type SupportTicketStatus =
   | "open"
   | "waiting_for_customer"
@@ -136,7 +146,9 @@ export interface ProductAttribute {
 }
 
 export interface ProductDoc extends BaseDoc {
+  sku?: string;
   brand_id?: string;
+  categoryId?: string;
   primary_category_id: string;
   name: string;
   slug: string;
@@ -144,6 +156,23 @@ export interface ProductDoc extends BaseDoc {
   status: ProductStatus;
   tag?: string;
   pack_type?: string;
+  brand?: string;
+  basePrice?: number;
+  weightKg?: number;
+  volumeL?: number;
+  isFragile?: boolean;
+  isFlammable?: boolean;
+  temperatureZone?: "ambient" | "chilled" | "frozen";
+  packagingType?: string;
+  isFreshProduce?: boolean;
+  isReturnable?: boolean;
+  searchKeywords?: string[];
+  images?: string[];
+  substituteSkuIds?: string[];
+  substitutePriority?: number;
+  allowSubstitution?: boolean;
+  isExpressAvailable?: boolean;
+  isFrequentlyBought?: boolean;
   shelf_life?: string;
   flavour?: string;
   finish?: string;
@@ -162,8 +191,10 @@ export interface ProductDoc extends BaseDoc {
 export interface ProductMediaDoc extends BaseDoc {
   product_id: string;
   url: string;
+  storage_id?: string;
   alt_text?: string;
   dominant_color?: string;
+  is_showcase?: boolean;
   sort_order: number;
 }
 
@@ -232,11 +263,65 @@ export interface PromotionTargetDoc extends BaseDoc {
 }
 
 export interface HomeSectionDoc extends BaseDoc {
-  title: string;
+  id?: string;
+  key?: string;
   kind: HomeSectionKind;
+  title?: string;
+  subtitle?: string;
   tab: string;
-  sort_order: number;
-  is_active: boolean;
+  sortOrder?: number;
+  isActive?: boolean;
+  allowEmpty?: boolean;
+  startsAt?: number;
+  endsAt?: number;
+  timezone?: string;
+  visibleDaysOfWeek?: number[];
+  visibleTimeWindows?: { start: string; end: string }[];
+  holidayTags?: string[];
+  seasonalTags?: string[];
+  storeIds?: string[];
+  cityIds?: string[];
+  regionIds?: string[];
+  customerSegments?: string[];
+  appVersion?: string;
+  minAppVersion?: string;
+  maxAppVersion?: string;
+  layoutVariant?: string;
+  backgroundColor?: string;
+  textColor?: string;
+  imageUrl?: string;
+  iconEmoji?: string;
+  maxItems?: number;
+  productIds?: string[];
+  categoryIds?: string[];
+  promotionIds?: string[];
+  brandIds?: string[];
+  config?: Record<string, unknown>;
+  resolvedData?: Record<string, unknown>;
+  createdAt?: number;
+  updatedAt?: number;
+  archivedAt?: number;
+  sort_order?: number;
+  is_active?: boolean;
+}
+
+export interface HomeSectionResponse {
+  id: string;
+  key: string;
+  kind: HomeSectionKind;
+  title?: string;
+  subtitle?: string;
+  tab: string;
+  sortOrder: number;
+  layoutVariant?: string;
+  config: Record<string, unknown>;
+  resolvedData: Record<string, unknown> & {
+    products?: Array<ProductDoc | Record<string, unknown>>;
+    categories?: Array<CategoryDoc | Record<string, unknown>>;
+    promotions?: Array<PromotionDoc | Record<string, unknown>>;
+    stores?: Array<StoreDoc | Record<string, unknown>>;
+    inventorySummary?: Record<string, unknown>;
+  };
 }
 
 export interface HomeSectionItemDoc extends BaseDoc {

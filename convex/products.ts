@@ -1,6 +1,7 @@
 import { v } from "convex/values";
 import { query, mutation } from "./functions";
 import { now, paginate, slugify } from "./helpers";
+import type { Id } from "./_generated/dataModel";
 import type {
   InventoryDoc,
   PriceDoc,
@@ -16,6 +17,15 @@ const productStatus = v.union(
   v.literal("hidden"),
   v.literal("discontinued"),
 );
+
+const dummyProductImageColors = ["F7C948", "90CDF4", "C6F6D5", "FBB6CE"];
+
+function dummyImagesForProduct(name: string) {
+  return dummyProductImageColors.map((color, index) => {
+    const label = index === 0 ? `${name} Showcase` : `${name} Slide ${index + 1}`;
+    return `https://placehold.co/800x800/${color}/111827?text=${encodeURIComponent(label)}`;
+  });
+}
 
 export const list = query({
   args: {
@@ -84,6 +94,7 @@ export const list = query({
     }
     const stockBySku = new Map<string, number>();
     for (const i of inventory as InventoryDoc[]) {
+      if (i.sku_id === undefined || i.quantity_available === undefined) continue;
       stockBySku.set(i.sku_id, (stockBySku.get(i.sku_id) ?? 0) + i.quantity_available);
     }
 
@@ -107,6 +118,7 @@ export const list = query({
       return {
         ...p,
         brand_name: p.brand_id ? brandName.get(p.brand_id) : undefined,
+        brand: p.brand,
         category_name: catName.get(p.primary_category_id),
         sku_count: pSkus.length,
         default_sku_id: def?._id,
@@ -129,6 +141,13 @@ export const get = query({
       .withIndex("by_product", (q) => q.eq("product_id", args.id))
       .collect()) as ProductMediaDoc[];
     media.sort((a, b) => a.sort_order - b.sort_order);
+    const resolvedMedia = await Promise.all(
+      media.map(async (item) => {
+        if (!item.storage_id) return item;
+        const url = await ctx.storage.getUrl(item.storage_id as Id<"_storage">);
+        return { ...item, url: url ?? item.url };
+      }),
+    );
     const similarPairs = await ctx.db
       .query("product_similar_products")
       .withIndex("by_product", (q) => q.eq("product_id", args.id))
@@ -136,7 +155,7 @@ export const get = query({
     const similarIds = similarPairs.map((p) => p.similar_product_id as string);
     const similar: ProductDoc[] = [];
     for (const sid of similarIds) {
-      const sp = (await ctx.db.get(sid as any)) as ProductDoc | null;
+      const sp = (await ctx.db.get(sid as Id<"products">)) as ProductDoc | null;
       if (sp) similar.push(sp);
     }
     const skus = (await ctx.db
@@ -144,11 +163,11 @@ export const get = query({
       .withIndex("by_product", (q) => q.eq("product_id", args.id))
       .collect()) as SkuDoc[];
     skus.sort((a, b) => a.sort_order - b.sort_order);
-    const brand = product.brand_id ? await ctx.db.get(product.brand_id as any) : null;
-    const category = await ctx.db.get(product.primary_category_id as any);
+    const brand = product.brand_id ? await ctx.db.get(product.brand_id as Id<"brands">) : null;
+    const category = await ctx.db.get(product.primary_category_id as Id<"categories">);
     return {
       ...product,
-      media,
+      media: resolvedMedia,
       similar,
       skus,
       brand_name: (brand as { name?: string } | null)?.name,
@@ -158,7 +177,9 @@ export const get = query({
 });
 
 const productFields = {
+  sku: v.optional(v.string()),
   brand_id: v.optional(v.id("brands")),
+  categoryId: v.optional(v.id("categories")),
   primary_category_id: v.id("categories"),
   name: v.string(),
   slug: v.optional(v.string()),
@@ -166,6 +187,25 @@ const productFields = {
   status: v.optional(productStatus),
   tag: v.optional(v.string()),
   pack_type: v.optional(v.string()),
+  brand: v.optional(v.string()),
+  basePrice: v.optional(v.number()),
+  weightKg: v.optional(v.number()),
+  volumeL: v.optional(v.number()),
+  isFragile: v.optional(v.boolean()),
+  isFlammable: v.optional(v.boolean()),
+  temperatureZone: v.optional(
+    v.union(v.literal("ambient"), v.literal("chilled"), v.literal("frozen")),
+  ),
+  packagingType: v.optional(v.string()),
+  isFreshProduce: v.optional(v.boolean()),
+  isReturnable: v.optional(v.boolean()),
+  searchKeywords: v.optional(v.array(v.string())),
+  images: v.optional(v.array(v.string())),
+  substituteSkuIds: v.optional(v.array(v.string())),
+  substitutePriority: v.optional(v.number()),
+  allowSubstitution: v.optional(v.boolean()),
+  isExpressAvailable: v.optional(v.boolean()),
+  isFrequentlyBought: v.optional(v.boolean()),
   shelf_life: v.optional(v.string()),
   flavour: v.optional(v.string()),
   finish: v.optional(v.string()),
@@ -192,7 +232,9 @@ export const create = mutation({
     const category = await ctx.db.get(args.primary_category_id);
     if (!category) throw new Error("Category not found");
     return await ctx.db.insert("products", {
+      sku: args.sku,
       brand_id: args.brand_id,
+      categoryId: args.categoryId ?? args.primary_category_id,
       primary_category_id: args.primary_category_id,
       name: args.name,
       slug,
@@ -200,6 +242,23 @@ export const create = mutation({
       status: args.status ?? "draft",
       tag: args.tag,
       pack_type: args.pack_type,
+      brand: args.brand,
+      basePrice: args.basePrice,
+      weightKg: args.weightKg,
+      volumeL: args.volumeL,
+      isFragile: args.isFragile,
+      isFlammable: args.isFlammable,
+      temperatureZone: args.temperatureZone,
+      packagingType: args.packagingType,
+      isFreshProduce: args.isFreshProduce,
+      isReturnable: args.isReturnable,
+      searchKeywords: args.searchKeywords,
+      images: args.images,
+      substituteSkuIds: args.substituteSkuIds,
+      substitutePriority: args.substitutePriority,
+      allowSubstitution: args.allowSubstitution,
+      isExpressAvailable: args.isExpressAvailable,
+      isFrequentlyBought: args.isFrequentlyBought,
       shelf_life: args.shelf_life,
       flavour: args.flavour,
       finish: args.finish,
@@ -235,7 +294,12 @@ export const update = mutation({
         .first();
       if (dup) throw new Error(`Slug "${patch.slug}" is already used`);
     }
-    await ctx.db.patch(id, { ...patch, updated_at: now() });
+    const categoryId = patch.categoryId ?? patch.primary_category_id;
+    await ctx.db.patch(id, {
+      ...patch,
+      ...(categoryId ? { categoryId } : {}),
+      updated_at: now(),
+    });
     return id;
   },
 });
@@ -299,26 +363,132 @@ export const remove = mutation({
 export const addMedia = mutation({
   args: {
     product_id: v.id("products"),
-    url: v.string(),
+    url: v.optional(v.string()),
+    storage_id: v.optional(v.id("_storage")),
     alt_text: v.optional(v.string()),
     dominant_color: v.optional(v.string()),
+    is_showcase: v.optional(v.boolean()),
     sort_order: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
+    if (!args.url && !args.storage_id) throw new Error("Media needs a URL or uploaded file");
+    const existing = await ctx.db
+      .query("product_media")
+      .withIndex("by_product", (q) => q.eq("product_id", args.product_id))
+      .collect();
+    const shouldShowcase = args.is_showcase ?? existing.length === 0;
+    if (shouldShowcase) {
+      for (const media of existing) {
+        await ctx.db.patch(media._id, { is_showcase: false });
+      }
+    }
+    const url = args.url ?? "";
     return await ctx.db.insert("product_media", {
       product_id: args.product_id,
-      url: args.url,
+      url,
+      storage_id: args.storage_id,
       alt_text: args.alt_text,
       dominant_color: args.dominant_color,
-      sort_order: args.sort_order ?? 0,
+      is_showcase: shouldShowcase,
+      sort_order: args.sort_order ?? existing.length,
     });
+  },
+});
+
+export const generateUploadUrl = mutation({
+  args: {},
+  handler: async (ctx) => {
+    return await ctx.storage.generateUploadUrl();
+  },
+});
+
+export const setShowcaseMedia = mutation({
+  args: { product_id: v.id("products"), media_id: v.id("product_media") },
+  handler: async (ctx, args) => {
+    const rows = await ctx.db
+      .query("product_media")
+      .withIndex("by_product", (q) => q.eq("product_id", args.product_id))
+      .collect();
+    if (!rows.some((row) => row._id === args.media_id)) {
+      throw new Error("Media does not belong to this product");
+    }
+    for (const row of rows) {
+      await ctx.db.patch(row._id, { is_showcase: row._id === args.media_id });
+    }
+    return args.media_id;
+  },
+});
+
+export const upsertDummyImages = mutation({
+  args: {},
+  handler: async (ctx) => {
+    const timestamp = now();
+    const products = ((await ctx.db.query("products").collect()) as ProductDoc[])
+      .sort((a, b) => a.name.localeCompare(b.name));
+    const media = (await ctx.db.query("product_media").collect()) as ProductMediaDoc[];
+    const mediaByProduct = new Map<string, ProductMediaDoc[]>();
+    for (const item of media) {
+      const items = mediaByProduct.get(item.product_id) ?? [];
+      items.push(item);
+      mediaByProduct.set(item.product_id, items);
+    }
+
+    let productsUpdated = 0;
+    let mediaInserted = 0;
+    let mediaUpdated = 0;
+    for (const product of products) {
+      const images = dummyImagesForProduct(product.name);
+      await ctx.db.patch(product._id as Id<"products">, {
+        images,
+        updated_at: timestamp,
+      });
+      productsUpdated += 1;
+
+      const existing = mediaByProduct.get(product._id) ?? [];
+      for (const item of existing) {
+        if (item.is_showcase) {
+          await ctx.db.patch(item._id as Id<"product_media">, { is_showcase: false });
+          mediaUpdated += 1;
+        }
+      }
+      for (const [index, url] of images.entries()) {
+        const match = existing.find((item) => item.url === url);
+        const patch = {
+          alt_text: `${product.name} image ${index + 1}`,
+          is_showcase: index === 0,
+          sort_order: index,
+        };
+        if (match) {
+          await ctx.db.patch(match._id as Id<"product_media">, patch);
+          mediaUpdated += 1;
+        } else {
+          await ctx.db.insert("product_media", {
+            product_id: product._id as Id<"products">,
+            url,
+            ...patch,
+          });
+          mediaInserted += 1;
+        }
+      }
+    }
+
+    return { productsUpdated, mediaInserted, mediaUpdated };
   },
 });
 
 export const removeMedia = mutation({
   args: { id: v.id("product_media") },
   handler: async (ctx, args) => {
+    const media = (await ctx.db.get(args.id)) as ProductMediaDoc | null;
+    if (!media) return;
     await ctx.db.delete(args.id);
+    if (!media.is_showcase) return;
+    const next = await ctx.db
+      .query("product_media")
+      .withIndex("by_product", (q) => q.eq("product_id", media.product_id as Id<"products">))
+      .collect();
+    next.sort((a, b) => a.sort_order - b.sort_order);
+    if (next[0]) await ctx.db.patch(next[0]._id, { is_showcase: true });
   },
 });
 

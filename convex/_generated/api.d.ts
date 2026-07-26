@@ -10,20 +10,27 @@
 
 import type * as brands from "../brands.js";
 import type * as categories from "../categories.js";
+import type * as crons from "../crons.js";
 import type * as customers from "../customers.js";
 import type * as dashboard from "../dashboard.js";
 import type * as functions from "../functions.js";
 import type * as helpers from "../helpers.js";
 import type * as homeSections from "../homeSections.js";
 import type * as inventory from "../inventory.js";
+import type * as lib_geo from "../lib/geo.js";
+import type * as lib_inventoryMath from "../lib/inventoryMath.js";
+import type * as lib_pricing from "../lib/pricing.js";
 import type * as model from "../model.js";
 import type * as orders from "../orders.js";
 import type * as prices from "../prices.js";
 import type * as products from "../products.js";
 import type * as promotions from "../promotions.js";
+import type * as quickInventory from "../quickInventory.js";
+import type * as quickInventorySeed from "../quickInventorySeed.js";
 import type * as seed from "../seed.js";
 import type * as skus from "../skus.js";
 import type * as stores from "../stores.js";
+import type * as types_inventory from "../types/inventory.js";
 
 import type {
   ApiFromModules,
@@ -34,20 +41,27 @@ import type {
 declare const fullApi: ApiFromModules<{
   brands: typeof brands;
   categories: typeof categories;
+  crons: typeof crons;
   customers: typeof customers;
   dashboard: typeof dashboard;
   functions: typeof functions;
   helpers: typeof helpers;
   homeSections: typeof homeSections;
   inventory: typeof inventory;
+  "lib/geo": typeof lib_geo;
+  "lib/inventoryMath": typeof lib_inventoryMath;
+  "lib/pricing": typeof lib_pricing;
   model: typeof model;
   orders: typeof orders;
   prices: typeof prices;
   products: typeof products;
   promotions: typeof promotions;
+  quickInventory: typeof quickInventory;
+  quickInventorySeed: typeof quickInventorySeed;
   seed: typeof seed;
   skus: typeof skus;
   stores: typeof stores;
+  "types/inventory": typeof types_inventory;
 }>;
 
 /**

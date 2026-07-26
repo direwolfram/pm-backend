@@ -132,6 +132,7 @@ export const run = mutation({
       color: string;
       tag?: string;
       flavour?: string;
+      images?: string[];
       rating: number;
       ratingCount: number;
       skus: {
@@ -144,6 +145,17 @@ export const run = mutation({
         isDefault?: boolean;
       }[];
     }
+    const dummyProductImages = [
+      "F7C948",
+      "90CDF4",
+      "C6F6D5",
+      "FBB6CE",
+    ];
+    const dummyImagesForProduct = (name: string) =>
+      dummyProductImages.map((color, imageIndex) => {
+        const label = imageIndex === 0 ? `${name} Showcase` : `${name} Slide ${imageIndex + 1}`;
+        return `https://placehold.co/800x800/${color}/111827?text=${encodeURIComponent(label)}`;
+      });
     const P = (p: SeedProduct) => p;
     const products: SeedProduct[] = [
       P({
@@ -287,6 +299,7 @@ export const run = mutation({
     const productIds: Record<string, string> = {};
     const firstSkuByProduct: Record<string, string> = {};
     for (const p of products) {
+      const images = p.images ?? dummyImagesForProduct(p.name);
       const pid = (await ctx.db.insert("products", {
         brand_id: p.brand ? brandIds[p.brand] : undefined,
         primary_category_id: p.category,
@@ -297,6 +310,7 @@ export const run = mutation({
         flavour: p.flavour,
         icon_emoji: p.emoji,
         image_color: p.color,
+        images,
         rating_average: p.rating,
         rating_count: p.ratingCount,
         attributes: [],
@@ -304,6 +318,15 @@ export const run = mutation({
         updated_at: t,
       })) as string;
       productIds[p.name] = pid;
+      for (const [mediaIndex, image] of images.entries()) {
+        await ctx.db.insert("product_media", {
+          product_id: pid,
+          url: image,
+          alt_text: `${p.name} image ${mediaIndex + 1}`,
+          is_showcase: mediaIndex === 0,
+          sort_order: mediaIndex,
+        });
+      }
       for (const [i, s] of p.skus.entries()) {
         const skuId = (await ctx.db.insert("skus", {
           product_id: pid,
@@ -416,54 +439,306 @@ export const run = mutation({
     });
 
     // ---- Home sections ----
-    const secBanners = (await ctx.db.insert("home_sections", {
-      title: "Featured promos",
-      kind: "promo_banner",
-      tab: "All",
-      sort_order: 0,
-      is_active: true,
-    })) as string;
-    for (const [i, pid] of [promoBanner, promoCoupon, promoFreeDelivery].entries()) {
-      await ctx.db.insert("home_section_items", {
-        section_id: secBanners,
-        promotion_id: pid,
-        sort_order: i,
+    const insertSection = async (section: Record<string, unknown>) => {
+      const id = await ctx.db.insert("home_sections", {
+        allowEmpty: false,
+        timezone: "Asia/Manila",
+        createdAt: t,
+        updatedAt: t,
+        ...section,
+        isActive: true,
       });
-    }
-    const secCats = (await ctx.db.insert("home_sections", {
-      title: "Shop by category",
-      kind: "category_grid",
+      await ctx.db.patch(id, { id });
+      return id;
+    };
+    const promoIds = [promoBanner, promoCoupon, promoFreeDelivery, promoCoke];
+    await insertSection({
+      key: "header_default",
+      kind: "header",
+      title: "Header",
       tab: "All",
-      sort_order: 1,
-      is_active: true,
-    })) as string;
-    for (const [i, cid] of [beverages, pantry, snacks, personalCare, household].entries()) {
-      await ctx.db.insert("home_section_items", {
-        section_id: secCats,
-        category_id: cid,
-        sort_order: i,
-      });
-    }
-    const secBest = (await ctx.db.insert("home_sections", {
-      title: "Bestsellers",
+      sortOrder: 0,
+      config: {
+        showLocation: true,
+        showProfile: true,
+        showCart: true,
+        variant: "default",
+      },
+    });
+    await insertSection({
+      key: "search_bar_default",
+      kind: "search_bar",
+      title: "Search",
+      tab: "All",
+      sortOrder: 10,
+      config: {
+        placeholder: "Search for groceries",
+        showMic: true,
+        showScanner: true,
+        stickyOnScroll: true,
+        variant: "rounded",
+      },
+    });
+    await insertSection({
+      key: "category_tabs_default",
+      kind: "category_tabs",
+      title: "Tabs",
+      tab: "All",
+      sortOrder: 20,
+      categoryIds: [beverages, pantry, snacks, personalCare, household],
+      config: {
+        tabs: ["All", "Grocery", "Snacks", "Beauty"],
+        defaultTab: "All",
+        stickyOnScroll: true,
+        variant: "pill",
+      },
+    });
+    await insertSection({
+      key: "hero_default",
+      kind: "hero_banner",
+      title: "Fresh groceries in minutes",
+      subtitle: "Daily essentials delivered fast.",
+      tab: "All",
+      sortOrder: 30,
+      layoutVariant: "wide",
+      imageUrl: "https://images.unsplash.com/photo-1542838132-92c53300491e",
+      config: {
+        title: "Fresh groceries in minutes",
+        subtitle: "Daily essentials delivered fast.",
+        imageUrl: "https://images.unsplash.com/photo-1542838132-92c53300491e",
+        ctaLabel: "Shop now",
+        ctaRoute: "/categories",
+        variant: "wide",
+      },
+    });
+    await insertSection({
+      key: "bestsellers_default",
       kind: "bestseller_grid",
+      title: "Bestsellers",
       tab: "All",
-      sort_order: 2,
-      is_active: true,
-    })) as string;
-    for (const [i, name] of [
-      "Lucky Me Pancit Canton Original",
-      "Nescafé Classic 3-in-1 Coffee",
-      "Coca-Cola Soft Drink",
-      "Milo Chocolate Malt Drink",
-    ].entries()) {
-      await ctx.db.insert("home_section_items", {
-        section_id: secBest,
-        product_id: productIds[name],
-        sort_order: i,
-      });
-    }
-
+      sortOrder: 40,
+      maxItems: 8,
+      productIds: [
+        productIds["Lucky Me Pancit Canton Original"],
+        productIds["Nescafé Classic 3-in-1 Coffee"],
+        productIds["Coca-Cola Soft Drink"],
+        productIds["Milo Chocolate Malt Drink"],
+      ],
+      config: { columns: 2, showMoreCount: 4, maxItems: 8 },
+    });
+    await insertSection({
+      key: "promo_banner_match_time",
+      kind: "promo_banner",
+      title: "Match time deals",
+      tab: "All",
+      sortOrder: 50,
+      promotionIds: [promoBanner],
+      backgroundColor: "#B71C1C",
+      visibleTimeWindows: [{ start: "17:00", end: "23:59" }],
+      config: {
+        promotionIds: [promoBanner],
+        title: "Match time deals",
+        subtitle: "Snacks and drinks for tonight.",
+        backgroundColor: "#B71C1C",
+        ctaLabel: "Grab deals",
+        ctaRoute: "/promotions",
+      },
+    });
+    await insertSection({
+      key: "promo_carousel_default",
+      kind: "promo_carousel",
+      title: "Promos",
+      tab: "All",
+      sortOrder: 60,
+      promotionIds: promoIds,
+      config: {
+        promotionIds: promoIds,
+        autoplay: true,
+        autoplayIntervalMs: 4500,
+        loop: true,
+        cardVariant: "compact",
+      },
+    });
+    await insertSection({
+      key: "shopping_list_card_default",
+      kind: "shopping_list_card",
+      title: "Shopping list",
+      tab: "All",
+      sortOrder: 70,
+      config: {
+        title: "Build your basket faster",
+        subtitle: "Paste a list and we will find matches.",
+        ctaLabel: "Open list",
+        ctaRoute: "/shopping-list",
+        iconName: "list-plus",
+      },
+    });
+    await insertSection({
+      key: "grocery_category_grid",
+      kind: "category_grid",
+      title: "Grocery",
+      tab: "Grocery",
+      sortOrder: 80,
+      categoryIds: [beverages, pantry, noodles, canned],
+      maxItems: 8,
+      config: { columns: 4, sectionTitle: "Grocery", showIcons: true, maxItems: 8 },
+    });
+    await insertSection({
+      key: "snacks_category_grid",
+      kind: "category_grid",
+      title: "Snacks",
+      tab: "Snacks",
+      sortOrder: 90,
+      categoryIds: [snacks],
+      maxItems: 8,
+      config: { columns: 4, sectionTitle: "Snacks", showIcons: true, maxItems: 8 },
+    });
+    await insertSection({
+      key: "beauty_category_grid",
+      kind: "category_grid",
+      title: "Beauty",
+      tab: "Beauty",
+      sortOrder: 100,
+      categoryIds: [personalCare],
+      maxItems: 8,
+      config: { columns: 4, sectionTitle: "Beauty", showIcons: true, maxItems: 8 },
+    });
+    await insertSection({
+      key: "fresh_day_section",
+      kind: "themed_product_section",
+      title: "Fresh Day",
+      tab: "All",
+      sortOrder: 110,
+      backgroundColor: "#E8F5E9",
+      productIds: [
+        productIds["Del Monte Pineapple Juice"],
+        productIds["Milo Chocolate Malt Drink"],
+        productIds["Lady's Choice Real Mayonnaise"],
+      ],
+      maxItems: 6,
+      config: {
+        productIds: [
+          productIds["Del Monte Pineapple Juice"],
+          productIds["Milo Chocolate Malt Drink"],
+          productIds["Lady's Choice Real Mayonnaise"],
+        ],
+        themeName: "Fresh Day",
+        themeEmoji: "🌿",
+        backgroundColor: "#E8F5E9",
+        titleColor: "#1B5E20",
+        maxItems: 6,
+      },
+    });
+    await insertSection({
+      key: "sweet_tooth_products",
+      kind: "product_carousel",
+      title: "Sweet tooth",
+      tab: "Snacks",
+      sortOrder: 120,
+      productIds: [
+        productIds["Oreo Chocolate Sandwich Cookies"],
+        productIds["Milo Chocolate Malt Drink"],
+      ],
+      maxItems: 8,
+      config: {
+        title: "Sweet tooth",
+        showSeeAll: true,
+        seeAllRoute: "/categories/snacks",
+        maxItems: 8,
+      },
+    });
+    await insertSection({
+      key: "cold_drinks_products",
+      kind: "product_carousel",
+      title: "Cold drinks",
+      tab: "Grocery",
+      sortOrder: 130,
+      categoryIds: [softdrinks, juices],
+      maxItems: 8,
+      config: {
+        title: "Cold drinks",
+        showSeeAll: true,
+        seeAllRoute: "/categories/beverages",
+        maxItems: 8,
+      },
+    });
+    await insertSection({
+      key: "featured_products",
+      kind: "featured_products",
+      title: "Featured products",
+      tab: "All",
+      sortOrder: 140,
+      productIds: [
+        productIds["Coca-Cola Soft Drink"],
+        productIds["Lucky Me Pancit Canton Original"],
+        productIds["Argentina Corned Beef"],
+        productIds["Colgate Triple Action Toothpaste"],
+      ],
+      maxItems: 8,
+      config: {
+        title: "Featured products",
+        subtitle: "Picked for this week",
+        maxItems: 8,
+        showSeeAll: true,
+      },
+    });
+    await insertSection({
+      key: "dry_fruit_products",
+      kind: "product_carousel",
+      title: "Pantry favorites",
+      tab: "Grocery",
+      sortOrder: 150,
+      categoryIds: [pantry, canned],
+      maxItems: 8,
+      config: { title: "Pantry favorites", maxItems: 8, showSeeAll: true },
+    });
+    await insertSection({
+      key: "instant_food_products",
+      kind: "product_carousel",
+      title: "Instant food",
+      tab: "Grocery",
+      sortOrder: 160,
+      categoryIds: [noodles],
+      maxItems: 8,
+      config: {
+        categoryId: noodles,
+        title: "Instant food",
+        maxItems: 8,
+        showSeeAll: true,
+      },
+    });
+    await insertSection({
+      key: "beauty_products",
+      kind: "product_carousel",
+      title: "Beauty essentials",
+      tab: "Beauty",
+      sortOrder: 170,
+      categoryIds: [personalCare],
+      brandIds: [brandIds.Colgate],
+      maxItems: 8,
+      config: {
+        categoryId: personalCare,
+        title: "Beauty essentials",
+        maxItems: 8,
+        showSeeAll: true,
+      },
+    });
+    await insertSection({
+      key: "store_inventory_summary",
+      kind: "store_inventory_section",
+      title: "Store stock",
+      tab: "All",
+      sortOrder: 180,
+      storeIds: [storeMakati, storeQC],
+      allowEmpty: true,
+      config: {
+        storeIds: [storeMakati, storeQC],
+        showInventorySummary: true,
+        showAvailability: true,
+        statusFilter: "available",
+        maxItems: 8,
+      },
+    });
     // ---- Customers + addresses + settings ----
     const customerSeed = [
       { name: "Maria Santos", phone: "9171234567", code: "MARIA8K2" },

@@ -102,7 +102,10 @@ export const lowStockAlerts = query({
   handler: async (ctx, args) => {
     const inventory = (await ctx.db.query("inventory").collect()) as InventoryDoc[];
     const low = inventory.filter(
-      (i) => i.status === "low_stock" || i.status === "out_of_stock",
+      (i) =>
+        i.sku_id !== undefined &&
+        i.store_id !== undefined &&
+        (i.status === "low_stock" || i.status === "out_of_stock"),
     );
     const skuCache = new Map<string, SkuDoc | null>();
     const productCache = new Map<string, ProductDoc | null>();
