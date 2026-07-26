@@ -4,34 +4,53 @@
 
 @layer base {
   :root {
-    --background: 0 0% 100%;
-    --foreground: 240 10% 3.9%;
+    --background: 60 7% 97%;
+    --foreground: 0 0% 9%;
     --card: 0 0% 100%;
-    --card-foreground: 240 10% 3.9%;
+    --card-foreground: 0 0% 9%;
     --popover: 0 0% 100%;
-    --popover-foreground: 240 10% 3.9%;
-    --primary: 240 5.9% 10%;
+    --popover-foreground: 0 0% 9%;
+    --primary: 221 83% 53%;
     --primary-foreground: 0 0% 98%;
-    --secondary: 240 4.8% 95.9%;
-    --secondary-foreground: 240 5.9% 10%;
-    --muted: 240 4.8% 95.9%;
-    --muted-foreground: 240 3.8% 46.1%;
-    --accent: 240 4.8% 95.9%;
-    --accent-foreground: 240 5.9% 10%;
-    --destructive: 0 84.2% 60.2%;
+    --secondary: 60 5% 96%;
+    --secondary-foreground: 0 0% 9%;
+    --muted: 60 3% 94%;
+    --muted-foreground: 240 4% 44%;
+    --accent: 214 95% 96%;
+    --accent-foreground: 221 83% 53%;
+    --destructive: 4 76% 49%;
     --destructive-foreground: 0 0% 98%;
-    --border: 240 5.9% 90%;
-    --input: 240 5.9% 90%;
-    --ring: 240 5.9% 10%;
-    --radius: 0.625rem;
-    --sidebar-background: 0 0% 98%;
-    --sidebar-foreground: 240 5.3% 26.1%;
-    --sidebar-primary: 240 5.9% 10%;
+    --border: 60 4% 89%;
+    --input: 60 4% 85%;
+    --ring: 221 83% 53%;
+    --radius: 0.5rem;
+    --sidebar-background: 0 0% 100%;
+    --sidebar-foreground: 240 4% 44%;
+    --sidebar-primary: 221 83% 53%;
     --sidebar-primary-foreground: 0 0% 98%;
-    --sidebar-accent: 240 4.8% 95.9%;
-    --sidebar-accent-foreground: 240 5.9% 10%;
-    --sidebar-border: 220 13% 91%;
-    --sidebar-ring: 217.2 91.2% 59.8%;
+    --sidebar-accent: 60 5% 96%;
+    --sidebar-accent-foreground: 0 0% 9%;
+    --sidebar-border: 60 4% 89%;
+    --sidebar-ring: 221 83% 53%;
+
+    --color-bg-page: #f8f8f7;
+    --color-bg-surface: #ffffff;
+    --color-bg-subtle: #f5f5f4;
+    --color-bg-muted: #efefee;
+    --color-border: #e4e4e2;
+    --color-border-strong: #d4d4d1;
+    --color-text-primary: #171717;
+    --color-text-secondary: #6b6b73;
+    --color-text-muted: #9999a1;
+    --color-icon: #73737a;
+    --color-primary: #2563eb;
+    --color-primary-hover: #1d4ed8;
+    --color-primary-active: #1e40af;
+    --color-primary-subtle: #eff6ff;
+    --color-primary-border: #bfdbfe;
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.04);
+    --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.06);
+    --shadow-lg: 0 12px 32px rgba(0, 0, 0, 0.1);
   }
 
   .dark {
@@ -71,5 +90,26 @@
   }
   body {
     @apply bg-background text-foreground;
+    font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+      "Segoe UI", sans-serif;
+    font-size: 14px;
+    line-height: 20px;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+    text-rendering: optimizeLegibility;
+  }
+  input,
+  button,
+  textarea,
+  select {
+    font: inherit;
+  }
+  :focus-visible {
+    outline-color: hsl(var(--ring));
+  }
+}
+
+@layer utilities {
+  .numbers {
+    font-variant-numeric: tabular-nums;
   }
 }

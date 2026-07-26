@@ -23,9 +23,9 @@ export function PageHeader({
   actions?: ReactNode;
 }) {
   return (
-    <div className="mb-6 flex flex-wrap items-start justify-between gap-3">
+    <div className="mb-5 flex flex-wrap items-start justify-between gap-3 border-b pb-5">
       <div>
-        <h1 className="text-2xl font-semibold tracking-tight">{title}</h1>
+        <h1 className="text-[22px] font-semibold leading-[30px] tracking-normal">{title}</h1>
         {description && (
           <p className="mt-1 text-sm text-muted-foreground">{description}</p>
         )}
@@ -36,46 +36,46 @@ export function PageHeader({
 }
 
 const STATUS_STYLES: Record<string, string> = {
-  active: "bg-emerald-100 text-emerald-800 border-emerald-200",
-  inactive: "bg-slate-100 text-slate-600 border-slate-200",
-  draft: "bg-amber-100 text-amber-800 border-amber-200",
-  hidden: "bg-slate-100 text-slate-600 border-slate-200",
-  discontinued: "bg-rose-100 text-rose-800 border-rose-200",
-  guest: "bg-slate-100 text-slate-600 border-slate-200",
-  blocked: "bg-rose-100 text-rose-800 border-rose-200",
-  deleted: "bg-rose-100 text-rose-800 border-rose-200",
-  in_stock: "bg-emerald-100 text-emerald-800 border-emerald-200",
-  low_stock: "bg-amber-100 text-amber-800 border-amber-200",
-  out_of_stock: "bg-rose-100 text-rose-800 border-rose-200",
-  unavailable: "bg-slate-200 text-slate-600 border-slate-300",
-  pending_payment: "bg-amber-100 text-amber-800 border-amber-200",
-  confirmed: "bg-sky-100 text-sky-800 border-sky-200",
-  picking: "bg-indigo-100 text-indigo-800 border-indigo-200",
-  packed: "bg-violet-100 text-violet-800 border-violet-200",
-  out_for_delivery: "bg-cyan-100 text-cyan-800 border-cyan-200",
-  delivered: "bg-emerald-100 text-emerald-800 border-emerald-200",
-  cancelled: "bg-rose-100 text-rose-800 border-rose-200",
-  refunded: "bg-slate-100 text-slate-600 border-slate-200",
-  pending: "bg-amber-100 text-amber-800 border-amber-200",
-  authorized: "bg-sky-100 text-sky-800 border-sky-200",
-  paid: "bg-emerald-100 text-emerald-800 border-emerald-200",
-  failed: "bg-rose-100 text-rose-800 border-rose-200",
-  open: "bg-amber-100 text-amber-800 border-amber-200",
-  waiting_for_customer: "bg-sky-100 text-sky-800 border-sky-200",
-  resolved: "bg-emerald-100 text-emerald-800 border-emerald-200",
-  closed: "bg-slate-100 text-slate-600 border-slate-200",
-  banner: "bg-fuchsia-100 text-fuchsia-800 border-fuchsia-200",
-  carousel: "bg-sky-100 text-sky-800 border-sky-200",
-  coupon: "bg-amber-100 text-amber-800 border-amber-200",
-  product_discount: "bg-emerald-100 text-emerald-800 border-emerald-200",
+  active: "bg-[#ECFDF3] text-[#168A4A] border-[#BBF7D0]",
+  inactive: "bg-[#F4F4F5] text-[#5F5F66] border-[#E4E4E7]",
+  draft: "bg-[#FFF8E6] text-[#B66A00] border-[#FDE6A7]",
+  hidden: "bg-[#F4F4F5] text-[#5F5F66] border-[#E4E4E7]",
+  discontinued: "bg-[#FEF3F2] text-[#D92D20] border-[#FECACA]",
+  guest: "bg-[#F4F4F5] text-[#5F5F66] border-[#E4E4E7]",
+  blocked: "bg-[#FEF3F2] text-[#D92D20] border-[#FECACA]",
+  deleted: "bg-[#FEF3F2] text-[#D92D20] border-[#FECACA]",
+  in_stock: "bg-[#ECFDF3] text-[#168A4A] border-[#BBF7D0]",
+  low_stock: "bg-[#FFF8E6] text-[#B66A00] border-[#FDE6A7]",
+  out_of_stock: "bg-[#FEF3F2] text-[#D92D20] border-[#FECACA]",
+  unavailable: "bg-[#F4F4F5] text-[#5F5F66] border-[#E4E4E7]",
+  pending_payment: "bg-[#FFF8E6] text-[#B66A00] border-[#FDE6A7]",
+  confirmed: "bg-[#EFF6FF] text-[#2563EB] border-[#BFDBFE]",
+  picking: "bg-[#EFF6FF] text-[#2563EB] border-[#BFDBFE]",
+  packed: "bg-[#EFF6FF] text-[#2563EB] border-[#BFDBFE]",
+  out_for_delivery: "bg-[#EFF6FF] text-[#2563EB] border-[#BFDBFE]",
+  delivered: "bg-[#ECFDF3] text-[#168A4A] border-[#BBF7D0]",
+  cancelled: "bg-[#FEF3F2] text-[#D92D20] border-[#FECACA]",
+  refunded: "bg-[#F4F4F5] text-[#5F5F66] border-[#E4E4E7]",
+  pending: "bg-[#FFF8E6] text-[#B66A00] border-[#FDE6A7]",
+  authorized: "bg-[#EFF6FF] text-[#2563EB] border-[#BFDBFE]",
+  paid: "bg-[#ECFDF3] text-[#168A4A] border-[#BBF7D0]",
+  failed: "bg-[#FEF3F2] text-[#D92D20] border-[#FECACA]",
+  open: "bg-[#FFF8E6] text-[#B66A00] border-[#FDE6A7]",
+  waiting_for_customer: "bg-[#EFF6FF] text-[#2563EB] border-[#BFDBFE]",
+  resolved: "bg-[#ECFDF3] text-[#168A4A] border-[#BBF7D0]",
+  closed: "bg-[#F4F4F5] text-[#5F5F66] border-[#E4E4E7]",
+  banner: "bg-[#EFF6FF] text-[#2563EB] border-[#BFDBFE]",
+  carousel: "bg-[#EFF6FF] text-[#2563EB] border-[#BFDBFE]",
+  coupon: "bg-[#FFF8E6] text-[#B66A00] border-[#FDE6A7]",
+  product_discount: "bg-[#ECFDF3] text-[#168A4A] border-[#BBF7D0]",
 };
 
 export function StatusBadge({ value }: { value?: string }) {
   if (!value) return <span className="text-muted-foreground">—</span>;
   const cls =
-    STATUS_STYLES[value] ?? "bg-slate-100 text-slate-700 border-slate-200";
+    STATUS_STYLES[value] ?? "bg-[#F4F4F5] text-[#5F5F66] border-[#E4E4E7]";
   return (
-    <Badge variant="outline" className={`font-medium ${cls}`}>
+    <Badge variant="outline" className={`capitalize ${cls}`}>
       {value.replace(/_/g, " ")}
     </Badge>
   );
@@ -83,7 +83,7 @@ export function StatusBadge({ value }: { value?: string }) {
 
 export function Loading() {
   return (
-    <div className="flex items-center justify-center py-16 text-muted-foreground">
+    <div className="flex items-center justify-center py-16 text-sm text-muted-foreground">
       <Loader2 className="mr-2 h-5 w-5 animate-spin" /> Loading…
     </div>
   );
@@ -99,9 +99,9 @@ export function EmptyState({
   action?: ReactNode;
 }) {
   return (
-    <div className="flex flex-col items-center justify-center rounded-lg border border-dashed py-14 text-center">
+    <div className="flex flex-col items-center justify-center rounded-lg border border-dashed bg-card py-12 text-center">
       <PackageOpen className="mb-3 h-8 w-8 text-muted-foreground" />
-      <p className="font-medium">{title}</p>
+      <p className="text-sm font-medium">{title}</p>
       {hint && <p className="mt-1 max-w-sm text-sm text-muted-foreground">{hint}</p>}
       {action && <div className="mt-4">{action}</div>}
     </div>

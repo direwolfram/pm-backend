@@ -21,6 +21,16 @@ const deliveryMode = v.union(
 );
 
 export default defineSchema({
+  users: defineTable({
+    name: v.optional(v.string()),
+    email: v.optional(v.string()),
+    phone: v.optional(v.string()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_email", ["email"])
+    .index("by_phone", ["phone"]),
+
   customers: defineTable({
     phone_country_code: v.string(),
     phone_number: v.string(),
@@ -133,7 +143,9 @@ export default defineSchema({
     .index("by_slug", ["slug"]),
 
   products: defineTable({
+    sku: v.optional(v.string()),
     brand_id: v.optional(v.id("brands")),
+    categoryId: v.optional(v.id("categories")),
     primary_category_id: v.id("categories"),
     name: v.string(),
     slug: v.string(),
@@ -146,6 +158,25 @@ export default defineSchema({
     ),
     tag: v.optional(v.string()),
     pack_type: v.optional(v.string()),
+    brand: v.optional(v.string()),
+    basePrice: v.optional(v.number()),
+    weightKg: v.optional(v.number()),
+    volumeL: v.optional(v.number()),
+    isFragile: v.optional(v.boolean()),
+    isFlammable: v.optional(v.boolean()),
+    temperatureZone: v.optional(
+      v.union(v.literal("ambient"), v.literal("chilled"), v.literal("frozen")),
+    ),
+    packagingType: v.optional(v.string()),
+    isFreshProduce: v.optional(v.boolean()),
+    isReturnable: v.optional(v.boolean()),
+    searchKeywords: v.optional(v.array(v.string())),
+    images: v.optional(v.array(v.string())),
+    substituteSkuIds: v.optional(v.array(v.string())),
+    substitutePriority: v.optional(v.number()),
+    allowSubstitution: v.optional(v.boolean()),
+    isExpressAvailable: v.optional(v.boolean()),
+    isFrequentlyBought: v.optional(v.boolean()),
     shelf_life: v.optional(v.string()),
     flavour: v.optional(v.string()),
     finish: v.optional(v.string()),
@@ -162,8 +193,12 @@ export default defineSchema({
     created_at: v.number(),
     updated_at: v.number(),
   })
+    .index("by_sku", ["sku"])
     .index("by_category", ["primary_category_id"])
+    .index("by_category_id", ["categoryId"])
     .index("by_brand", ["brand_id"])
+    .index("by_brand_name", ["brand"])
+    .index("by_frequently_bought", ["isFrequentlyBought"])
     .index("by_slug", ["slug"])
     .index("by_status", ["status"])
     .searchIndex("search_products", {
@@ -174,8 +209,10 @@ export default defineSchema({
   product_media: defineTable({
     product_id: v.id("products"),
     url: v.string(),
+    storage_id: v.optional(v.id("_storage")),
     alt_text: v.optional(v.string()),
     dominant_color: v.optional(v.string()),
+    is_showcase: v.optional(v.boolean()),
     sort_order: v.number(),
   }).index("by_product", ["product_id"]),
 
@@ -220,23 +257,149 @@ export default defineSchema({
     .index("by_store", ["store_id"]),
 
   inventory: defineTable({
-    sku_id: v.id("skus"),
-    store_id: v.id("stores"),
-    quantity_available: v.number(),
-    quantity_reserved: v.number(),
-    low_stock_threshold: v.number(),
-    status: v.union(
+    sku_id: v.optional(v.id("skus")),
+    store_id: v.optional(v.id("stores")),
+    quantity_available: v.optional(v.number()),
+    quantity_reserved: v.optional(v.number()),
+    low_stock_threshold: v.optional(v.number()),
+    status: v.optional(v.union(
       v.literal("in_stock"),
       v.literal("low_stock"),
       v.literal("out_of_stock"),
       v.literal("unavailable"),
-    ),
+    )),
     restock_at: v.optional(v.number()),
-    updated_at: v.number(),
+    updated_at: v.optional(v.number()),
+
+    sku: v.optional(v.string()),
+    productId: v.optional(v.id("products")),
+    fulfillmentCenterId: v.optional(v.id("fulfillmentCenters")),
+    availableQuantity: v.optional(v.number()),
+    reservedQuantity: v.optional(v.number()),
+    inboundQuantity: v.optional(v.number()),
+    maxOrderQuantity: v.optional(v.number()),
+    replenishmentThreshold: v.optional(v.number()),
+    expectedReplenishmentAt: v.optional(v.number()),
+    lastUpdatedAt: v.optional(v.number()),
+    isActive: v.optional(v.boolean()),
+    isLowStock: v.optional(v.boolean()),
   })
     .index("by_sku_store", ["sku_id", "store_id"])
     .index("by_store_status", ["store_id", "status"])
-    .index("by_sku", ["sku_id"]),
+    .index("by_sku", ["sku_id"])
+    .index("by_sku_center", ["sku", "fulfillmentCenterId"])
+    .index("by_center_active", ["fulfillmentCenterId", "isActive"])
+    .index("by_low_stock", ["fulfillmentCenterId", "isLowStock"])
+    .index("by_last_updated", ["lastUpdatedAt"]),
+
+  fulfillmentCenters: defineTable({
+    name: v.string(),
+    address: v.string(),
+    latitude: v.number(),
+    longitude: v.number(),
+    serviceablePincodes: v.array(v.string()),
+    zoneIds: v.array(v.id("zones")),
+    isActive: v.boolean(),
+    operatingHours: v.object({ open: v.number(), close: v.number() }),
+    capacity: v.number(),
+    coldChainEnabled: v.boolean(),
+  })
+    .index("by_pincode", ["serviceablePincodes"])
+    .index("by_location", ["latitude", "longitude"])
+    .index("by_active", ["isActive"]),
+
+  zones: defineTable({
+    fulfillmentCenterId: v.id("fulfillmentCenters"),
+    name: v.string(),
+    zoneType: v.union(
+      v.literal("ambient"),
+      v.literal("chilled"),
+      v.literal("frozen"),
+      v.literal("general"),
+    ),
+    pickLocations: v.array(
+      v.object({
+        binId: v.string(),
+        aisle: v.string(),
+        rack: v.string(),
+        shelf: v.string(),
+        capacity: v.number(),
+        currentCount: v.number(),
+      }),
+    ),
+  }).index("by_center", ["fulfillmentCenterId"]),
+
+  batches: defineTable({
+    inventoryId: v.id("inventory"),
+    batchNumber: v.string(),
+    quantity: v.number(),
+    expiryDate: v.number(),
+    manufacturedDate: v.optional(v.number()),
+    harvestDate: v.optional(v.number()),
+    shelfLifeDaysRemaining: v.number(),
+    isNearExpiry: v.boolean(),
+    discountPercent: v.number(),
+    qualityCheckStatus: v.union(
+      v.literal("pending"),
+      v.literal("passed"),
+      v.literal("failed"),
+    ),
+    pickPriority: v.number(),
+    expiredAt: v.optional(v.number()),
+  })
+    .index("by_inventory_expiry", ["inventoryId", "expiryDate"])
+    .index("by_near_expiry", ["isNearExpiry"]),
+
+  deliverySlots: defineTable({
+    fulfillmentCenterId: v.id("fulfillmentCenters"),
+    slotStart: v.number(),
+    slotEnd: v.number(),
+    durationMinutes: v.number(),
+    maxCapacity: v.number(),
+    currentOrders: v.number(),
+    isRushHour: v.boolean(),
+    isAvailable: v.boolean(),
+  })
+    .index("by_center_time", ["fulfillmentCenterId", "slotStart"])
+    .index("by_center_available", ["fulfillmentCenterId", "isAvailable"]),
+
+  cartReservations: defineTable({
+    userId: v.id("users"),
+    inventoryId: v.id("inventory"),
+    quantity: v.number(),
+    reservedAt: v.number(),
+    expiresAt: v.number(),
+    status: v.union(
+      v.literal("active"),
+      v.literal("converted"),
+      v.literal("expired"),
+      v.literal("released"),
+    ),
+  })
+    .index("by_user", ["userId"])
+    .index("by_expiry", ["expiresAt"])
+    .index("by_inventory", ["inventoryId"]),
+
+  inventoryPricing: defineTable({
+    inventoryId: v.id("inventory"),
+    dynamicPrice: v.number(),
+    flashSaleReservedQty: v.number(),
+    membershipExclusiveQty: v.number(),
+    discountStartAt: v.optional(v.number()),
+    discountEndAt: v.optional(v.number()),
+    isSurgeActive: v.boolean(),
+  }).index("by_inventory", ["inventoryId"]),
+
+  inventoryLogs: defineTable({
+    inventoryId: v.id("inventory"),
+    adjustment: v.number(),
+    reason: v.string(),
+    previousAvailableQuantity: v.number(),
+    nextAvailableQuantity: v.number(),
+    createdAt: v.number(),
+  })
+    .index("by_inventory", ["inventoryId"])
+    .index("by_created", ["createdAt"]),
 
   promotions: defineTable({
     kind: v.union(
@@ -281,18 +444,70 @@ export default defineSchema({
     .index("by_product", ["product_id"]),
 
   home_sections: defineTable({
-    title: v.string(),
+    id: v.optional(v.string()),
+    key: v.optional(v.string()),
     kind: v.union(
-      v.literal("product_carousel"),
-      v.literal("category_grid"),
+      v.literal("header"),
+      v.literal("search_bar"),
+      v.literal("category_tabs"),
+      v.literal("hero_banner"),
       v.literal("bestseller_grid"),
       v.literal("promo_banner"),
+      v.literal("promo_carousel"),
       v.literal("shopping_list_card"),
+      v.literal("category_grid"),
+      v.literal("themed_product_section"),
+      v.literal("product_carousel"),
+      v.literal("featured_products"),
+      v.literal("store_inventory_section"),
+      v.literal("custom_cta"),
+      v.literal("spacer"),
     ),
+    title: v.optional(v.string()),
+    subtitle: v.optional(v.string()),
     tab: v.string(),
-    sort_order: v.number(),
-    is_active: v.boolean(),
-  }).index("by_tab", ["tab", "sort_order"]),
+    sortOrder: v.optional(v.number()),
+    isActive: v.optional(v.boolean()),
+    allowEmpty: v.optional(v.boolean()),
+    startsAt: v.optional(v.number()),
+    endsAt: v.optional(v.number()),
+    timezone: v.optional(v.string()),
+    visibleDaysOfWeek: v.optional(v.array(v.number())),
+    visibleTimeWindows: v.optional(
+      v.array(v.object({ start: v.string(), end: v.string() })),
+    ),
+    holidayTags: v.optional(v.array(v.string())),
+    seasonalTags: v.optional(v.array(v.string())),
+    storeIds: v.optional(v.array(v.id("stores"))),
+    cityIds: v.optional(v.array(v.string())),
+    regionIds: v.optional(v.array(v.string())),
+    customerSegments: v.optional(v.array(v.string())),
+    appVersion: v.optional(v.string()),
+    minAppVersion: v.optional(v.string()),
+    maxAppVersion: v.optional(v.string()),
+    layoutVariant: v.optional(v.string()),
+    backgroundColor: v.optional(v.string()),
+    textColor: v.optional(v.string()),
+    imageUrl: v.optional(v.string()),
+    iconEmoji: v.optional(v.string()),
+    maxItems: v.optional(v.number()),
+    productIds: v.optional(v.array(v.id("products"))),
+    categoryIds: v.optional(v.array(v.id("categories"))),
+    promotionIds: v.optional(v.array(v.id("promotions"))),
+    brandIds: v.optional(v.array(v.id("brands"))),
+    config: v.optional(v.any()),
+    resolvedData: v.optional(v.any()),
+    createdAt: v.optional(v.number()),
+    updatedAt: v.optional(v.number()),
+    archivedAt: v.optional(v.number()),
+
+    // Legacy fields retained so existing seeded databases keep validating
+    // until they are migrated by homeSections.seedDefaults or admin edits.
+    sort_order: v.optional(v.number()),
+    is_active: v.optional(v.boolean()),
+  })
+    .index("by_key", ["key"])
+    .index("by_tab", ["tab", "sortOrder"]),
 
   home_section_items: defineTable({
     section_id: v.id("home_sections"),

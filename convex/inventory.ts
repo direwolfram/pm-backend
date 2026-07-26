@@ -16,6 +16,10 @@ const inventoryStatus = v.union(
   v.literal("unavailable"),
 );
 
+function isLegacyInventoryRow(row: InventoryDoc): boolean {
+  return row.sku_id !== undefined && row.store_id !== undefined;
+}
+
 async function enrichRows(
   ctx: { db: any },
   rows: InventoryDoc[],
@@ -24,6 +28,7 @@ async function enrichRows(
   const productCache = new Map<string, ProductDoc | null>();
   const out: InventoryRow[] = [];
   for (const row of rows) {
+    if (!isLegacyInventoryRow(row)) continue;
     if (!skuCache.has(row.sku_id)) {
       skuCache.set(row.sku_id, (await ctx.db.get(row.sku_id)) as SkuDoc | null);
     }
@@ -69,7 +74,9 @@ export const listByStore = query({
         .query("inventory")
         .collect()
         .then((all) =>
-          (all as InventoryDoc[]).filter((r) => r.store_id === args.store_id),
+          (all as InventoryDoc[]).filter(
+            (r) => isLegacyInventoryRow(r) && r.store_id === args.store_id,
+          ),
         )) as InventoryDoc[];
     }
     let enriched = await enrichRows(ctx, rows);
@@ -94,7 +101,9 @@ export const summaryByStore = query({
       .query("inventory")
       .collect()
       .then((all) =>
-        (all as InventoryDoc[]).filter((r) => r.store_id === args.store_id),
+          (all as InventoryDoc[]).filter(
+            (r) => isLegacyInventoryRow(r) && r.store_id === args.store_id,
+          ),
       )) as InventoryDoc[];
     const summary = {
       total_skus: rows.length,

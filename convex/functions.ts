@@ -1,4 +1,8 @@
-import { queryGeneric, mutationGeneric } from "convex/server";
+import {
+  internalMutationGeneric,
+  mutationGeneric,
+  queryGeneric,
+} from "convex/server";
 
 /**
  * Codegen-free builders. Once you run `npx convex deploy` with your own
@@ -7,3 +11,4 @@ import { queryGeneric, mutationGeneric } from "convex/server";
  */
 export const query = queryGeneric;
 export const mutation = mutationGeneric;
+export const internalMutation = internalMutationGeneric;
