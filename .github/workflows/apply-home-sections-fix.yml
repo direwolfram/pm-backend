@@ -28,7 +28,7 @@ jobs:
           import re
 
           path = Path('convex/homeSections.ts')
-          source = path.read_text()
+          source = path.read_text().replace('\r\n', '\n')
 
           replacement = '''type ResolutionData = {
             products: ProductDoc[];
@@ -64,16 +64,12 @@ jobs:
             if (sections.some((section) => section.kind === "store_inventory_section")) {
               required.add("inventory");
             }
-
             const load = async <T>(table: keyof ResolutionData): Promise<T[]> =>
               required.has(table) ? await ctx.db.query(table).collect() as T[] : [];
             const [products, categories, promotions, stores, skus, inventory] = await Promise.all([
-              load<ProductDoc>("products"),
-              load<CategoryDoc>("categories"),
-              load<PromotionDoc>("promotions"),
-              load<StoreDoc>("stores"),
-              load<SkuDoc>("skus"),
-              load<InventoryDoc>("inventory"),
+              load<ProductDoc>("products"), load<CategoryDoc>("categories"),
+              load<PromotionDoc>("promotions"), load<StoreDoc>("stores"),
+              load<SkuDoc>("skus"), load<InventoryDoc>("inventory"),
             ]);
             return { products, categories, promotions, stores, skus, inventory };
           }
@@ -87,27 +83,26 @@ jobs:
             const current = args.now ?? Date.now();
             const maxItems = sectionLimit(section);
             const { products, categories, promotions, stores, skus, inventory } = data;'''
+          start = source.index('async function resolveSection(')
+          body = source.index('  const categoryId = configString(section.config, "categoryId");', start)
+          source = source[:start] + replacement + '\n\n' + source[body:]
 
-          pattern = r'async function resolveSection\(\n  ctx: \{ db: any \},\n  section: HomeSectionDoc,\n  args: \{ store_id\?: string; now\?: number \},\n\) \{\n  const refs = referencedIds\(section\);\n  const current = args\.now \?\? Date\.now\(\);\n  const maxItems = sectionLimit\(section\);\n  const \[products, categories, promotions, stores, skus, inventory\] = await Promise\.all\(\[.*?\n  \]\);'
-          source, count = re.subn(pattern, replacement, source, count=1, flags=re.S)
-          if count != 1: raise SystemExit('resolveSection target did not match')
-
-          pattern = r'async function responseForSection\(\n  ctx: \{ db: any \},\n  section: HomeSectionDoc,\n  args: \{ store_id\?: string; now\?: number \},\n\) \{\n  const normalized = normalizeSection\(section\);\n  const resolvedData = \(normalized\.resolvedData \?\? await resolveSection\(ctx, normalized, args\)\) as ResolvedSectionData;'
+          start = source.index('async function responseForSection(')
+          body = source.index('  return {', start)
           replacement = '''async function responseForSection(
             section: HomeSectionDoc,
             args: { store_id?: string; now?: number },
             data: ResolutionData,
           ) {
             const normalized = normalizeSection(section);
-            const resolvedData = (normalized.resolvedData ?? await resolveSection(normalized, args, data)) as ResolvedSectionData;'''
-          source, count = re.subn(pattern, replacement, source, count=1)
-          if count != 1: raise SystemExit('responseForSection target did not match')
+            const resolvedData = (normalized.resolvedData ?? await resolveSection(normalized, args, data)) as ResolvedSectionData;
+          '''
+          source = source[:start] + replacement + source[body:]
 
-          source, count = source.replace(
-            '  const visibleResponses = [];\n  for (const section of sections) {\n    const response = await responseForSection(ctx, section, args);',
-            '  const resolutionData = await loadResolutionData(ctx, sections, args.store_id);\n  const visibleResponses = [];\n  for (const section of sections) {\n    const response = await responseForSection(section, args, resolutionData);',
-            1,
-          ), 1
+          old = '  const visibleResponses = [];\n  for (const section of sections) {\n    const response = await responseForSection(ctx, section, args);'
+          new = '  const resolutionData = await loadResolutionData(ctx, sections, args.store_id);\n  const visibleResponses = [];\n  for (const section of sections) {\n    const response = await responseForSection(section, args, resolutionData);'
+          if old not in source: raise SystemExit('list target did not match')
+          source = source.replace(old, new, 1)
 
           old = '    if (!section) throw new Error("Home section not found");\n    return await responseForSection(ctx, normalizeSection(section), {});'
           new = '    if (!section) throw new Error("Home section not found");\n    const normalized = normalizeSection(section);\n    const resolutionData = await loadResolutionData(ctx, [normalized]);\n    return await responseForSection(normalized, {}, resolutionData);'
@@ -136,9 +131,7 @@ jobs:
             return { data, total: rows.length, limit, offset };'''
           if old not in source: raise SystemExit('adminList target did not match')
           source = source.replace(old, new, 1)
-
-          if 'responseForSection(ctx' in source:
-            raise SystemExit('stale responseForSection call remains')
+          if 'responseForSection(ctx' in source: raise SystemExit('stale call remains')
           path.write_text(source)
           PY
       - name: Validate
@@ -148,9 +141,9 @@ jobs:
           npm run build
       - name: Commit fix
         run: |
-          rm .github/workflows/apply-home-sections-fix.yml
+          rm .github/workflows/apply-home-sections-fix.yml .github/home-sections-fix-trigger
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add convex/homeSections.ts .github/workflows/apply-home-sections-fix.yml
+          git add convex/homeSections.ts .github/workflows/apply-home-sections-fix.yml .github/home-sections-fix-trigger
           git commit -m "fix: eliminate home section read amplification"
           git push origin HEAD:fix/home-sections-read-amplification
