@@ -1,0 +1,215 @@
+name: Apply home sections read fix
+
+on:
+  push:
+    branches:
+      - fix/home-sections-read-amplification
+
+permissions:
+  contents: write
+
+jobs:
+  apply-fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/home-sections-read-amplification
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - name: Refactor home section resolution
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path('convex/homeSections.ts')
+          source = path.read_text()
+
+          old = '''async function resolveSection(
+            ctx: { db: any },
+            section: HomeSectionDoc,
+            args: { store_id?: string; now?: number },
+          ) {
+            const refs = referencedIds(section);
+            const current = args.now ?? Date.now();
+            const maxItems = sectionLimit(section);
+            const [products, categories, promotions, stores, skus, inventory] = await Promise.all([
+              ctx.db.query("products").collect() as Promise<ProductDoc[]>,
+              ctx.db.query("categories").collect() as Promise<CategoryDoc[]>,
+              ctx.db.query("promotions").collect() as Promise<PromotionDoc[]>,
+              ctx.db.query("stores").collect() as Promise<StoreDoc[]>,
+              ctx.db.query("skus").collect() as Promise<SkuDoc[]>,
+              ctx.db.query("inventory").collect() as Promise<InventoryDoc[]>,
+            ]);
+          '''
+
+          new = '''type ResolutionData = {
+            products: ProductDoc[];
+            categories: CategoryDoc[];
+            promotions: PromotionDoc[];
+            stores: StoreDoc[];
+            skus: SkuDoc[];
+            inventory: InventoryDoc[];
+          };
+
+          const staticSectionKinds = new Set([
+            "header",
+            "search_bar",
+            "hero_banner",
+            "shopping_list_card",
+            "custom_cta",
+            "spacer",
+          ]);
+
+          function requiredResolutionTables(sections: HomeSectionDoc[]) {
+            const required = new Set<keyof ResolutionData>();
+            for (const section of sections) {
+              if (staticSectionKinds.has(section.kind)) continue;
+              if (productSectionKinds.has(section.kind)) required.add("products");
+              if (section.kind === "category_grid" || section.kind === "category_tabs") required.add("categories");
+              if (section.kind === "promo_banner" || section.kind === "promo_carousel") required.add("promotions");
+              if (section.kind === "store_inventory_section") required.add("stores");
+              if (productSectionKinds.has(section.kind) && section.storeIds?.length) {
+                required.add("stores");
+              }
+            }
+            return required;
+          }
+
+          async function loadResolutionData(
+            ctx: { db: any },
+            sections: HomeSectionDoc[],
+            storeId?: string,
+          ): Promise<ResolutionData> {
+            const required = requiredResolutionTables(sections);
+            if (storeId && sections.some((section) => productSectionKinds.has(section.kind))) {
+              required.add("skus");
+              required.add("inventory");
+            }
+            if (sections.some((section) => section.kind === "store_inventory_section")) {
+              required.add("inventory");
+            }
+
+            const load = async <T>(table: keyof ResolutionData): Promise<T[]> =>
+              required.has(table)
+                ? await ctx.db.query(table).collect() as T[]
+                : [];
+
+            const [products, categories, promotions, stores, skus, inventory] = await Promise.all([
+              load<ProductDoc>("products"),
+              load<CategoryDoc>("categories"),
+              load<PromotionDoc>("promotions"),
+              load<StoreDoc>("stores"),
+              load<SkuDoc>("skus"),
+              load<InventoryDoc>("inventory"),
+            ]);
+            return { products, categories, promotions, stores, skus, inventory };
+          }
+
+          async function resolveSection(
+            section: HomeSectionDoc,
+            args: { store_id?: string; now?: number },
+            data: ResolutionData,
+          ) {
+            const refs = referencedIds(section);
+            const current = args.now ?? Date.now();
+            const maxItems = sectionLimit(section);
+            const { products, categories, promotions, stores, skus, inventory } = data;
+          '''
+
+          if old not in source:
+            raise SystemExit('resolveSection target did not match')
+          source = source.replace(old, new, 1)
+
+          old = '''async function responseForSection(
+            ctx: { db: any },
+            section: HomeSectionDoc,
+            args: { store_id?: string; now?: number },
+          ) {
+            const normalized = normalizeSection(section);
+            const resolvedData = (normalized.resolvedData ?? await resolveSection(ctx, normalized, args)) as ResolvedSectionData;
+          '''
+          new = '''async function responseForSection(
+            section: HomeSectionDoc,
+            args: { store_id?: string; now?: number },
+            data: ResolutionData,
+          ) {
+            const normalized = normalizeSection(section);
+            const resolvedData = (normalized.resolvedData ?? await resolveSection(normalized, args, data)) as ResolvedSectionData;
+          '''
+          if old not in source:
+            raise SystemExit('responseForSection target did not match')
+          source = source.replace(old, new, 1)
+
+          old = '''    const visibleResponses = [];
+            for (const section of sections) {
+              const response = await responseForSection(ctx, section, args);
+          '''
+          new = '''    const data = await loadResolutionData(ctx, sections, args.store_id);
+            const visibleResponses = [];
+            for (const section of sections) {
+              const response = await responseForSection(section, args, data);
+          '''
+          if old not in source:
+            raise SystemExit('list target did not match')
+          source = source.replace(old, new, 1)
+
+          old = '''    const section = (await ctx.db.get(args.id)) as HomeSectionDoc | null;
+            if (!section) throw new Error("Home section not found");
+            return await responseForSection(ctx, normalizeSection(section), {});
+          '''
+          new = '''    const section = (await ctx.db.get(args.id)) as HomeSectionDoc | null;
+            if (!section) throw new Error("Home section not found");
+            const normalized = normalizeSection(section);
+            const data = await loadResolutionData(ctx, [normalized]);
+            return await responseForSection(normalized, {}, data);
+          '''
+          if old not in source:
+            raise SystemExit('get target did not match')
+          source = source.replace(old, new, 1)
+
+          old = '''    rows.sort((a, b) => a.tab.localeCompare(b.tab) || (a.sortOrder ?? 0) - (b.sortOrder ?? 0));
+            const data = [];
+            for (const section of rows.slice(offset, offset + limit)) {
+              data.push({
+                ...section,
+                preview: await responseForSection(ctx, section, {}),
+              });
+            }
+            return { data, total: rows.length, limit, offset };
+          '''
+          new = '''    rows.sort((a, b) => a.tab.localeCompare(b.tab) || (a.sortOrder ?? 0) - (b.sortOrder ?? 0));
+            const page = rows.slice(offset, offset + limit);
+            const resolutionData = await loadResolutionData(ctx, page);
+            const data = [];
+            for (const section of page) {
+              data.push({
+                ...section,
+                preview: await responseForSection(section, {}, resolutionData),
+              });
+            }
+            return { data, total: rows.length, limit, offset };
+          '''
+          if old not in source:
+            raise SystemExit('adminList target did not match')
+          source = source.replace(old, new, 1)
+
+          path.write_text(source)
+          PY
+      - name: Validate
+        run: |
+          npm ci
+          npm run lint
+          npm run build
+      - name: Commit fix
+        run: |
+          rm .github/workflows/apply-home-sections-fix.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add convex/homeSections.ts .github/workflows/apply-home-sections-fix.yml
+          git commit -m "fix: eliminate home section read amplification"
+          git push origin HEAD:fix/home-sections-read-amplification
