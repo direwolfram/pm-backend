@@ -21,6 +21,31 @@ const deliveryMode = v.union(
 );
 
 export default defineSchema({
+  /**
+   * Transactionally maintained exact counts for admin list endpoints,
+   * keyed by scope + filter dimension tuple. Lets list queries return an
+   * exact numeric total for equality filter combinations with O(1) reads.
+   * Drift (only possible via direct DB writes) is repaired by
+   * listCounts.reconcileListCounts.
+   */
+  listCounts: defineTable({
+    scope: v.string(),
+    key: v.string(),
+    count: v.number(),
+  })
+    .index("by_scope", ["scope"])
+    .index("by_scope_key", ["scope", "key"]),
+
+  /**
+   * Singleton-style progress rows for background drains (e.g. the price
+   * transition activation horizon).
+   */
+  transitionState: defineTable({
+    key: v.string(),
+    horizon: v.optional(v.number()),
+    cursor: v.optional(v.union(v.string(), v.null())),
+  }).index("by_key", ["key"]),
+
   users: defineTable({
     name: v.optional(v.string()),
     email: v.optional(v.string()),
@@ -49,7 +74,9 @@ export default defineSchema({
     order_count: v.optional(v.number()),
     total_spend: v.optional(v.number()),
     customerStatsVersion: v.optional(v.number()),
+    statsGeneration: v.optional(v.number()),
     reconcile_cursor: v.optional(v.union(v.string(), v.null())),
+    reconcile_generation: v.optional(v.number()),
     reconcile_totals: v.optional(
       v.object({ order_count: v.number(), total_spend: v.number() }),
     ),

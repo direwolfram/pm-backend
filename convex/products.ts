@@ -5,9 +5,16 @@ import { boundedPageArgs, now, pageResponse, slugify, unwrapCursor, wrapCursor }
 import {
   activePriceForSku,
   computeProductListSummary,
+  deletePricesActiveForSku,
   PRODUCT_LIST_SUMMARY_VERSION,
   recomputeProductListSummary,
 } from "./lib/productListSummaries";
+import {
+  applyListCountChange,
+  exactListTotal,
+  productCountKeys,
+  productTotalKey,
+} from "./listCounts";
 import type { Id } from "./_generated/dataModel";
 import type {
   ProductDoc,
@@ -80,22 +87,47 @@ async function pageProducts(
 ) {
   const pageArgs = boundedPageArgs(args);
   const limit = pageArgs.limit;
-  const fetchLimit = limit + pageArgs.offset + 1;
   const useOffset = args.offset !== undefined && args.cursor === undefined;
   const scope = productListScope(args);
   const cursor = unwrapCursor(scope, args.cursor);
   const isSearch = !!args.search?.trim();
-  let builder;
   if (isSearch) {
-    builder = ctx.db.query("products").withSearchIndex("search_products", (q: any) => {
-      let s = q.search("name", args.search!.trim());
-      if (args.status) s = s.eq("status", args.status);
-      if (args.category_id) s = s.eq("primary_category_id", args.category_id);
-      if (args.brand_id) s = s.eq("brand_id", args.brand_id);
-      return s;
-    });
-  } else {
-    builder = ctx.db
+    // Search domain: exact total = size of the filtered match set; reads are
+    // bounded by matches, not the table.
+    const matches = (await ctx.db
+      .query("products")
+      .withSearchIndex("search_products", (q: any) => {
+        let s = q.search("name", args.search!.trim());
+        if (args.status) s = s.eq("status", args.status);
+        if (args.category_id) s = s.eq("primary_category_id", args.category_id);
+        if (args.brand_id) s = s.eq("brand_id", args.brand_id);
+        return s;
+      })
+      .collect()) as ProductDoc[];
+    const skip = useOffset
+      ? pageArgs.offset
+      : cursor === null
+        ? 0
+        : Number(cursor);
+    if (!Number.isInteger(skip) || skip < 0 || skip > matches.length) {
+      throw new Error("Invalid cursor: request a fresh first page");
+    }
+    const page = matches.slice(skip, skip + limit);
+    const nextSkip = skip + limit;
+    return {
+      rows: page,
+      pagination: {
+        isDone: nextSkip >= matches.length,
+        nextCursor:
+          useOffset || nextSkip >= matches.length
+            ? null
+            : wrapCursor(scope, String(nextSkip)),
+        total: matches.length,
+      },
+    };
+  }
+  const makeBuilder = () =>
+    ctx.db
       .query("products")
       .withIndex(productListIndex(args), (q: any) => {
         if (args.category_id && args.brand_id && args.status) {
@@ -120,9 +152,12 @@ async function pageProducts(
         if (args.status) return q.eq("status", args.status);
         return q;
       });
-  }
-  // Search indexes are always in relevance order and cannot be re-ordered.
-  const ordered = isSearch ? builder : builder.order("desc");
+  // Exact total: maintained counters (O(1)); missing counter rows fall back
+  // to a bounded count of the match domain.
+  const maintained = await exactListTotal(ctx, "products", productTotalKey(args));
+  const total =
+    maintained ?? ((await makeBuilder().collect()) as ProductDoc[]).length;
+  const ordered = makeBuilder().order("desc");
   if (!useOffset) {
     const result = await ordered.paginate({
       numItems: limit,
@@ -136,15 +171,17 @@ async function pageProducts(
           result.isDone || !result.continueCursor
             ? null
             : wrapCursor(scope, result.continueCursor),
+        total,
       },
     };
   }
-  const rows = (await ordered.take(fetchLimit)) as ProductDoc[];
+  const rows = (await ordered.take(limit + pageArgs.offset + 1)) as ProductDoc[];
   return {
     rows: rows.slice(pageArgs.offset, pageArgs.offset + limit),
     pagination: {
       isDone: rows.length <= pageArgs.offset + limit,
       nextCursor: null,
+      total,
     },
   };
 }
@@ -365,7 +402,7 @@ export const create = mutation({
         throw new Error("Brand is being deleted");
       }
     }
-    return await ctx.db.insert("products", {
+    const doc = {
       sku: args.sku,
       brand_id: args.brand_id,
       categoryId: args.categoryId ?? args.primary_category_id,
@@ -373,7 +410,7 @@ export const create = mutation({
       name: args.name,
       slug,
       description: args.description,
-      status: args.status ?? "draft",
+      status: args.status ?? ("draft" as const),
       tag: args.tag,
       pack_type: args.pack_type,
       brand: args.brand,
@@ -409,7 +446,10 @@ export const create = mutation({
       attributes: args.attributes ?? [],
       created_at: now(),
       updated_at: now(),
-    });
+    };
+    const id = await ctx.db.insert("products", doc);
+    await applyListCountChange(ctx, "products", productCountKeys, null, doc);
+    return id;
   },
 });
 
@@ -451,6 +491,16 @@ export const update = mutation({
       ...(categoryId ? { categoryId } : {}),
       updated_at: now(),
     });
+    const after = (await ctx.db.get(id)) as ProductDoc | null;
+    if (after) {
+      await applyListCountChange(
+        ctx,
+        "products",
+        productCountKeys,
+        product as ProductDoc,
+        after,
+      );
+    }
     if (patch.name) {
       const inventory = await ctx.db
         .query("inventory")
@@ -609,6 +659,8 @@ export const continueProductDelete = internalMutation({
       .withIndex("by_product", (q) => q.eq("product_id", args.id))
       .take(CASCADE_BATCH_LIMIT - operations);
     for (const s of skus) {
+      // Keep pricesActive consistent: mirrors of this SKU's prices go with it.
+      await deletePricesActiveForSku(ctx, s._id);
       await ctx.db.delete(s._id);
       operations += 1;
     }
@@ -646,6 +698,13 @@ export const continueProductDelete = internalMutation({
       });
       return { done: false, operations };
     }
+    await applyListCountChange(
+      ctx,
+      "products",
+      productCountKeys,
+      product,
+      null,
+    );
     await ctx.db.delete(args.id);
     return { done: true, operations };
   },

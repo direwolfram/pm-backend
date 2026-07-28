@@ -26,6 +26,14 @@ describe("customers.list read scaling", () => {
     );
     const db = new FakeConvexDb({
       customers,
+      listCounts: [
+        doc("listCounts", {
+          _id: "lc_active",
+          scope: "customers",
+          key: "status:active",
+          count: 25,
+        }),
+      ],
       orders: Array.from({ length: 500 }, (_, index) =>
         doc("orders", {
           _id: `order_${index}`,
@@ -49,10 +57,14 @@ describe("customers.list read scaling", () => {
     const result = await listHandler({ db }, { status: "active", limit: 5 });
 
     expect(result.data).toHaveLength(5);
+    expect(result.total).toBe(25);
+    expect(result.totalIsExact).toBe(true);
     expect(result.data.every((row) => row.status === "active")).toBe(true);
     expect(result.data[0]).toMatchObject({ order_count: 0, total_spend: 0 });
     expect(db.stats.collect["customers.by_status_created"]).toBe(1);
     expect(db.stats.collect.orders).toBeUndefined();
+    // counter read is a point lookup, not a scan
+    expect(db.stats.collect.customers).toBeUndefined();
   });
 });
 
@@ -173,7 +185,8 @@ describe("customers.list cursor pagination", () => {
 
     const first = await t.query(api.customers.list, { limit: 2, offset: 0 });
     expect(first.data).toHaveLength(2);
-    expect(first.total).toBeUndefined();
+    expect(first.total).toBe(205);
+    expect(first.totalIsExact).toBe(true);
     const deep = await t.query(api.customers.list, { limit: 1, offset: 200 });
     expect(deep.data).toHaveLength(1);
     await expect(

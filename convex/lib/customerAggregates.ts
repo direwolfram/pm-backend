@@ -62,6 +62,10 @@ export async function adjustCustomerOrderStats(
     order_count: Math.max((customer.order_count ?? 0) + delta.order_count, 0),
     total_spend: money((customer.total_spend ?? 0) + delta.total_spend),
     customerStatsVersion: CUSTOMER_ORDER_STATS_VERSION,
+    // Every authoritative aggregate write bumps the generation so an
+    // in-flight reconciliation detects the interleaving and restarts
+    // instead of committing a stale snapshot.
+    statsGeneration: (customer.statsGeneration ?? 0) + 1,
   });
 }
 

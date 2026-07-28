@@ -104,14 +104,15 @@ export function pageResponse<T>(
     nextCursor?: string | null;
     continueCursor?: string | null;
     isDone?: boolean;
+    total: number;
   },
 ) {
   const { limit, offset } = boundedPageArgs(args);
   const nextCursor = pagination.nextCursor ?? pagination.continueCursor ?? null;
   return {
     data,
-    total: undefined,
-    totalIsExact: false,
+    total: pagination.total,
+    totalIsExact: true,
     limit,
     offset,
     cursor: nextCursor,
@@ -130,6 +131,7 @@ export function offsetCompatResponse<T>(
   return pageResponse(data, args, {
     nextCursor: null,
     isDone: !hasMore,
+    total: rows.length,
   });
 }
 

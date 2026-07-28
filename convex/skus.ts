@@ -2,7 +2,10 @@ import { v } from "convex/values";
 import { anyApi } from "convex/server";
 import { query, mutation, internalMutation } from "./functions";
 import { now } from "./helpers";
-import { recomputeProductListSummary } from "./lib/productListSummaries";
+import {
+  deletePricesActiveForSku,
+  recomputeProductListSummary,
+} from "./lib/productListSummaries";
 import type { InventoryDoc, PriceDoc, SkuDoc } from "./model";
 
 const CASCADE_BATCH_LIMIT = 100;
@@ -295,6 +298,8 @@ export const continueSkuDelete = internalMutation({
       await ctx.db.delete(p._id);
       operations += 1;
     }
+    // Mirror cleanup: pricesActive rows for this SKU go with its prices.
+    await deletePricesActiveForSku(ctx, args.id);
     if (operations >= CASCADE_BATCH_LIMIT) {
       await ctx.scheduler.runAfter(0, anyApi.skus.continueSkuDelete, {
         id: args.id,

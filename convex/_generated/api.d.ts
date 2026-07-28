@@ -9,6 +9,7 @@
  */
 
 import type * as brands from "../brands.js";
+import type * as cascades from "../cascades.js";
 import type * as categories from "../categories.js";
 import type * as crons from "../crons.js";
 import type * as customers from "../customers.js";
@@ -22,6 +23,7 @@ import type * as lib_geo from "../lib/geo.js";
 import type * as lib_inventoryMath from "../lib/inventoryMath.js";
 import type * as lib_pricing from "../lib/pricing.js";
 import type * as lib_productListSummaries from "../lib/productListSummaries.js";
+import type * as listCounts from "../listCounts.js";
 import type * as model from "../model.js";
 import type * as orders from "../orders.js";
 import type * as prices from "../prices.js";
@@ -42,6 +44,7 @@ import type {
 
 declare const fullApi: ApiFromModules<{
   brands: typeof brands;
+  cascades: typeof cascades;
   categories: typeof categories;
   crons: typeof crons;
   customers: typeof customers;
@@ -55,6 +58,7 @@ declare const fullApi: ApiFromModules<{
   "lib/inventoryMath": typeof lib_inventoryMath;
   "lib/pricing": typeof lib_pricing;
   "lib/productListSummaries": typeof lib_productListSummaries;
+  listCounts: typeof listCounts;
   model: typeof model;
   orders: typeof orders;
   prices: typeof prices;

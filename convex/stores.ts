@@ -2,7 +2,12 @@ import { v } from "convex/values";
 import { anyApi } from "convex/server";
 import { query, mutation, internalMutation } from "./functions";
 import { now, paginate } from "./helpers";
-import type { DeliveryZoneDoc, StoreDoc } from "./model";
+import {
+  decrementProductStock,
+  deletePricesActiveForSku,
+  refreshProductDefaultPrice,
+} from "./lib/productListSummaries";
+import type { DeliveryZoneDoc, InventoryDoc, PriceDoc, StoreDoc } from "./model";
 
 const CASCADE_BATCH_LIMIT = 100;
 
@@ -153,13 +158,30 @@ export const continueStoreDelete = internalMutation({
       });
       return { done: false, operations };
     }
-    const inv = await ctx.db
+    const inv = (await ctx.db
       .query("inventory")
       .withIndex("by_store", (q) => q.eq("store_id", args.id))
-      .take(CASCADE_BATCH_LIMIT - operations);
+      .take(CASCADE_BATCH_LIMIT - operations)) as InventoryDoc[];
+    const deletedStockByProduct = new Map<string, number>();
     for (const row of inv) {
       await ctx.db.delete(row._id);
+      const productId = row.productId;
+      if (productId) {
+        const quantity =
+          row.quantity_available ??
+          (row as InventoryDoc & { availableQuantity?: number })
+            .availableQuantity ??
+          0;
+        deletedStockByProduct.set(
+          productId,
+          (deletedStockByProduct.get(productId) ?? 0) + quantity,
+        );
+      }
       operations += 1;
+    }
+    // Keep product total_stock exact as inventory disappears.
+    for (const [productId, quantity] of deletedStockByProduct) {
+      await decrementProductStock(ctx, productId, quantity);
     }
     if (operations >= CASCADE_BATCH_LIMIT) {
       await ctx.scheduler.runAfter(0, anyApi.stores.continueStoreDelete, {
@@ -167,13 +189,25 @@ export const continueStoreDelete = internalMutation({
       });
       return { done: false, operations };
     }
-    const prices = await ctx.db
+    const prices = (await ctx.db
       .query("prices")
       .withIndex("by_store", (q) => q.eq("store_id", args.id))
-      .take(CASCADE_BATCH_LIMIT - operations);
+      .take(CASCADE_BATCH_LIMIT - operations)) as PriceDoc[];
+    const priceSkus = new Set<string>();
+    const priceProducts = new Set<string>();
     for (const p of prices) {
       await ctx.db.delete(p._id);
+      priceSkus.add(p.sku_id);
+      if (p.product_id) priceProducts.add(p.product_id);
       operations += 1;
+    }
+    // Mirror cleanup: pricesActive rows for deleted prices go with them,
+    // and affected products get their default_price reconciled.
+    for (const skuId of priceSkus) {
+      await deletePricesActiveForSku(ctx, skuId);
+    }
+    for (const productId of priceProducts) {
+      await refreshProductDefaultPrice(ctx, productId);
     }
     if (operations >= CASCADE_BATCH_LIMIT) {
       await ctx.scheduler.runAfter(0, anyApi.stores.continueStoreDelete, {

@@ -2,9 +2,16 @@ import { v } from "convex/values";
 import { anyApi } from "convex/server";
 import { query, mutation, internalMutation } from "./functions";
 import { now, paginate } from "./helpers";
-import type { BrandDoc } from "./model";
+import { applyListCountChange, productCountKeys } from "./listCounts";
+import type { BrandDoc, ProductDoc } from "./model";
 
 const CASCADE_BATCH_LIMIT = 100;
+/**
+ * Products set-null per execution. Each product costs 1 read + 1 write plus
+ * 8 maintained-counter reads + 8 writes, so a continuation stays under
+ * ~50 reads / ~225 writes.
+ */
+const BRAND_SETNULL_BATCH_LIMIT = 25;
 
 export const list = query({
   args: {
@@ -106,15 +113,22 @@ export const continueBrandDelete = internalMutation({
     const brand = (await ctx.db.get(args.id)) as BrandDoc | null;
     if (!brand) return { done: true, deleted: true };
     let operations = 0;
-    const products = await ctx.db
+    const products = (await ctx.db
       .query("products")
       .withIndex("by_brand", (q) => q.eq("brand_id", args.id))
-      .take(CASCADE_BATCH_LIMIT);
+      .take(BRAND_SETNULL_BATCH_LIMIT)) as ProductDoc[];
     for (const p of products) {
       await ctx.db.patch(p._id, { brand_id: undefined });
+      await applyListCountChange(
+        ctx,
+        "products",
+        productCountKeys,
+        p,
+        { ...p, brand_id: undefined },
+      );
       operations += 1;
     }
-    if (operations >= CASCADE_BATCH_LIMIT) {
+    if (products.length >= BRAND_SETNULL_BATCH_LIMIT) {
       await ctx.scheduler.runAfter(0, anyApi.brands.continueBrandDelete, {
         id: args.id,
       });

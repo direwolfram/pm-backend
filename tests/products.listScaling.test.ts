@@ -39,6 +39,14 @@ describe("products.list read scaling", () => {
     );
     const db = new FakeConvexDb({
       products: [...target, ...unrelated],
+      listCounts: [
+        doc("listCounts", {
+          _id: "lc_combo",
+          scope: "products",
+          key: "category:cat_a|brand:brand_a|status:active",
+          count: 30,
+        }),
+      ],
       categories: [
         doc("categories", {
           _id: "cat_a",
@@ -71,6 +79,8 @@ describe("products.list read scaling", () => {
     );
 
     expect(result.data).toHaveLength(5);
+    expect(result.total).toBe(30);
+    expect(result.totalIsExact).toBe(true);
     expect(result.data[0]).toMatchObject({
       sku_count: 2,
       default_price: 42,

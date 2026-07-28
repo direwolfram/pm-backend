@@ -157,3 +157,70 @@ export async function recomputeProductListSummary(
   await ctx.db.patch(productId, patch);
   return patch;
 }
+
+const MAX_ACTIVE_MIRROR_ROWS_PER_SKU = 1_000;
+
+/**
+ * Delete every pricesActive mirror row for one SKU. Must run whenever prices
+ * are deleted outside prices.remove (batched cascades) so stale mirrors can
+ * never contribute to default_price.
+ */
+export async function deletePricesActiveForSku(ctx: { db: any }, skuId: string) {
+  const rows = await ctx.db
+    .query("pricesActive")
+    .withIndex("by_sku", (q: any) => q.eq("sku_id", skuId))
+    .take(MAX_ACTIVE_MIRROR_ROWS_PER_SKU + 1);
+  if (rows.length > MAX_ACTIVE_MIRROR_ROWS_PER_SKU) {
+    throw new Error(
+      `SKU ${skuId} has more than ${MAX_ACTIVE_MIRROR_ROWS_PER_SKU} active price mirror rows`,
+    );
+  }
+  for (const row of rows) {
+    await ctx.db.delete(row._id);
+  }
+  return rows.length;
+}
+
+/**
+ * Incrementally adjust total_stock when inventory rows are deleted by a
+ * batched cascade (store deletion). Each batch applies the exact delta of
+ * the rows it deleted transactionally, so retries cannot double-apply.
+ */
+export async function decrementProductStock(
+  ctx: { db: any },
+  productId: string,
+  quantity: number,
+) {
+  if (quantity === 0) return;
+  const product = await ctx.db.get(productId);
+  if (!product) return;
+  await ctx.db.patch(productId, {
+    total_stock: Math.max(((product as { total_stock?: number }).total_stock ?? 0) - quantity, 0),
+    productListSummaryVersion: PRODUCT_LIST_SUMMARY_VERSION,
+  });
+}
+
+/**
+ * Refresh only default_price for a product (used by batched cascades that
+ * delete prices without touching SKUs). One bounded mirror read per product.
+ */
+export async function refreshProductDefaultPrice(
+  ctx: { db: any },
+  productId: string,
+) {
+  const product = (await ctx.db.get(productId)) as
+    | { default_sku_id?: string; default_price?: number }
+    | null;
+  if (!product) return;
+  const next = product.default_sku_id
+    ? (await activePriceForSku(ctx, product.default_sku_id, Date.now()))
+        ?.sale_price
+    : undefined;
+  const nextPrice = next === undefined ? undefined : money(next);
+  if (product.default_price !== nextPrice) {
+    await ctx.db.patch(productId, {
+      default_price: nextPrice,
+      productListSummaryVersion: PRODUCT_LIST_SUMMARY_VERSION,
+    });
+  }
+}

@@ -11,6 +11,12 @@ import {
   wrapCursor,
 } from "./helpers";
 import { applyOrderStatsChange } from "./lib/customerAggregates";
+import {
+  applyListCountChange,
+  exactListTotal,
+  orderCountKeys,
+  orderTotalKey,
+} from "./listCounts";
 import type {
   AddressDoc,
   CustomerDoc,
@@ -138,22 +144,57 @@ async function pageOrders(
 ) {
   const pageArgs = boundedPageArgs(args);
   const limit = pageArgs.limit;
-  const fetchLimit = limit + pageArgs.offset + 1;
   const useOffset = args.offset !== undefined && args.cursor === undefined;
   const scope = orderListScope(args);
   const cursor = unwrapCursor(scope, args.cursor);
   const isSearch = !!args.search?.trim();
-  let queryBuilder;
+  const hasWindow = args.placed_from !== undefined || args.placed_to !== undefined;
+  const inWindow = (order: OrderDoc) =>
+    (args.placed_from === undefined || order.placed_at >= args.placed_from) &&
+    (args.placed_to === undefined || order.placed_at <= args.placed_to);
+
   if (isSearch) {
-    queryBuilder = ctx.db.query("orders").withSearchIndex("search_orders", (q: any) => {
-      let s = q.search("order_search_text", args.search!.trim().toLowerCase());
-      if (args.status) s = s.eq("status", args.status);
-      if (args.store_id) s = s.eq("store_id", args.store_id);
-      return s;
-    });
-  } else {
-    const indexName = orderIndex(args);
-    queryBuilder = ctx.db.query("orders").withIndex(indexName, (q: any) => {
+    // Search domain: status/store are search filter fields; the placed_at
+    // window is applied to the full match set BEFORE the logical page is
+    // produced, so pages are complete (never post-filtered fixed pages).
+    // Reads are bounded by the match set, not the table.
+    const matches = (
+      (await ctx.db
+        .query("orders")
+        .withSearchIndex("search_orders", (q: any) => {
+          let s = q.search("order_search_text", args.search!.trim().toLowerCase());
+          if (args.status) s = s.eq("status", args.status);
+          if (args.store_id) s = s.eq("store_id", args.store_id);
+          return s;
+        })
+        .collect()) as OrderDoc[]
+    ).filter(inWindow);
+    const skip = useOffset
+      ? pageArgs.offset
+      : cursor === null
+        ? 0
+        : Number(cursor);
+    if (!Number.isInteger(skip) || skip < 0 || skip > matches.length) {
+      throw new Error("Invalid cursor: request a fresh first page");
+    }
+    const page = matches.slice(skip, skip + limit);
+    const nextSkip = skip + limit;
+    return {
+      rows: page,
+      pagination: {
+        isDone: nextSkip >= matches.length,
+        nextCursor:
+          useOffset || nextSkip >= matches.length
+            ? null
+            : wrapCursor(scope, String(nextSkip)),
+        total: matches.length,
+      },
+    };
+  }
+
+  const indexName = orderIndex(args);
+  const makeBuilder = () =>
+    ctx.db.query("orders").withIndex(indexName, (q: any) => {
       const withBounds = (range: any) => {
         let out = range;
         if (args.placed_to !== undefined) out = out.lte("placed_at", args.placed_to);
@@ -169,39 +210,37 @@ async function pageOrders(
       if (args.status) return withBounds(q.eq("status", args.status));
       return withBounds(q);
     });
-  }
-  // Search indexes are always in relevance order and cannot be re-ordered;
-  // database indexes page newest-first.
-  const ordered = isSearch ? queryBuilder : queryBuilder.order("desc");
+  // Exact totals: maintained counters for equality-only queries (O(1)); a
+  // count of the index range (bounded by the match domain) for date windows
+  // or missing counter rows.
+  const maintained = hasWindow
+    ? undefined
+    : await exactListTotal(ctx, "orders", orderTotalKey(args));
+  const total =
+    maintained ?? ((await makeBuilder().collect()) as OrderDoc[]).length;
+
+  const ordered = makeBuilder().order("desc");
   if (!useOffset) {
     const result = await ordered.paginate({
       numItems: limit,
       cursor,
     });
-    const page = (result.page as OrderDoc[]).filter(
-      (order) =>
-        (args.placed_from === undefined || order.placed_at >= args.placed_from) &&
-        (args.placed_to === undefined || order.placed_at <= args.placed_to),
-    );
     return {
-      rows: page,
+      rows: result.page as OrderDoc[],
       pagination: {
         isDone: result.isDone,
         nextCursor:
           result.isDone || !result.continueCursor
             ? null
             : wrapCursor(scope, result.continueCursor),
+        total,
       },
     };
   }
-  const rows = ((await ordered.take(fetchLimit)) as OrderDoc[]).filter(
-    (order) =>
-      (args.placed_from === undefined || order.placed_at >= args.placed_from) &&
-      (args.placed_to !== undefined ? order.placed_at <= args.placed_to : true),
-  );
+  const rows = (await ordered.take(limit + pageArgs.offset + 1)) as OrderDoc[];
   return {
     rows: rows.slice(pageArgs.offset, pageArgs.offset + limit),
-    pagination: { isDone: rows.length <= pageArgs.offset + limit, nextCursor: null },
+    pagination: { isDone: rows.length <= pageArgs.offset + limit, nextCursor: null, total },
   };
 }
 
@@ -341,6 +380,9 @@ export const create = mutation({
     ]);
     if (!customer) throw new Error("Customer not found");
     if (!store) throw new Error("Store not found");
+    if ((store as { deleting_at?: number }).deleting_at) {
+      throw new Error("Store is being deleted");
+    }
     if (!address) throw new Error("Address not found");
     const order = {
       order_number: args.order_number,
@@ -370,6 +412,7 @@ export const create = mutation({
       orderSummaryVersion: ORDER_SUMMARY_VERSION,
     });
     await applyOrderStatsChange(ctx, null, { ...order, _id: id } as OrderDoc);
+    await applyListCountChange(ctx, "orders", orderCountKeys, null, order);
     return id;
   },
 });
@@ -437,6 +480,7 @@ export const remove = mutation({
     }
     await ctx.db.delete(args.id);
     await applyOrderStatsChange(ctx, order, null);
+    await applyListCountChange(ctx, "orders", orderCountKeys, order, null);
   },
 });
 
@@ -463,6 +507,10 @@ export const updateStatus = mutation({
         args.status === "delivered" ? (patch.delivered_at as number) : order.delivered_at,
       cancelled_at:
         args.status === "cancelled" ? (patch.cancelled_at as number) : order.cancelled_at,
+    });
+    await applyListCountChange(ctx, "orders", orderCountKeys, order, {
+      ...order,
+      status: args.status,
     });
     return args.id;
   },
@@ -508,6 +556,16 @@ export const createItem = mutation({
     }
     const order = (await ctx.db.get(args.order_id)) as OrderDoc | null;
     if (!order) throw new Error("Order not found");
+    const [product, sku] = await Promise.all([
+      ctx.db.get(args.product_id as any),
+      ctx.db.get(args.sku_id as any),
+    ]);
+    if ((product as { deleting_at?: number } | null)?.deleting_at) {
+      throw new Error("Product is being deleted");
+    }
+    if ((sku as { deleting_at?: number } | null)?.deleting_at) {
+      throw new Error("SKU is being deleted");
+    }
     // Derive the effective pre-write count BEFORE inserting so a missing
     // stored count cannot be recomputed with the new item already included
     // (which would double-count the new quantity).

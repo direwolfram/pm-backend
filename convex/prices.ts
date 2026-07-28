@@ -3,7 +3,6 @@ import { anyApi } from "convex/server";
 import { query, mutation, internalMutation } from "./functions";
 import { assertPricePair, now } from "./helpers";
 import {
-  PRICE_ACTIVE_LOOKAHEAD_MS,
   priceIsActiveMaterializable,
   recomputeProductListSummary,
 } from "./lib/productListSummaries";
@@ -24,7 +23,15 @@ async function syncPriceActiveRow(
   const rows = (await ctx.db
     .query("pricesActive")
     .withIndex("by_sku", (q: any) => q.eq("sku_id", price.sku_id))
-    .collect()) as { _id: string; price_id: string }[];
+    .collect()) as {
+    _id: string;
+    price_id: string;
+    product_id?: string;
+    store_id?: string;
+    sale_price: number;
+    starts_at: number;
+    ends_at?: number;
+  }[];
   const mirror = rows.find((row) => row.price_id === price._id);
   if (priceIsActiveMaterializable(price, t)) {
     const payload = {
@@ -37,10 +44,19 @@ async function syncPriceActiveRow(
       ends_at: price.ends_at,
     };
     if (mirror) {
-      await ctx.db.patch(mirror._id, payload);
-    } else {
-      await ctx.db.insert("pricesActive", payload);
+      if (
+        mirror.product_id !== payload.product_id ||
+        mirror.store_id !== payload.store_id ||
+        mirror.sale_price !== payload.sale_price ||
+        mirror.starts_at !== payload.starts_at ||
+        mirror.ends_at !== payload.ends_at
+      ) {
+        await ctx.db.patch(mirror._id, payload);
+        return true;
+      }
+      return false;
     }
+    await ctx.db.insert("pricesActive", payload);
     return true;
   }
   if (mirror) {
@@ -208,20 +224,27 @@ export const remove = mutation({
   },
 });
 
+const PRICE_TRANSITION_STATE_KEY = "prices.scheduleTransition";
+
 /**
- * Rolls price transitions forward in two bounded phases:
- * 1. Drop pricesActive mirror rows whose ends_at has passed (indexed).
- * 2. Materialize the rolling activation window: the 200 most recently
- *    started (or starting) prices within the lookahead window are synced
- *    into pricesActive.
- * Both phases are idempotent; affected product summaries are recomputed.
+ * Complete bounded price-transition drain. Two phases per execution:
+ * A. Expirations: delete pricesActive mirror rows whose ends_at passed
+ *    (indexed take; destructive drain, re-queried each execution until empty).
+ * B. Activations: cursor-paginated scan of ALL prices in insertion order.
+ *    The resume cursor lives in the transitionState row, so late-inserted
+ *    prices are always reached (they sort after the cursor), interrupted
+ *    drains resume where they stopped, and overlapping cron runs share one
+ *    logical chain. Each price is synced into pricesActive idempotently.
+ * Both phases self-schedule until drained and recompute only the summaries
+ * of products whose active-price set actually changed.
  */
 export const scheduleTransition = internalMutation({
   args: { now: v.optional(v.number()) },
   handler: async (ctx, args) => {
     const t = args.now ?? now();
     const touchedProducts = new Set<string>();
-    let expired = 0;
+
+    // Phase A: expirations (destructive drain — no cursor needed).
     const expiredMirrors = (await ctx.db
       .query("pricesActive")
       .withIndex("by_ends_at", (q: any) =>
@@ -233,31 +256,75 @@ export const scheduleTransition = internalMutation({
     }[];
     for (const mirror of expiredMirrors) {
       await ctx.db.delete(mirror._id);
-      expired += 1;
       if (mirror.product_id) touchedProducts.add(mirror.product_id);
     }
-    let activated = 0;
+    const expirationsDrained =
+      expiredMirrors.length < PRICE_TRANSITION_BATCH_LIMIT;
+
+    // Phase B: creation-ordered activation scan with a persisted
+    // _creationTime high-water mark. Late-inserted prices always sort after
+    // the mark, interrupted drains resume where they stopped, and
+    // overlapping cron runs share one logical chain.
+    const state = (await ctx.db
+      .query("transitionState")
+      .withIndex("by_key", (q: any) => q.eq("key", PRICE_TRANSITION_STATE_KEY))
+      .first()) as
+      | { _id: string; horizon?: number }
+      | null;
+    const horizon = state?.horizon ?? -1e15;
     const candidates = (await ctx.db
       .query("prices")
-      .withIndex("by_starts_at", (q: any) =>
-        q.lte("starts_at", t + PRICE_ACTIVE_LOOKAHEAD_MS),
+      .withIndex("by_creation_time", (q: any) =>
+        q.gt("_creationTime", horizon),
       )
-      .order("desc")
-      .take(PRICE_TRANSITION_BATCH_LIMIT)) as PriceDoc[];
-    for (const price of candidates) {
+      .take(PRICE_TRANSITION_BATCH_LIMIT + 1)) as (PriceDoc & {
+      _creationTime: number;
+    })[];
+    const activationsDrained =
+      candidates.length <= PRICE_TRANSITION_BATCH_LIMIT;
+    const batch = candidates.slice(0, PRICE_TRANSITION_BATCH_LIMIT);
+    let synced = 0;
+    for (const price of batch) {
       if (await syncPriceActiveRow(ctx, price, t)) {
-        activated += 1;
+        synced += 1;
         if (price.product_id) touchedProducts.add(price.product_id);
+      } else if (
+        price.product_id &&
+        price.starts_at <= t &&
+        (!price.ends_at || price.ends_at > t)
+      ) {
+        // Mirror unchanged but the price became time-active since the last
+        // drain: the persisted default_price must be recomputed.
+        touchedProducts.add(price.product_id);
       }
     }
+    const nextHorizon = batch.at(-1)?._creationTime ?? horizon;
+    if (state) {
+      if (state.horizon !== nextHorizon) {
+        await ctx.db.patch(state._id, { horizon: nextHorizon });
+      }
+    } else {
+      await ctx.db.insert("transitionState", {
+        key: PRICE_TRANSITION_STATE_KEY,
+        horizon: nextHorizon,
+      });
+    }
+
     for (const productId of touchedProducts) {
       await recomputeProductListSummary(ctx, productId);
     }
+    const drained = expirationsDrained && activationsDrained;
+    if (!drained) {
+      await ctx.scheduler.runAfter(0, anyApi.prices.scheduleTransition, {
+        now: t,
+      });
+    }
     return {
-      expired,
-      activated,
+      expired: expiredMirrors.length,
+      activated: synced,
       refreshed: touchedProducts.size,
-      remainingMayExist: expiredMirrors.length >= PRICE_TRANSITION_BATCH_LIMIT,
+      drained,
+      remainingMayExist: !drained,
     };
   },
 });

@@ -8,6 +8,7 @@ import {
   shelfLifeDaysRemaining,
 } from "./lib/inventoryMath";
 import { slugify } from "./helpers";
+import { productCountKeys } from "./listCounts";
 import type { Id as ConvexId } from "./_generated/dataModel";
 
 interface SeedProduct {
@@ -274,6 +275,27 @@ export const run = mutation({
         total_stock: totalStock,
         productListSummaryVersion: 2,
       });
+    }
+
+    // Maintained list counters for the seeded products.
+    const counts = new Map<string, number>();
+    for (const product of await ctx.db.query("products").collect()) {
+      for (const key of productCountKeys(product)) {
+        counts.set(key, (counts.get(key) ?? 0) + 1);
+      }
+    }
+    for (const [key, count] of counts) {
+      const existing = await ctx.db
+        .query("listCounts")
+        .withIndex("by_scope_key", (q) =>
+          q.eq("scope", "products").eq("key", key),
+        )
+        .first();
+      if (existing) {
+        await ctx.db.patch(existing._id, { count: existing.count + count });
+      } else {
+        await ctx.db.insert("listCounts", { scope: "products", key, count });
+      }
     }
 
     for (const [i, inventoryId] of inventoryIds.slice(0, 10).entries()) {

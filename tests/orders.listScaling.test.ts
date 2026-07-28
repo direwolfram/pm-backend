@@ -38,6 +38,14 @@ describe("orders.list read scaling", () => {
     );
     const db = new FakeConvexDb({
       orders: [...target, ...unrelated],
+      listCounts: [
+        doc("listCounts", {
+          _id: "lc_store_a",
+          scope: "orders",
+          key: "store:store_a",
+          count: 20,
+        }),
+      ],
       customers: target.map((row) =>
         doc("customers", {
           _id: row.customer_id as string,
@@ -84,6 +92,8 @@ describe("orders.list read scaling", () => {
     );
 
     expect(result.data).toHaveLength(5);
+    expect(result.total).toBe(20);
+    expect(result.totalIsExact).toBe(true);
     expect(result.data.every((row) => row.store_id === "store_a")).toBe(true);
     expect(db.stats.collect["orders.by_store_placed"]).toBe(1);
     expect(db.stats.collect.orders).toBeUndefined();
@@ -342,8 +352,8 @@ describe("orders.list cursor pagination", () => {
 
     const first = await t.query(api.orders.list, { limit: 2, offset: 0 });
     expect(first.data).toHaveLength(2);
-    expect(first.total).toBeUndefined();
-    expect(first.totalIsExact).toBe(false);
+    expect(first.total).toBe(205);
+    expect(first.totalIsExact).toBe(true);
 
     const deep = await t.query(api.orders.list, { limit: 1, offset: 200 });
     expect(deep.data).toHaveLength(1);
@@ -400,8 +410,7 @@ describe("orders.list cursor pagination", () => {
     ).rejects.toThrow(/cursor/i);
   });
 
-  it("keeps page work constant while unrelated historical orders grow", async () => {
-    const target = Array.from({ length: 10 }, (_, index) =>
+  it("keeps page work constant while unrelated historical orders grow", async () => {    const target = Array.from({ length: 10 }, (_, index) =>
       order(`target_${index}`, "store_a", `customer_${index}`, 10_000 - index),
     );
     const unrelated = Array.from({ length: 2_000 }, (_, index) =>
@@ -409,6 +418,14 @@ describe("orders.list cursor pagination", () => {
     );
     const db = new FakeConvexDb({
       orders: [...target, ...unrelated],
+      listCounts: [
+        doc("listCounts", {
+          _id: "lc_store_a_growth",
+          scope: "orders",
+          key: "store:store_a",
+          count: 10,
+        }),
+      ],
       customers: [],
       stores: [],
       order_items: [],
@@ -420,8 +437,200 @@ describe("orders.list cursor pagination", () => {
     );
 
     expect(result.data).toHaveLength(5);
+    expect(result.total).toBe(10);
     expect(
       db.stats.documentsReturned["orders.by_store_placed"],
     ).toBeLessThanOrEqual(6);
+  });
+});
+
+describe("orders.list search with date windows", () => {
+  async function seedWindowOrders(t: ReturnType<typeof convexTest>) {
+    return await t.run(async (ctx) => {
+      const customerId = await ctx.db.insert("customers", {
+        phone_country_code: "+63",
+        phone_number: "900",
+        display_name: "Window Customer",
+        status: "active",
+        marketing_opt_in: false,
+        created_at: 1,
+        updated_at: 1,
+      });
+      const storeId = await ctx.db.insert("stores", {
+        name: "Store",
+        status: "active",
+        address: "A",
+        latitude: 0,
+        longitude: 0,
+        timezone: "Asia/Manila",
+        created_at: 1,
+        updated_at: 1,
+      });
+      const addressId = await ctx.db.insert("addresses", {
+        customer_id: customerId,
+        label: "home",
+        title: "Home",
+        full_address: "Home",
+        country_code: "PH",
+        latitude: 0,
+        longitude: 0,
+        is_default: true,
+        created_at: 1,
+        updated_at: 1,
+      });
+      return { customerId, storeId, addressId };
+    });
+  }
+
+  async function insertMany(
+    t: ReturnType<typeof convexTest>,
+    env: { customerId: Id<"customers">; storeId: Id<"stores">; addressId: Id<"addresses"> },
+    rows: { n: number; placedAt: number; status?: string }[],
+  ) {
+    await t.run(async (ctx) => {
+      for (const row of rows) {
+        await ctx.db.insert("orders", {
+          order_number: `PM-WIN-${row.n}`,
+          customer_id: env.customerId,
+          store_id: env.storeId,
+          address_id: env.addressId,
+          delivery_mode: "express",
+          status: row.status ?? "confirmed",
+          payment_status: "paid",
+          currency: "PHP",
+          subtotal_amount: 1,
+          discount_amount: 0,
+          delivery_fee_amount: 0,
+          total_amount: 1,
+          item_count: 1,
+          order_search_text: `needle order ${row.n}`,
+          orderSummaryVersion: 2,
+          placed_at: row.placedAt,
+        });
+      }
+    });
+  }
+
+  it("returns complete pages when out-of-window matches come first", async () => {
+    const t = convexTest({ schema, modules });
+    const env = await seedWindowOrders(t);
+    // 60 matches outside the window (higher placed_at), 45 inside.
+    await insertMany(
+      t,
+      env,
+      Array.from({ length: 60 }, (_, i) => ({ n: i, placedAt: 100_000 + i })),
+    );
+    await insertMany(
+      t,
+      env,
+      Array.from({ length: 45 }, (_, i) => ({
+        n: 100 + i,
+        placedAt: 1_000 + (i % 5),
+      })),
+    );
+
+    const seen: string[] = [];
+    let cursor: string | null = null;
+    let pages = 0;
+    let lastTotal = -1;
+    do {
+      const page: any = await t.query(api.orders.list, {
+        search: "needle",
+        placed_from: 1_000,
+        placed_to: 1_004,
+        limit: 20,
+        cursor,
+      } as any);
+      lastTotal = page.total;
+      for (const row of page.data as any[]) {
+        expect(row.placed_at).toBeGreaterThanOrEqual(1_000);
+        expect(row.placed_at).toBeLessThanOrEqual(1_004);
+        seen.push(row.order_number as string);
+      }
+      cursor = page.nextCursor;
+      pages += 1;
+      expect(pages).toBeLessThan(10);
+    } while (cursor !== null);
+
+    expect(lastTotal).toBe(45);
+    expect(seen).toHaveLength(45);
+    expect(new Set(seen).size).toBe(45);
+  });
+
+  it("honors status and store filters together with the window", async () => {
+    const t = convexTest({ schema, modules });
+    const env = await seedWindowOrders(t);
+    const { storeId } = env;
+    await insertMany(
+      t,
+      env,
+      Array.from({ length: 10 }, (_, i) => ({
+        n: i,
+        placedAt: 1_000,
+        status: i % 2 === 0 ? "confirmed" : "cancelled",
+      })),
+    );
+    await insertMany(
+      t,
+      env,
+      Array.from({ length: 10 }, (_, i) => ({ n: 10 + i, placedAt: 5_000 })),
+    );
+
+    const page = await t.query(api.orders.list, {
+      search: "needle",
+      status: "confirmed",
+      store_id: storeId,
+      placed_from: 500,
+      placed_to: 1_500,
+      limit: 50,
+    });
+    expect(page.total).toBe(5);
+    expect(page.data).toHaveLength(5);
+    expect(page.data.every((row: any) => row.status === "confirmed")).toBe(true);
+
+    const empty = await t.query(api.orders.list, {
+      search: "needle",
+      placed_from: 9_000,
+      placed_to: 9_500,
+      limit: 50,
+    });
+    expect(empty).toMatchObject({ total: 0, hasMore: false });
+    expect(empty.data).toHaveLength(0);
+  });
+
+  it("rejects a window cursor reused with changed dates", async () => {
+    const t = convexTest({ schema, modules });
+    const env = await seedWindowOrders(t);
+    await insertMany(
+      t,
+      env,
+      Array.from({ length: 5 }, (_, i) => ({ n: i, placedAt: 1_000 + i })),
+    );
+    const first = await t.query(api.orders.list, {
+      search: "needle",
+      placed_from: 1_000,
+      placed_to: 1_001,
+      limit: 1,
+    });
+    expect(first.data).toHaveLength(1);
+    await expect(
+      t.query(api.orders.list, {
+        search: "needle",
+        placed_from: 1_002,
+        placed_to: 1_004,
+        limit: 1,
+        cursor: first.nextCursor,
+      }),
+    ).rejects.toThrow(/cursor/i);
+    // identical window works
+    const second = await t.query(api.orders.list, {
+      search: "needle",
+      placed_from: 1_000,
+      placed_to: 1_001,
+      limit: 1,
+      cursor: first.nextCursor,
+    });
+    expect(second.data).toHaveLength(1);
+    expect(second.data[0].order_number).not.toBe(first.data[0].order_number);
   });
 });

@@ -7,6 +7,11 @@ import {
 } from "./lib/customerAggregates";
 import { PRODUCT_LIST_SUMMARY_VERSION } from "./lib/productListSummaries";
 import { ORDER_SUMMARY_VERSION, orderSearchText } from "./orders";
+import {
+  customerCountKeys,
+  orderCountKeys,
+  productCountKeys,
+} from "./listCounts";
 import type { CustomerDoc, OrderDoc } from "./model";
 
 /**
@@ -1023,6 +1028,27 @@ export const run = mutation({
         deeplink: "pocketmart://promotions/payday",
         created_at: t - day,
       });
+    }
+
+    // ---- Maintained list counters (kept exact inline; see listCounts) ----
+    const counts = new Map<string, { scope: string; key: string; count: number }>();
+    const bump = (scope: string, key: string) => {
+      const id = `${scope}${key}`;
+      const row = counts.get(id) ?? { scope, key, count: 0 };
+      row.count += 1;
+      counts.set(id, row);
+    };
+    for (const product of await ctx.db.query("products").collect()) {
+      for (const key of productCountKeys(product)) bump("products", key);
+    }
+    for (const customer of await ctx.db.query("customers").collect()) {
+      for (const key of customerCountKeys(customer)) bump("customers", key);
+    }
+    for (const order of await ctx.db.query("orders").collect()) {
+      for (const key of orderCountKeys(order)) bump("orders", key);
+    }
+    for (const row of counts.values()) {
+      await ctx.db.insert("listCounts", row);
     }
 
     return {

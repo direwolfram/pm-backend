@@ -47,7 +47,7 @@ import type {
 
 type ListResult = {
   data: ProductListRow[];
-  total?: number;
+  total: number;
   totalIsExact: boolean;
   nextCursor: string | null;
   hasMore: boolean;
