@@ -146,6 +146,17 @@ function orderListScope(args: {
 }
 
 /**
+ * Newest-first order with a stable tie-breaker, matching the non-search
+ * index ordering (placed_at desc, _id desc). Applied to capped search match
+ * sets so search pages follow the same deterministic contract as index
+ * pages; equal placed_at timestamps can never reorder across requests.
+ */
+export function compareOrdersNewestFirst(a: OrderDoc, b: OrderDoc) {
+  if (a.placed_at !== b.placed_at) return b.placed_at - a.placed_at;
+  return a._id < b._id ? 1 : a._id > b._id ? -1 : 0;
+}
+
+/**
  * Bounded exact count of a query domain. Reads at most cap + 1 documents;
  * throws an explicit error when the domain is larger so callers never see a
  * silently truncated total.
@@ -210,6 +221,11 @@ async function pageOrders(
       );
     }
     const matches = rawMatches.filter(inWindow);
+    // Search indexes return relevance order, which is neither the
+    // established newest-first contract nor stable across requests. Sort the
+    // (capped) match set deterministically so pages, offsets, and cursor
+    // continuations all traverse the same total order.
+    matches.sort(compareOrdersNewestFirst);
     const skip = useOffset
       ? pageArgs.offset
       : cursor === null

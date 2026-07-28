@@ -3,7 +3,7 @@ import { convexTest } from "convex-test";
 import { api, internal } from "../convex/_generated/api";
 import schema from "../convex/schema";
 import type { Id } from "../convex/_generated/dataModel";
-import { listHandler, ORDER_LIST_SCAN_CAP } from "../convex/orders";
+import { listHandler, ORDER_LIST_SCAN_CAP, compareOrdersNewestFirst } from "../convex/orders";
 import { doc, FakeConvexDb } from "./fakeConvexDb";
 
 const modules = import.meta.glob("../convex/**/*.ts");
@@ -447,6 +447,123 @@ describe("order summary readiness and reconciliation", () => {
       limit: 100,
     });
     expect(again.patched).toBe(0);
+  });
+});
+
+describe("orders.list search ordering contract", () => {
+  async function seedTiedSearchOrders(t: ReturnType<typeof convexTest>) {
+    const env = await seedEnv(t);
+    // Groups of identical placed_at force tie handling on every page edge.
+    const placedAts = [9_000, 9_000, 9_000, 7_000, 7_000, 5_000, 5_000, 5_000, 5_000, 3_000, 3_000, 1_000];
+    await t.run(async (ctx) => {
+      for (let n = 0; n < placedAts.length; n += 1) {
+        await ctx.db.insert(
+          "orders",
+          orderRow(env, n, {
+            placedAt: placedAts[n],
+            searchText: `needle tied ${n}`,
+          }),
+        );
+      }
+    });
+    return env;
+  }
+
+  async function expectedOrder(t: ReturnType<typeof convexTest>) {
+    const all = await t.run(async (ctx) => await ctx.db.query("orders").collect());
+    return all
+      .filter((row) => (row.order_search_text ?? "").includes("needle"))
+      .sort(compareOrdersNewestFirst)
+      .map((row) => row._id as string);
+  }
+
+  it("paginates newest-first with stable tie handling across pages", async () => {
+    const t = convexTest({ schema, modules });
+    await seedTiedSearchOrders(t);
+    const expected = await expectedOrder(t);
+    expect(expected).toHaveLength(12);
+
+    const seen: string[] = [];
+    let cursor: string | null = null;
+    let lastPlacedAt = Number.POSITIVE_INFINITY;
+    let guard = 0;
+    do {
+      guard += 1;
+      expect(guard).toBeLessThan(10);
+      const page = await t.query(api.orders.list, {
+        search: "needle",
+        limit: 5,
+        cursor,
+      });
+      expect(page.total).toBe(12);
+      expect(page.totalIsExact).toBe(true);
+      for (const row of page.data) {
+        expect(row.placed_at).toBeLessThanOrEqual(lastPlacedAt);
+        lastPlacedAt = row.placed_at;
+        seen.push(row._id as string);
+      }
+      cursor = page.nextCursor;
+    } while (cursor !== null);
+
+    expect(seen).toEqual(expected);
+    expect(new Set(seen).size).toBe(12);
+  });
+
+  it("keeps newest-first order when a date window and filters apply", async () => {
+    const t = convexTest({ schema, modules });
+    const env = await seedTiedSearchOrders(t);
+    const page = await t.query(api.orders.list, {
+      search: "needle",
+      status: "confirmed",
+      store_id: env.storeId,
+      placed_from: 3_000,
+      placed_to: 7_000,
+      limit: 50,
+    });
+    expect(page.total).toBe(8);
+    const placed = page.data.map((row) => row.placed_at);
+    expect(placed).toEqual([...placed].sort((a, b) => b - a));
+    expect(page.data.every((row) => row.placed_at >= 3_000 && row.placed_at <= 7_000)).toBe(true);
+  });
+
+  it("supports legacy offsets over the same newest-first order", async () => {
+    const t = convexTest({ schema, modules });
+    await seedTiedSearchOrders(t);
+    const expected = await expectedOrder(t);
+
+    const page = await t.query(api.orders.list, {
+      search: "needle",
+      limit: 4,
+      offset: 4,
+    });
+    expect(page.data.map((row) => row._id as string)).toEqual(expected.slice(4, 8));
+    expect(page.total).toBe(12);
+    expect(page.nextCursor).toBeNull();
+
+    const exhausted = await t.query(api.orders.list, {
+      search: "needle",
+      limit: 5,
+      offset: 12,
+    });
+    expect(exhausted).toMatchObject({ total: 12, hasMore: false });
+    expect(exhausted.data).toHaveLength(0);
+
+    // Deep offsets are rejected explicitly, never silently truncated.
+    await expect(
+      t.query(api.orders.list, { search: "needle", limit: 1, offset: 201 }),
+    ).rejects.toThrow(/offset pagination is only supported up to 200/);
+  });
+
+  it("returns an empty first page for search terms with no matches", async () => {
+    const t = convexTest({ schema, modules });
+    await seedTiedSearchOrders(t);
+    const page = await t.query(api.orders.list, { search: "absent", limit: 5 });
+    expect(page).toMatchObject({
+      total: 0,
+      hasMore: false,
+      nextCursor: null,
+    });
+    expect(page.data).toHaveLength(0);
   });
 });
 
