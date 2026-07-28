@@ -234,6 +234,9 @@ export interface InventoryDoc extends BaseDoc {
   status: InventoryStatus;
   restock_at?: number;
   updated_at: number;
+  skuCode?: string;
+  variantLabel?: string;
+  productName?: string;
 }
 
 export interface PromotionDoc extends BaseDoc {

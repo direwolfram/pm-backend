@@ -1,6 +1,6 @@
 import { v } from "convex/values";
 import { query, mutation } from "./functions";
-import { deriveInventoryStatus, now, paginate } from "./helpers";
+import { deriveInventoryStatus, now } from "./helpers";
 import type {
   InventoryDoc,
   InventoryRow,
@@ -16,17 +16,45 @@ const inventoryStatus = v.union(
   v.literal("unavailable"),
 );
 
+interface ListByStoreArgs {
+  store_id: string;
+  status?: InventoryStatus;
+  search?: string;
+  limit?: number;
+  offset?: number;
+}
+
 function isLegacyInventoryRow(row: InventoryDoc): boolean {
   return row.sku_id !== undefined && row.store_id !== undefined;
 }
 
-async function enrichRows(
+function inventoryPageArgs(args: { limit?: number; offset?: number }) {
+  const limit = Math.min(Math.max(args.limit ?? 50, 1), 200);
+  const offset = Math.max(args.offset ?? 0, 0);
+  return { limit, offset };
+}
+
+function inventorySearchText(
+  row: InventoryDoc,
+  sku?: SkuDoc | null,
+  product?: ProductDoc | null,
+) {
+  return `${row.productName ?? product?.name ?? ""} ${row.skuCode ?? sku?.sku_code ?? ""} ${row.variantLabel ?? sku?.variant_label ?? ""}`.toLowerCase();
+}
+
+function inventorySortName(
+  row: InventoryDoc,
+  product?: ProductDoc | null,
+) {
+  return row.productName ?? product?.name ?? "";
+}
+
+async function loadSkuProductLookups(
   ctx: { db: any },
   rows: InventoryDoc[],
-): Promise<InventoryRow[]> {
+) {
   const skuCache = new Map<string, SkuDoc | null>();
   const productCache = new Map<string, ProductDoc | null>();
-  const out: InventoryRow[] = [];
   for (const row of rows) {
     if (!isLegacyInventoryRow(row)) continue;
     if (!skuCache.has(row.sku_id)) {
@@ -38,10 +66,79 @@ async function enrichRows(
       productCache.set(
         sku.product_id,
         (await ctx.db.get(sku.product_id)) as ProductDoc | null,
-      );
+    );
     }
+  }
+  return { skuCache, productCache };
+}
+
+export async function listByStoreHandler(
+  ctx: { db: any },
+  args: ListByStoreArgs,
+) {
+  let rows: InventoryDoc[];
+  if (args.status) {
+    rows = (await ctx.db
+      .query("inventory")
+      .withIndex("by_store_status", (q: any) =>
+        q.eq("store_id", args.store_id).eq("status", args.status!),
+      )
+      .collect()) as InventoryDoc[];
+  } else {
+    rows = (await ctx.db
+      .query("inventory")
+      .withIndex("by_store", (q: any) => q.eq("store_id", args.store_id))
+      .collect()) as InventoryDoc[];
+  }
+  rows = rows.filter(isLegacyInventoryRow);
+
+  const missingSummaryRows = rows.filter(
+    (row) =>
+      row.productName === undefined ||
+      row.skuCode === undefined ||
+      row.variantLabel === undefined,
+  );
+  const { skuCache, productCache } = await loadSkuProductLookups(
+    ctx,
+    missingSummaryRows,
+  );
+
+  if (args.search) {
+    const s = args.search.toLowerCase();
+    rows = rows.filter((row) => {
+      const sku = skuCache.get(row.sku_id);
+      const product = sku ? productCache.get(sku.product_id) : null;
+      return inventorySearchText(row, sku, product).includes(s);
+    });
+  }
+
+  rows.sort((a, b) => {
+    const aSku = skuCache.get(a.sku_id);
+    const bSku = skuCache.get(b.sku_id);
+    const aProduct = aSku ? productCache.get(aSku.product_id) : null;
+    const bProduct = bSku ? productCache.get(bSku.product_id) : null;
+    return inventorySortName(a, aProduct).localeCompare(
+      inventorySortName(b, bProduct),
+    );
+  });
+
+  const { limit, offset } = inventoryPageArgs(args);
+  const pageRows = rows.slice(offset, offset + limit);
+  const pageMissing = pageRows.filter(
+    (row) => !skuCache.has(row.sku_id) || !row.productName,
+  );
+  const pageLookups = await loadSkuProductLookups(ctx, pageMissing);
+  for (const [id, sku] of pageLookups.skuCache) skuCache.set(id, sku);
+  for (const [id, product] of pageLookups.productCache) {
+    productCache.set(id, product);
+  }
+
+  const data: InventoryRow[] = [];
+  for (const row of pageRows) {
+    const sku = skuCache.get(row.sku_id);
+    if (!sku) continue;
     const product = productCache.get(sku.product_id);
-    out.push({
+    data.push({
       ...row,
       sku_code: sku.sku_code,
       variant_label: sku.variant_label,
@@ -49,7 +146,32 @@ async function enrichRows(
       product_id: sku.product_id,
     });
   }
-  return out;
+  return { data, total: rows.length, limit, offset };
+}
+
+export async function summaryByStoreHandler(
+  ctx: { db: any },
+  args: { store_id: string },
+) {
+  const rows = ((await ctx.db
+    .query("inventory")
+    .withIndex("by_store", (q: any) => q.eq("store_id", args.store_id))
+    .collect()) as InventoryDoc[]).filter(isLegacyInventoryRow);
+  const summary = {
+    total_skus: rows.length,
+    in_stock: 0,
+    low_stock: 0,
+    out_of_stock: 0,
+    unavailable: 0,
+    total_units: 0,
+    reserved_units: 0,
+  };
+  for (const r of rows) {
+    summary[r.status as InventoryStatus] += 1;
+    summary.total_units += r.quantity_available;
+    summary.reserved_units += r.quantity_reserved;
+  }
+  return summary;
 }
 
 export const listByStore = query({
@@ -61,65 +183,14 @@ export const listByStore = query({
     offset: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
-    let rows: InventoryDoc[];
-    if (args.status) {
-      rows = (await ctx.db
-        .query("inventory")
-        .withIndex("by_store_status", (q: any) =>
-          q.eq("store_id", args.store_id).eq("status", args.status!),
-        )
-        .collect()) as InventoryDoc[];
-    } else {
-      rows = (await ctx.db
-        .query("inventory")
-        .collect()
-        .then((all) =>
-          (all as InventoryDoc[]).filter(
-            (r) => isLegacyInventoryRow(r) && r.store_id === args.store_id,
-          ),
-        )) as InventoryDoc[];
-    }
-    let enriched = await enrichRows(ctx, rows);
-    if (args.search) {
-      const s = args.search.toLowerCase();
-      enriched = enriched.filter(
-        (r) =>
-          r.product_name.toLowerCase().includes(s) ||
-          r.sku_code.toLowerCase().includes(s) ||
-          r.variant_label.toLowerCase().includes(s),
-      );
-    }
-    enriched.sort((a, b) => a.product_name.localeCompare(b.product_name));
-    return paginate(enriched, args);
+    return listByStoreHandler(ctx, args);
   },
 });
 
 export const summaryByStore = query({
   args: { store_id: v.id("stores") },
   handler: async (ctx, args) => {
-    const rows = (await ctx.db
-      .query("inventory")
-      .collect()
-      .then((all) =>
-          (all as InventoryDoc[]).filter(
-            (r) => isLegacyInventoryRow(r) && r.store_id === args.store_id,
-          ),
-      )) as InventoryDoc[];
-    const summary = {
-      total_skus: rows.length,
-      in_stock: 0,
-      low_stock: 0,
-      out_of_stock: 0,
-      unavailable: 0,
-      total_units: 0,
-      reserved_units: 0,
-    };
-    for (const r of rows) {
-      summary[r.status as InventoryStatus] += 1;
-      summary.total_units += r.quantity_available;
-      summary.reserved_units += r.quantity_reserved;
-    }
-    return summary;
+    return summaryByStoreHandler(ctx, args);
   },
 });
 
@@ -150,6 +221,10 @@ export const upsert = mutation({
       lowStockThreshold: threshold,
       manualUnavailable: args.unavailable ?? existing?.status === "unavailable",
     });
+    const sku = (await ctx.db.get(args.sku_id)) as SkuDoc | null;
+    const product = sku
+      ? ((await ctx.db.get(sku.product_id as any)) as ProductDoc | null)
+      : null;
     if (existing) {
       await ctx.db.patch(existing._id as any, {
         quantity_available: args.quantity_available,
@@ -157,6 +232,9 @@ export const upsert = mutation({
         restock_at: args.restock_at,
         status,
         updated_at: now(),
+        skuCode: sku?.sku_code,
+        variantLabel: sku?.variant_label,
+        productName: product?.name,
       });
       return existing._id;
     }
@@ -169,6 +247,9 @@ export const upsert = mutation({
       status,
       restock_at: args.restock_at,
       updated_at: now(),
+      skuCode: sku?.sku_code,
+      variantLabel: sku?.variant_label,
+      productName: product?.name,
     });
   },
 });

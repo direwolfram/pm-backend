@@ -270,6 +270,8 @@ export default defineSchema({
     )),
     restock_at: v.optional(v.number()),
     updated_at: v.optional(v.number()),
+    skuCode: v.optional(v.string()),
+    variantLabel: v.optional(v.string()),
 
     sku: v.optional(v.string()),
     productId: v.optional(v.id("products")),
@@ -288,6 +290,7 @@ export default defineSchema({
     fulfillmentCenterName: v.optional(v.string()),
   })
     .index("by_sku_store", ["sku_id", "store_id"])
+    .index("by_store", ["store_id"])
     .index("by_store_status", ["store_id", "status"])
     .index("by_sku", ["sku_id"])
     .index("by_sku_center", ["sku", "fulfillmentCenterId"])
