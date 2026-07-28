@@ -565,6 +565,32 @@ describe("orders.list search ordering contract", () => {
     });
     expect(page.data).toHaveLength(0);
   });
+
+  it("pins the v2 token-prefix search semantics (not substring)", async () => {
+    const t = convexTest({ schema, modules });
+    await seedTiedSearchOrders(t);
+
+    // Token and token-prefix queries match.
+    const fullToken = await t.query(api.orders.list, {
+      search: "needle",
+      limit: 200,
+    });
+    expect(fullToken.total).toBe(12);
+    const prefix = await t.query(api.orders.list, {
+      search: "need",
+      limit: 200,
+    });
+    expect(prefix.total).toBe(12);
+
+    // A mid-token substring that v1 (naive .includes) would have matched
+    // must NOT match under the indexed v2 contract.
+    const midToken = await t.query(api.orders.list, {
+      search: "eedl",
+      limit: 10,
+    });
+    expect(midToken.total).toBe(0);
+    expect(midToken.data).toHaveLength(0);
+  });
 });
 
 function fakeOrder(

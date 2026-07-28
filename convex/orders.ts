@@ -366,6 +366,32 @@ const TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
   refunded: [],
 };
 
+/**
+ * orders.list — bounded contract (v2).
+ *
+ * The pre-v2 endpoint scanned the whole orders/customers/stores/order_items
+ * tables per request, which let it offer arbitrary offsets, exact totals for
+ * any domain, and naive substring search. Those semantics cannot be
+ * preserved with bounded reads, so this endpoint is an explicit v2 contract:
+ *
+ * - Ordering: deterministic newest-first (placed_at desc, _id desc) on every
+ *   path, with timestamp ties broken by _id so pages never overlap or gap.
+ * - Pagination: opaque, filter-fingerprinted cursors are the primary API.
+ *   Legacy `offset` is honored up to MAX_COMPAT_OFFSET (200) and rejected
+ *   with a documented error beyond that instead of silently truncating.
+ * - Totals: exact numeric totals on every path — O(1) maintained counters
+ *   for equality filters, a bounded scan (ORDER_LIST_SCAN_CAP) for search,
+ *   date-window, and counter-missing domains. Domains above the cap are
+ *   rejected with an explicit error, never an estimate or capped value.
+ * - Search semantics (deliberate change from v1): token-prefix matching over
+ *   the denormalized order_search_text (order number, customer name, phone),
+ *   not arbitrary substring matching. A partial token that is not a word
+ *   prefix no longer matches; this is what makes search indexed and bounded.
+ * - Caller audit: the only in-repo caller (src/pages/Orders.tsx) uses
+ *   status/store/search/limit only — no offset, cursor, or date window — and
+ *   is fully compatible with this contract. Deep-offset consumers must
+ *   migrate to cursor pagination.
+ */
 export const list = query({
   args: {
     status: v.optional(orderStatus),
