@@ -45,6 +45,26 @@ const categoryFields = {
   is_active: v.optional(v.boolean()),
 };
 
+interface CategoryDbReader {
+  get(id: string): Promise<CategoryDoc | null>;
+}
+
+async function assertNoCategoryCycle(
+  ctx: { db: CategoryDbReader },
+  categoryId: string,
+  parentId?: string,
+) {
+  let current = parentId;
+  while (current) {
+    if (current === categoryId) {
+      throw new Error("Category parent would create a cycle");
+    }
+    const parent = await ctx.db.get(current);
+    if (!parent) throw new Error("Parent category not found");
+    current = parent.parent_id;
+  }
+}
+
 export const create = mutation({
   args: categoryFields,
   handler: async (ctx, args) => {
@@ -55,10 +75,7 @@ export const create = mutation({
       .withIndex("by_slug", (q) => q.eq("slug", slug))
       .first();
     if (dup) throw new Error(`Slug "${slug}" is already used`);
-    if (args.parent_id) {
-      const parent = await ctx.db.get(args.parent_id);
-      if (!parent) throw new Error("Parent category not found");
-    }
+    await assertNoCategoryCycle(ctx, "", args.parent_id);
     return await ctx.db.insert("categories", {
       parent_id: args.parent_id,
       name: args.name,
@@ -81,6 +98,7 @@ export const update = mutation({
     const cat = await ctx.db.get(id);
     if (!cat) throw new Error("Category not found");
     if (patch.parent_id === id) throw new Error("A category cannot be its own parent");
+    await assertNoCategoryCycle(ctx, id as string, patch.parent_id);
     if (patch.slug && patch.slug !== cat.slug) {
       const dup = await ctx.db
         .query("categories")
