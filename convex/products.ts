@@ -1,7 +1,10 @@
 import { v } from "convex/values";
+import { anyApi } from "convex/server";
 import { query, mutation, internalMutation } from "./functions";
 import { boundedPageArgs, now, pageResponse, slugify } from "./helpers";
 import {
+  activePriceForSku,
+  computeProductListSummary,
   PRODUCT_LIST_SUMMARY_VERSION,
   recomputeProductListSummary,
 } from "./lib/productListSummaries";
@@ -22,6 +25,7 @@ const productStatus = v.union(
 
 const dummyProductImageColors = ["F7C948", "90CDF4", "C6F6D5", "FBB6CE"];
 const SIMILAR_PRODUCT_LIMIT = 24;
+const CASCADE_BATCH_LIMIT = 100;
 
 function dummyImagesForProduct(name: string) {
   return dummyProductImageColors.map((color, index) => {
@@ -56,16 +60,13 @@ async function pageProducts(
     brand_id?: string;
     limit?: number;
     offset?: number;
-    cursor?: string;
+    cursor?: string | null;
   },
 ) {
   const pageArgs = boundedPageArgs(args);
   const limit = pageArgs.limit;
-  const offset = args.cursor ? 0 : pageArgs.offset;
-  const fetchLimit = Math.min(limit + offset + 1, 201);
-  const cursorProduct = args.cursor
-    ? ((await ctx.db.get(args.cursor as any)) as ProductDoc | null)
-    : null;
+  const fetchLimit = limit + pageArgs.offset + 1;
+  const useOffset = args.offset !== undefined && args.cursor === undefined;
   let builder;
   if (args.search?.trim()) {
     builder = ctx.db.query("products").withSearchIndex("search_products", (q: any) => {
@@ -79,48 +80,49 @@ async function pageProducts(
     builder = ctx.db
       .query("products")
       .withIndex(productListIndex(args), (q: any) => {
-        const withCursor = (range: any) =>
-          cursorProduct ? range.lt("updated_at", cursorProduct.updated_at) : range;
         if (args.category_id && args.brand_id && args.status) {
-          return withCursor(
-            q
-              .eq("primary_category_id", args.category_id)
-              .eq("brand_id", args.brand_id)
-              .eq("status", args.status),
-          );
+          return q
+            .eq("primary_category_id", args.category_id)
+            .eq("brand_id", args.brand_id)
+            .eq("status", args.status);
         }
         if (args.category_id && args.brand_id) {
-          return withCursor(
-            q
-              .eq("primary_category_id", args.category_id)
-              .eq("brand_id", args.brand_id),
-          );
+          return q
+            .eq("primary_category_id", args.category_id)
+            .eq("brand_id", args.brand_id);
         }
         if (args.category_id && args.status) {
-          return withCursor(
-            q.eq("primary_category_id", args.category_id).eq("status", args.status),
-          );
+          return q.eq("primary_category_id", args.category_id).eq("status", args.status);
         }
         if (args.brand_id && args.status) {
-          return withCursor(q.eq("brand_id", args.brand_id).eq("status", args.status));
+          return q.eq("brand_id", args.brand_id).eq("status", args.status);
         }
-        if (args.category_id) {
-          return withCursor(q.eq("primary_category_id", args.category_id));
-        }
-        if (args.brand_id) return withCursor(q.eq("brand_id", args.brand_id));
-        if (args.status) return withCursor(q.eq("status", args.status));
-        return withCursor(q);
+        if (args.category_id) return q.eq("primary_category_id", args.category_id);
+        if (args.brand_id) return q.eq("brand_id", args.brand_id);
+        if (args.status) return q.eq("status", args.status);
+        return q;
       });
   }
-  const rows = ((await builder.order("desc").take(fetchLimit)) as ProductDoc[]).slice(
-    offset,
-    offset + limit + 1,
-  );
-  return { rows: rows.slice(0, limit), hasMore: rows.length > limit };
+  const ordered = builder.order("desc");
+  if (!useOffset) {
+    const result = await ordered.paginate({
+      numItems: limit,
+      cursor: args.cursor ?? null,
+    });
+    return { rows: result.page as ProductDoc[], pagination: result };
+  }
+  const rows = (await ordered.take(fetchLimit)) as ProductDoc[];
+  return {
+    rows: rows.slice(pageArgs.offset, pageArgs.offset + limit),
+    pagination: {
+      isDone: rows.length <= pageArgs.offset + limit,
+      nextCursor: null,
+    },
+  };
 }
 
 async function enrichProductPage(ctx: { db: any }, rows: ProductDoc[]) {
-  const [brands, categories, missingSummaries] = await Promise.all([
+  const [brands, categories, missingSummaries, activePrices] = await Promise.all([
     Promise.all(
       Array.from(
         new Set(rows.map((product) => product.brand_id).filter(Boolean)),
@@ -142,24 +144,40 @@ async function enrichProductPage(ctx: { db: any }, rows: ProductDoc[]) {
             product.productListSummaryVersion !== PRODUCT_LIST_SUMMARY_VERSION,
         )
         .map(async (product) => {
-          const summary = await recomputeProductListSummary(ctx, product._id);
+          const summary = await computeProductListSummary(ctx, product._id);
           return [product._id, summary] as const;
+        }),
+    ),
+    Promise.all(
+      rows
+        .map((product) => product.default_sku_id)
+        .filter(Boolean)
+        .map(async (skuId) => {
+          return [
+            skuId,
+            (await activePriceForSku(ctx, skuId, Date.now()))?.sale_price,
+          ] as const;
         }),
     ),
   ]);
   const brandName = new Map(brands);
   const catName = new Map(categories);
   const summaries = new Map(missingSummaries);
+  const activePriceBySku = new Map(activePrices);
   return rows.map((p): ProductListRow => {
     const summary = summaries.get(p._id);
+    const defaultSkuId = summary?.default_sku_id ?? p.default_sku_id;
     return {
       ...p,
       brand_name: p.brand_id ? brandName.get(p.brand_id)?.name : undefined,
       brand: p.brand,
       category_name: catName.get(p.primary_category_id)?.name,
       sku_count: summary?.sku_count ?? p.sku_count ?? 0,
-      default_sku_id: summary?.default_sku_id ?? p.default_sku_id,
-      default_price: summary?.default_price ?? p.default_price,
+      default_sku_id: defaultSkuId,
+      default_price:
+        (defaultSkuId ? activePriceBySku.get(defaultSkuId) : undefined) ??
+        summary?.default_price ??
+        p.default_price,
       total_stock: summary?.total_stock ?? p.total_stock ?? 0,
     };
   });
@@ -174,12 +192,12 @@ export async function listHandler(
     brand_id?: string;
     limit?: number;
     offset?: number;
-    cursor?: string;
+    cursor?: string | null;
   },
 ) {
-  const { rows, hasMore } = await pageProducts(ctx, args);
+  const { rows, pagination } = await pageProducts(ctx, args);
   const enriched = await enrichProductPage(ctx, rows);
-  return pageResponse(enriched, args, hasMore);
+  return pageResponse(enriched, args, pagination);
 }
 
 export const list = query({
@@ -190,7 +208,7 @@ export const list = query({
     brand_id: v.optional(v.id("brands")),
     limit: v.optional(v.number()),
     offset: v.optional(v.number()),
-    cursor: v.optional(v.string()),
+    cursor: v.optional(v.union(v.string(), v.null())),
   },
   handler: async (ctx, args) => {
     return await listHandler(ctx, args);
@@ -309,6 +327,16 @@ export const create = mutation({
     if (dup) throw new Error(`Slug "${slug}" is already used`);
     const category = await ctx.db.get(args.primary_category_id);
     if (!category) throw new Error("Category not found");
+    if ((category as { deleting_at?: number }).deleting_at) {
+      throw new Error("Category is being deleted");
+    }
+    if (args.brand_id) {
+      const brand = await ctx.db.get(args.brand_id);
+      if (!brand) throw new Error("Brand not found");
+      if ((brand as { deleting_at?: number }).deleting_at) {
+        throw new Error("Brand is being deleted");
+      }
+    }
     return await ctx.db.insert("products", {
       sku: args.sku,
       brand_id: args.brand_id,
@@ -376,6 +404,20 @@ export const update = mutation({
       if (dup) throw new Error(`Slug "${patch.slug}" is already used`);
     }
     const categoryId = patch.categoryId ?? patch.primary_category_id;
+    if (categoryId) {
+      const category = await ctx.db.get(categoryId);
+      if (!category) throw new Error("Category not found");
+      if ((category as { deleting_at?: number }).deleting_at) {
+        throw new Error("Category is being deleted");
+      }
+    }
+    if (patch.brand_id) {
+      const brand = await ctx.db.get(patch.brand_id);
+      if (!brand) throw new Error("Brand not found");
+      if ((brand as { deleting_at?: number }).deleting_at) {
+        throw new Error("Brand is being deleted");
+      }
+    }
     await ctx.db.patch(id, {
       ...patch,
       ...(categoryId ? { categoryId } : {}),
@@ -423,6 +465,8 @@ export const backfillProductListSummaries = internalMutation({
 export const remove = mutation({
   args: { id: v.id("products") },
   handler: async (ctx, args) => {
+    const product = (await ctx.db.get(args.id)) as ProductDoc | null;
+    if (!product) return;
     const orderItem = await ctx.db
       .query("order_items")
       .withIndex("by_product", (q) => q.eq("product_id", args.id))
@@ -432,56 +476,140 @@ export const remove = mutation({
         "Cannot delete: this product appears in orders. Set status to discontinued instead.",
       );
     }
+    if (!product.deleting_at) {
+      await ctx.db.patch(args.id, { deleting_at: now() });
+    }
+    await ctx.scheduler.runAfter(0, anyApi.products.continueProductDelete, {
+      id: args.id,
+    });
+    return args.id;
+  },
+});
+
+export const continueProductDelete = internalMutation({
+  args: { id: v.id("products") },
+  handler: async (ctx, args) => {
+    const product = (await ctx.db.get(args.id)) as ProductDoc | null;
+    if (!product) return { done: true, deleted: true };
+    const orderItem = await ctx.db
+      .query("order_items")
+      .withIndex("by_product", (q) => q.eq("product_id", args.id))
+      .first();
+    if (orderItem) throw new Error("Cannot delete: this product appears in orders");
+    let operations = 0;
     const media = await ctx.db
       .query("product_media")
       .withIndex("by_product", (q) => q.eq("product_id", args.id))
-      .collect();
-    for (const m of media) await ctx.db.delete(m._id);
+      .take(CASCADE_BATCH_LIMIT);
+    for (const m of media) {
+      await ctx.db.delete(m._id);
+      operations += 1;
+    }
+    if (operations >= CASCADE_BATCH_LIMIT) {
+      await ctx.scheduler.runAfter(0, anyApi.products.continueProductDelete, {
+        id: args.id,
+      });
+      return { done: false, operations };
+    }
 
     const [outgoingPairs, incomingPairs] = await Promise.all([
       ctx.db
         .query("product_similar_products")
         .withIndex("by_product", (q) => q.eq("product_id", args.id))
-        .collect(),
+        .take(CASCADE_BATCH_LIMIT),
       ctx.db
         .query("product_similar_products")
         .withIndex("by_similar_product", (q) =>
           q.eq("similar_product_id", args.id),
         )
-        .collect(),
+        .take(CASCADE_BATCH_LIMIT),
     ]);
     const pairIds = new Set(
       [...outgoingPairs, ...incomingPairs].map((pair) => pair._id),
     );
-    for (const id of pairIds) await ctx.db.delete(id);
+    for (const id of pairIds) {
+      if (operations >= CASCADE_BATCH_LIMIT) break;
+      await ctx.db.delete(id);
+      operations += 1;
+    }
+    if (operations >= CASCADE_BATCH_LIMIT) {
+      await ctx.scheduler.runAfter(0, anyApi.products.continueProductDelete, {
+        id: args.id,
+      });
+      return { done: false, operations };
+    }
+    const prices = await ctx.db
+      .query("prices")
+      .withIndex("by_product", (q) => q.eq("product_id", args.id))
+      .take(CASCADE_BATCH_LIMIT - operations);
+    for (const pr of prices) {
+      await ctx.db.delete(pr._id);
+      operations += 1;
+    }
+    if (operations >= CASCADE_BATCH_LIMIT) {
+      await ctx.scheduler.runAfter(0, anyApi.products.continueProductDelete, {
+        id: args.id,
+      });
+      return { done: false, operations };
+    }
+    const inv = await ctx.db
+      .query("inventory")
+      .withIndex("by_product_id", (q) => q.eq("productId", args.id))
+      .take(CASCADE_BATCH_LIMIT - operations);
+    for (const i of inv) {
+      await ctx.db.delete(i._id);
+      operations += 1;
+    }
+    if (operations >= CASCADE_BATCH_LIMIT) {
+      await ctx.scheduler.runAfter(0, anyApi.products.continueProductDelete, {
+        id: args.id,
+      });
+      return { done: false, operations };
+    }
     const skus = await ctx.db
       .query("skus")
       .withIndex("by_product", (q) => q.eq("product_id", args.id))
-      .collect();
+      .take(CASCADE_BATCH_LIMIT - operations);
     for (const s of skus) {
-      const prices = await ctx.db
-        .query("prices")
-        .withIndex("by_sku", (q) => q.eq("sku_id", s._id))
-        .collect();
-      for (const pr of prices) await ctx.db.delete(pr._id);
-      const inv = await ctx.db
-        .query("inventory")
-        .withIndex("by_sku", (q) => q.eq("sku_id", s._id))
-        .collect();
-      for (const i of inv) await ctx.db.delete(i._id);
       await ctx.db.delete(s._id);
+      operations += 1;
+    }
+    if (operations >= CASCADE_BATCH_LIMIT) {
+      await ctx.scheduler.runAfter(0, anyApi.products.continueProductDelete, {
+        id: args.id,
+      });
+      return { done: false, operations };
     }
     const items = await ctx.db
       .query("home_section_items")
       .withIndex("by_product", (q) => q.eq("product_id", args.id))
-      .collect();
-    for (const item of items) await ctx.db.delete(item._id);
+      .take(CASCADE_BATCH_LIMIT - operations);
+    for (const item of items) {
+      await ctx.db.delete(item._id);
+      operations += 1;
+    }
+    if (operations >= CASCADE_BATCH_LIMIT) {
+      await ctx.scheduler.runAfter(0, anyApi.products.continueProductDelete, {
+        id: args.id,
+      });
+      return { done: false, operations };
+    }
     const targets = await ctx.db
       .query("promotion_targets")
       .withIndex("by_product", (q) => q.eq("product_id", args.id))
-      .collect();
-    for (const t of targets) await ctx.db.delete(t._id);
+      .take(CASCADE_BATCH_LIMIT - operations);
+    for (const t of targets) {
+      await ctx.db.delete(t._id);
+      operations += 1;
+    }
+    if (operations >= CASCADE_BATCH_LIMIT) {
+      await ctx.scheduler.runAfter(0, anyApi.products.continueProductDelete, {
+        id: args.id,
+      });
+      return { done: false, operations };
+    }
     await ctx.db.delete(args.id);
+    return { done: true, operations };
   },
 });
 
@@ -499,6 +627,9 @@ export const addMedia = mutation({
   },
   handler: async (ctx, args) => {
     if (!args.url && !args.storage_id) throw new Error("Media needs a URL or uploaded file");
+    const product = (await ctx.db.get(args.product_id)) as ProductDoc | null;
+    if (!product) throw new Error("Product not found");
+    if (product.deleting_at) throw new Error("Product is being deleted");
     const existing = await ctx.db
       .query("product_media")
       .withIndex("by_product", (q) => q.eq("product_id", args.product_id))
@@ -627,6 +758,9 @@ export const setSimilar = mutation({
     similar_product_ids: v.array(v.id("products")),
   },
   handler: async (ctx, args) => {
+    const product = (await ctx.db.get(args.product_id)) as ProductDoc | null;
+    if (!product) throw new Error("Product not found");
+    if (product.deleting_at) throw new Error("Product is being deleted");
     const existing = await ctx.db
       .query("product_similar_products")
       .withIndex("by_product", (q) => q.eq("product_id", args.product_id))
@@ -634,6 +768,8 @@ export const setSimilar = mutation({
     for (const p of existing) await ctx.db.delete(p._id);
     for (const sid of args.similar_product_ids) {
       if (sid === args.product_id) continue;
+      const similar = (await ctx.db.get(sid)) as ProductDoc | null;
+      if (!similar || similar.deleting_at) continue;
       await ctx.db.insert("product_similar_products", {
         product_id: args.product_id,
         similar_product_id: sid,

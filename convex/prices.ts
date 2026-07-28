@@ -75,6 +75,13 @@ export const upsert = mutation({
     }
     const sku = await ctx.db.get(args.sku_id);
     if (!sku) throw new Error("SKU not found");
+    if ((sku as { deleting_at?: number }).deleting_at) {
+      throw new Error("SKU is being deleted");
+    }
+    const product = await ctx.db.get((sku as { product_id: string }).product_id);
+    if ((product as { deleting_at?: number } | null)?.deleting_at) {
+      throw new Error("Product is being deleted");
+    }
     const store = args.store_id
       ? ((await ctx.db.get(args.store_id)) as { name?: string } | null)
       : null;

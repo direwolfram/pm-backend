@@ -93,6 +93,7 @@ interface BatchDoc {
   qualityCheckStatus: "pending" | "passed" | "failed";
   pickPriority: number;
   expiredAt?: number;
+  nextShelfLifeRefreshAt?: number;
 }
 
 interface DeliverySlotDoc {
@@ -163,6 +164,16 @@ const qualityCheckStatus = v.union(
 
 function now(): number {
   return Date.now();
+}
+
+function nextManilaMidnightAfter(t: number) {
+  const manilaOffset = 8 * 60 * 60 * 1000;
+  const day = 86_400_000;
+  return (Math.floor((t + manilaOffset) / day) + 1) * day - manilaOffset;
+}
+
+function nextShelfLifeRefreshAt(_expiryDate: number, evaluatedAt: number) {
+  return nextManilaMidnightAfter(evaluatedAt);
 }
 
 function assertPositiveQuantity(quantity: number) {
@@ -926,6 +937,7 @@ export const createBatch = mutation({
       discountPercent: args.discountPercent ?? 0,
       qualityCheckStatus: args.qualityCheckStatus ?? "pending",
       pickPriority: pickPriorityScore(args.expiryDate),
+      nextShelfLifeRefreshAt: nextShelfLifeRefreshAt(args.expiryDate, t),
     });
     await ctx.db.patch(args.inventoryId, {
       ...quickInventoryPatch(
@@ -1075,39 +1087,46 @@ export const expireCartReservations = internalMutation({
 
 export const updateShelfLife = internalMutation({
   args: {
-    cursorExpiryDate: v.optional(v.number()),
+    cursor: v.optional(v.string()),
     limit: v.optional(v.number()),
+    evaluatedAt: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
-    const t = now();
+    const t = args.evaluatedAt ?? now();
     const limit = Math.min(
       Math.max(args.limit ?? SHELF_LIFE_BATCH_LIMIT, 1),
       SHELF_LIFE_BATCH_LIMIT,
     );
-    const batches = (await ctx.db
+    const result = await ctx.db
       .query("batches")
-      .withIndex("by_unexpired_expiry", (q) => {
-        const base = q.eq("expiredAt", undefined);
-        return args.cursorExpiryDate === undefined
-          ? base
-          : base.gt("expiryDate", args.cursorExpiryDate);
-      })
+      .withIndex("by_unexpired_shelf_life_due", (q) =>
+        q.eq("expiredAt", undefined).lte("nextShelfLifeRefreshAt", t),
+      )
       .order("asc")
-      .take(limit + 1)) as BatchDoc[];
-    const page = batches.slice(0, limit);
+      .paginate({ numItems: limit, cursor: args.cursor ?? null });
+    const page = result.page as BatchDoc[];
     const touchedInventoryIds = new Set<InventoryId>();
     let patched = 0;
     for (const batch of page) {
+      if (batch.expiredAt !== undefined) {
+        await ctx.db.patch(batch._id, {
+          nextShelfLifeRefreshAt: undefined,
+        });
+        patched += 1;
+        continue;
+      }
       const daysRemaining = shelfLifeDaysRemaining(batch.expiryDate, t);
       const next = {
         shelfLifeDaysRemaining: daysRemaining,
         isNearExpiry: daysRemaining <= 2,
         pickPriority: pickPriorityScore(batch.expiryDate),
+        nextShelfLifeRefreshAt: nextShelfLifeRefreshAt(batch.expiryDate, t),
       };
       if (
         batch.shelfLifeDaysRemaining !== next.shelfLifeDaysRemaining ||
         batch.isNearExpiry !== next.isNearExpiry ||
-        batch.pickPriority !== next.pickPriority
+        batch.pickPriority !== next.pickPriority ||
+        batch.nextShelfLifeRefreshAt !== next.nextShelfLifeRefreshAt
       ) {
         await ctx.db.patch(batch._id, next);
         touchedInventoryIds.add(batch.inventoryId);
@@ -1117,20 +1136,60 @@ export const updateShelfLife = internalMutation({
     for (const inventoryId of touchedInventoryIds) {
       await ctx.db.patch(inventoryId, await computeBatchSummary(ctx, inventoryId));
     }
-    const hasMore = batches.length > limit;
-    if (hasMore && page.at(-1)) {
+    if (!result.isDone) {
       await ctx.scheduler.runAfter(0, anyApi.quickInventory.updateShelfLife, {
-        cursorExpiryDate: page.at(-1)!.expiryDate,
+        cursor: result.continueCursor,
         limit,
+        evaluatedAt: t,
       });
     }
     return {
       processed: page.length,
       patched,
       touchedInventory: touchedInventoryIds.size,
-      nextCursorExpiryDate: hasMore ? page.at(-1)?.expiryDate : undefined,
-      remainingMayExist: hasMore,
+      nextCursor: result.continueCursor,
+      remainingMayExist: !result.isDone,
       timezone: "Asia/Manila",
+    };
+  },
+});
+
+export const backfillShelfLifeRefreshMarkers = internalMutation({
+  args: { limit: v.optional(v.number()), cursor: v.optional(v.string()) },
+  handler: async (ctx, args) => {
+    const t = now();
+    const limit = Math.min(
+      Math.max(args.limit ?? SHELF_LIFE_BATCH_LIMIT, 1),
+      SHELF_LIFE_BATCH_LIMIT,
+    );
+    const result = await ctx.db
+      .query("batches")
+      .withIndex("by_expiry")
+      .order("asc")
+      .paginate({ numItems: limit, cursor: args.cursor ?? null });
+    let patched = 0;
+    for (const batch of result.page as BatchDoc[]) {
+      const marker =
+        batch.expiredAt === undefined
+          ? nextShelfLifeRefreshAt(batch.expiryDate, t)
+          : undefined;
+      if (batch.nextShelfLifeRefreshAt !== marker) {
+        await ctx.db.patch(batch._id, { nextShelfLifeRefreshAt: marker });
+        patched += 1;
+      }
+    }
+    if (!result.isDone) {
+      await ctx.scheduler.runAfter(
+        0,
+        anyApi.quickInventory.backfillShelfLifeRefreshMarkers,
+        { limit, cursor: result.continueCursor },
+      );
+    }
+    return {
+      processed: result.page.length,
+      patched,
+      nextCursor: result.continueCursor,
+      remainingMayExist: !result.isDone,
     };
   },
 });

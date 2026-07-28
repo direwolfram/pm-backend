@@ -121,6 +121,21 @@ export class FakeConvexDb {
         bump(this.stats.documentsReturned, key, out.length);
         return out;
       },
+      paginate: async ({ numItems, cursor }: { numItems: number; cursor?: string | null }) => {
+        const key = tableKey(table, indexName);
+        const all = this.applyConstraints(table, constraints);
+        const start = cursor ? Number(cursor) : 0;
+        const page = all.slice(start, start + numItems);
+        const next = start + page.length;
+        bump(this.stats.collect, key);
+        bump(this.stats.documentsReturned, key, page.length);
+        return {
+          page,
+          isDone: next >= all.length,
+          continueCursor: String(next),
+          nextCursor: String(next),
+        };
+      },
       first: async () => {
         const key = tableKey(table, indexName);
         const out = this.applyConstraints(table, constraints)[0] ?? null;

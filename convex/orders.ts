@@ -1,4 +1,5 @@
 import { v } from "convex/values";
+import { anyApi } from "convex/server";
 import { query, mutation, internalMutation } from "./functions";
 import { boundedPageArgs, now, pageResponse } from "./helpers";
 import { applyOrderStatsChange } from "./lib/customerAggregates";
@@ -12,6 +13,9 @@ import type {
   PaymentDoc,
   StoreDoc,
 } from "./model";
+
+const ORDER_SUMMARY_VERSION = 2;
+const ORDER_SUMMARY_BATCH_LIMIT = 100;
 
 const orderStatus = v.union(
   v.literal("pending_payment"),
@@ -31,7 +35,7 @@ const paymentStatus = v.union(
   v.literal("refunded"),
 );
 
-function orderSearchText(order: OrderDoc, customer?: CustomerDoc | null) {
+export function orderSearchText(order: OrderDoc, customer?: CustomerDoc | null) {
   return [
     order.order_number,
     customer?.display_name ?? "",
@@ -41,6 +45,26 @@ function orderSearchText(order: OrderDoc, customer?: CustomerDoc | null) {
   ]
     .join(" ")
     .toLowerCase();
+}
+
+async function computeOrderItemCount(ctx: { db: any }, orderId: string) {
+  const items = (await ctx.db
+    .query("order_items")
+    .withIndex("by_order", (q: any) => q.eq("order_id", orderId))
+    .collect()) as OrderItemDoc[];
+  return items.reduce((sum, item) => sum + item.quantity, 0);
+}
+
+async function patchOrderSummary(ctx: { db: any }, order: OrderDoc) {
+  const [customer, itemCount] = await Promise.all([
+    ctx.db.get(order.customer_id as any),
+    computeOrderItemCount(ctx, order._id),
+  ]);
+  await ctx.db.patch(order._id as any, {
+    item_count: itemCount,
+    order_search_text: orderSearchText(order, customer as CustomerDoc | null),
+    orderSummaryVersion: ORDER_SUMMARY_VERSION,
+  });
 }
 
 function orderIndex(args: {
@@ -63,18 +87,15 @@ async function pageOrders(
     search?: string;
     limit?: number;
     offset?: number;
-    cursor?: string;
+    cursor?: string | null;
     placed_from?: number;
     placed_to?: number;
   },
 ) {
   const pageArgs = boundedPageArgs(args);
   const limit = pageArgs.limit;
-  const offset = args.cursor ? 0 : pageArgs.offset;
-  const fetchLimit = Math.min(limit + offset + 1, 201);
-  const cursorOrder = args.cursor
-    ? ((await ctx.db.get(args.cursor as any)) as OrderDoc | null)
-    : null;
+  const fetchLimit = limit + pageArgs.offset + 1;
+  const useOffset = args.offset !== undefined && args.cursor === undefined;
   let queryBuilder;
   if (args.search?.trim()) {
     queryBuilder = ctx.db.query("orders").withSearchIndex("search_orders", (q: any) => {
@@ -88,18 +109,7 @@ async function pageOrders(
     queryBuilder = ctx.db.query("orders").withIndex(indexName, (q: any) => {
       const withBounds = (range: any) => {
         let out = range;
-        if (cursorOrder) {
-          const upper =
-            args.placed_to !== undefined
-              ? Math.min(cursorOrder.placed_at, args.placed_to)
-              : cursorOrder.placed_at;
-          out =
-            args.placed_to !== undefined && args.placed_to < cursorOrder.placed_at
-              ? out.lte("placed_at", upper)
-              : out.lt("placed_at", upper);
-        } else if (args.placed_to !== undefined) {
-          out = out.lte("placed_at", args.placed_to);
-        }
+        if (args.placed_to !== undefined) out = out.lte("placed_at", args.placed_to);
         if (args.placed_from !== undefined) out = out.gte("placed_at", args.placed_from);
         return out;
       };
@@ -113,18 +123,32 @@ async function pageOrders(
       return withBounds(q);
     });
   }
-  const rows = ((await queryBuilder.order("desc").take(fetchLimit)) as OrderDoc[])
-    .filter(
+  const ordered = queryBuilder.order("desc");
+  if (!useOffset) {
+    const result = await ordered.paginate({
+      numItems: limit,
+      cursor: args.cursor ?? null,
+    });
+    const page = (result.page as OrderDoc[]).filter(
       (order) =>
         (args.placed_from === undefined || order.placed_at >= args.placed_from) &&
         (args.placed_to === undefined || order.placed_at <= args.placed_to),
-    )
-    .slice(offset, offset + limit + 1);
-  return { rows: rows.slice(0, limit), hasMore: rows.length > limit };
+    );
+    return { rows: page, pagination: result };
+  }
+  const rows = ((await ordered.take(fetchLimit)) as OrderDoc[]).filter(
+    (order) =>
+      (args.placed_from === undefined || order.placed_at >= args.placed_from) &&
+      (args.placed_to === undefined || order.placed_at <= args.placed_to),
+  );
+  return {
+    rows: rows.slice(pageArgs.offset, pageArgs.offset + limit),
+    pagination: { isDone: rows.length <= pageArgs.offset + limit, nextCursor: null },
+  };
 }
 
 async function enrichOrders(ctx: { db: any }, orders: OrderDoc[]) {
-  const [customers, stores, fallbackCounts] = await Promise.all([
+  const [customers, stores] = await Promise.all([
     Promise.all(
       Array.from(new Set(orders.map((order) => order.customer_id))).map(
         async (id) => [id, (await ctx.db.get(id as any)) as CustomerDoc | null] as const,
@@ -135,24 +159,9 @@ async function enrichOrders(ctx: { db: any }, orders: OrderDoc[]) {
         async (id) => [id, (await ctx.db.get(id as any)) as StoreDoc | null] as const,
       ),
     ),
-    Promise.all(
-      orders
-        .filter((order) => order.item_count === undefined)
-        .map(async (order) => {
-          const items = (await ctx.db
-            .query("order_items")
-            .withIndex("by_order", (q: any) => q.eq("order_id", order._id))
-            .collect()) as OrderItemDoc[];
-          return [
-            order._id,
-            items.reduce((sum, item) => sum + item.quantity, 0),
-          ] as const;
-        }),
-    ),
   ]);
   const customersById = new Map(customers);
   const storesById = new Map(stores);
-  const itemCounts = new Map(fallbackCounts);
   return orders.map((o): OrderListRow => {
     const c = customersById.get(o.customer_id);
     return {
@@ -160,7 +169,7 @@ async function enrichOrders(ctx: { db: any }, orders: OrderDoc[]) {
       customer_name:
         c?.display_name ?? `${c?.phone_country_code ?? ""}${c?.phone_number ?? ""}`,
       store_name: storesById.get(o.store_id)?.name,
-      item_count: o.item_count ?? itemCounts.get(o._id) ?? 0,
+      item_count: o.item_count ?? 0,
     };
   });
 }
@@ -173,14 +182,14 @@ export async function listHandler(
     search?: string;
     limit?: number;
     offset?: number;
-    cursor?: string;
+    cursor?: string | null;
     placed_from?: number;
     placed_to?: number;
   },
 ) {
-  const { rows, hasMore } = await pageOrders(ctx, args);
+  const { rows, pagination } = await pageOrders(ctx, args);
   const enriched = await enrichOrders(ctx, rows);
-  return pageResponse(enriched, args, hasMore);
+  return pageResponse(enriched, args, pagination);
 }
 
 /** Allowed forward transitions + terminal escape hatches. */
@@ -202,7 +211,7 @@ export const list = query({
     search: v.optional(v.string()),
     limit: v.optional(v.number()),
     offset: v.optional(v.number()),
-    cursor: v.optional(v.string()),
+    cursor: v.optional(v.union(v.string(), v.null())),
     placed_from: v.optional(v.number()),
     placed_to: v.optional(v.number()),
   },
@@ -240,6 +249,134 @@ export const get = query({
         ? `${address.title} — ${address.full_address}`
         : undefined,
     };
+  },
+});
+
+export const create = mutation({
+  args: {
+    order_number: v.string(),
+    customer_id: v.id("customers"),
+    cart_id: v.optional(v.id("carts")),
+    store_id: v.id("stores"),
+    address_id: v.id("addresses"),
+    delivery_mode: v.union(
+      v.literal("express"),
+      v.literal("savers"),
+      v.literal("sari-sari"),
+    ),
+    status: v.optional(orderStatus),
+    payment_status: v.optional(paymentStatus),
+    currency: v.optional(v.string()),
+    subtotal_amount: v.number(),
+    discount_amount: v.optional(v.number()),
+    delivery_fee_amount: v.optional(v.number()),
+    total_amount: v.number(),
+    customer_notes: v.optional(v.string()),
+    placed_at: v.optional(v.number()),
+    estimated_delivery_at: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    const [customer, store, address] = await Promise.all([
+      ctx.db.get(args.customer_id),
+      ctx.db.get(args.store_id),
+      ctx.db.get(args.address_id),
+    ]);
+    if (!customer) throw new Error("Customer not found");
+    if (!store) throw new Error("Store not found");
+    if (!address) throw new Error("Address not found");
+    const order = {
+      order_number: args.order_number,
+      customer_id: args.customer_id,
+      cart_id: args.cart_id,
+      store_id: args.store_id,
+      address_id: args.address_id,
+      delivery_mode: args.delivery_mode,
+      status: args.status ?? "pending_payment",
+      payment_status: args.payment_status ?? "pending",
+      currency: args.currency ?? "PHP",
+      subtotal_amount: args.subtotal_amount,
+      discount_amount: args.discount_amount ?? 0,
+      delivery_fee_amount: args.delivery_fee_amount ?? 0,
+      total_amount: args.total_amount,
+      customer_notes: args.customer_notes,
+      item_count: 0,
+      placed_at: args.placed_at ?? now(),
+      estimated_delivery_at: args.estimated_delivery_at,
+    } as Omit<OrderDoc, "_id" | "_creationTime">;
+    const id = await ctx.db.insert("orders", {
+      ...order,
+      order_search_text: orderSearchText(
+        { ...order, _id: "" } as OrderDoc,
+        customer as CustomerDoc,
+      ),
+      orderSummaryVersion: ORDER_SUMMARY_VERSION,
+    });
+    await applyOrderStatsChange(ctx, null, { ...order, _id: id } as OrderDoc);
+    return id;
+  },
+});
+
+export const updateAmounts = mutation({
+  args: {
+    id: v.id("orders"),
+    subtotal_amount: v.optional(v.number()),
+    discount_amount: v.optional(v.number()),
+    delivery_fee_amount: v.optional(v.number()),
+    total_amount: v.number(),
+  },
+  handler: async (ctx, args) => {
+    const order = (await ctx.db.get(args.id)) as OrderDoc | null;
+    if (!order) throw new Error("Order not found");
+    const next = {
+      ...order,
+      subtotal_amount: args.subtotal_amount ?? order.subtotal_amount,
+      discount_amount: args.discount_amount ?? order.discount_amount,
+      delivery_fee_amount: args.delivery_fee_amount ?? order.delivery_fee_amount,
+      total_amount: args.total_amount,
+    };
+    await ctx.db.patch(args.id, {
+      subtotal_amount: next.subtotal_amount,
+      discount_amount: next.discount_amount,
+      delivery_fee_amount: next.delivery_fee_amount,
+      total_amount: next.total_amount,
+    });
+    await applyOrderStatsChange(ctx, order, next);
+    return args.id;
+  },
+});
+
+export const reassignCustomer = mutation({
+  args: { id: v.id("orders"), customer_id: v.id("customers") },
+  handler: async (ctx, args) => {
+    const order = (await ctx.db.get(args.id)) as OrderDoc | null;
+    if (!order) throw new Error("Order not found");
+    const customer = (await ctx.db.get(args.customer_id)) as CustomerDoc | null;
+    if (!customer) throw new Error("Customer not found");
+    const next = { ...order, customer_id: args.customer_id };
+    await ctx.db.patch(args.id, {
+      customer_id: args.customer_id,
+      order_search_text: orderSearchText(next, customer),
+      orderSummaryVersion: ORDER_SUMMARY_VERSION,
+    });
+    await applyOrderStatsChange(ctx, order, next);
+    return args.id;
+  },
+});
+
+export const remove = mutation({
+  args: { id: v.id("orders") },
+  handler: async (ctx, args) => {
+    const order = (await ctx.db.get(args.id)) as OrderDoc | null;
+    if (!order) return;
+    const items = await ctx.db
+      .query("order_items")
+      .withIndex("by_order", (q) => q.eq("order_id", args.id))
+      .take(100);
+    if (items.length > 0) {
+      throw new Error("Delete order items before deleting the order");
+    }
+    await ctx.db.delete(args.id);
+    await applyOrderStatsChange(ctx, order, null);
   },
 });
 
@@ -292,37 +429,142 @@ export const updatePaymentStatus = mutation({
   },
 });
 
-export const backfillOrderListSummaries = internalMutation({
-  args: { limit: v.optional(v.number()) },
+export const createItem = mutation({
+  args: {
+    order_id: v.id("orders"),
+    product_id: v.id("products"),
+    sku_id: v.id("skus"),
+    product_name_snapshot: v.string(),
+    sku_label_snapshot: v.string(),
+    quantity: v.number(),
+    unit_price: v.number(),
+    compare_at_price: v.optional(v.number()),
+  },
   handler: async (ctx, args) => {
-    const limit = Math.min(Math.max(args.limit ?? 50, 1), 200);
-    const orders = (await ctx.db
+    const order = (await ctx.db.get(args.order_id)) as OrderDoc | null;
+    if (!order) throw new Error("Order not found");
+    const id = await ctx.db.insert("order_items", {
+      ...args,
+      line_total: args.quantity * args.unit_price,
+    });
+    await ctx.db.patch(args.order_id, {
+      item_count: (order.item_count ?? (await computeOrderItemCount(ctx, args.order_id))) + args.quantity,
+      orderSummaryVersion: ORDER_SUMMARY_VERSION,
+    });
+    return id;
+  },
+});
+
+export const updateItem = mutation({
+  args: {
+    id: v.id("order_items"),
+    order_id: v.optional(v.id("orders")),
+    quantity: v.optional(v.number()),
+    unit_price: v.optional(v.number()),
+    compare_at_price: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    const item = (await ctx.db.get(args.id)) as OrderItemDoc | null;
+    if (!item) throw new Error("Order item not found");
+    const nextOrderId = args.order_id ?? item.order_id;
+    const nextQuantity = args.quantity ?? item.quantity;
+    const nextUnitPrice = args.unit_price ?? item.unit_price;
+    await ctx.db.patch(args.id, {
+      order_id: nextOrderId,
+      quantity: nextQuantity,
+      unit_price: nextUnitPrice,
+      compare_at_price: args.compare_at_price,
+      line_total: nextQuantity * nextUnitPrice,
+    });
+    const touched = new Set([item.order_id, nextOrderId]);
+    for (const orderId of touched) {
+      const order = (await ctx.db.get(orderId as any)) as OrderDoc | null;
+      if (order) await patchOrderSummary(ctx, order);
+    }
+    return args.id;
+  },
+});
+
+export const removeItem = mutation({
+  args: { id: v.id("order_items") },
+  handler: async (ctx, args) => {
+    const item = (await ctx.db.get(args.id)) as OrderItemDoc | null;
+    if (!item) return;
+    await ctx.db.delete(args.id);
+    const order = (await ctx.db.get(item.order_id as any)) as OrderDoc | null;
+    if (order) await patchOrderSummary(ctx, order);
+  },
+});
+
+export const backfillOrderListSummaries = internalMutation({
+  args: { limit: v.optional(v.number()), cursor: v.optional(v.string()) },
+  handler: async (ctx, args) => {
+    const limit = Math.min(Math.max(args.limit ?? 50, 1), ORDER_SUMMARY_BATCH_LIMIT);
+    const result = await ctx.db
       .query("orders")
-      .withIndex("by_order_stats_backfill", (q) => q.eq("item_count", undefined))
-      .take(limit)) as OrderDoc[];
+      .withIndex("by_order_summary_version", (q) =>
+        q.eq("orderSummaryVersion", undefined),
+      )
+      .order("asc")
+      .paginate({ numItems: limit, cursor: args.cursor ?? null });
+    const orders = result.page as OrderDoc[];
     let patched = 0;
     for (const order of orders) {
-      const [items, customer] = await Promise.all([
-        ctx.db
-          .query("order_items")
-          .withIndex("by_order", (q: any) => q.eq("order_id", order._id))
-          .collect(),
-        ctx.db.get(order.customer_id as any),
-      ]);
-      const itemCount = (items as OrderItemDoc[]).reduce(
-        (sum, item) => sum + item.quantity,
-        0,
-      );
-      await ctx.db.patch(order._id as any, {
-        item_count: itemCount,
-        order_search_text: orderSearchText(order, customer as CustomerDoc | null),
-      });
+      await patchOrderSummary(ctx, order);
       patched += 1;
+    }
+    if (!result.isDone) {
+      await ctx.scheduler.runAfter(0, anyApi.orders.backfillOrderListSummaries, {
+        limit,
+        cursor: result.continueCursor,
+      });
     }
     return {
       processed: orders.length,
       patched,
-      remainingMayExist: orders.length >= limit,
+      nextCursor: result.continueCursor,
+      remainingMayExist: !result.isDone,
+    };
+  },
+});
+
+export const refreshCustomerOrderSearch = internalMutation({
+  args: {
+    customer_id: v.id("customers"),
+    cursor: v.optional(v.string()),
+    limit: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    const customer = (await ctx.db.get(args.customer_id)) as CustomerDoc | null;
+    const limit = Math.min(Math.max(args.limit ?? 50, 1), ORDER_SUMMARY_BATCH_LIMIT);
+    const result = await ctx.db
+      .query("orders")
+      .withIndex("by_customer", (q) => q.eq("customer_id", args.customer_id))
+      .order("desc")
+      .paginate({ numItems: limit, cursor: args.cursor ?? null });
+    let patched = 0;
+    for (const order of result.page as OrderDoc[]) {
+      const nextSearchText = orderSearchText(order, customer);
+      if (order.order_search_text !== nextSearchText) {
+        await ctx.db.patch(order._id as any, {
+          order_search_text: nextSearchText,
+          orderSummaryVersion: ORDER_SUMMARY_VERSION,
+        });
+        patched += 1;
+      }
+    }
+    if (!result.isDone) {
+      await ctx.scheduler.runAfter(0, anyApi.orders.refreshCustomerOrderSearch, {
+        customer_id: args.customer_id,
+        cursor: result.continueCursor,
+        limit,
+      });
+    }
+    return {
+      processed: result.page.length,
+      patched,
+      nextCursor: result.continueCursor,
+      remainingMayExist: !result.isDone,
     };
   },
 });

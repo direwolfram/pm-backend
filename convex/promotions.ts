@@ -3,6 +3,14 @@ import { query, mutation } from "./functions";
 import { paginate } from "./helpers";
 import type { PromotionDoc, PromotionTargetDoc } from "./model";
 
+const CASCADE_BATCH_LIMIT = 100;
+
+function assertBoundedCascade(rows: unknown[], label: string) {
+  if (rows.length > CASCADE_BATCH_LIMIT) {
+    throw new Error(`${label} has too many dependents; run a batched cleanup`);
+  }
+}
+
 const promotionKind = v.union(
   v.literal("banner"),
   v.literal("carousel"),
@@ -92,6 +100,26 @@ async function assertUniqueCoupon(
   }
 }
 
+async function assertTargetWritable(ctx: { db: any }, target: {
+  product_id?: string;
+  sku_id?: string;
+  category_id?: string;
+  brand_id?: string;
+}) {
+  for (const id of [
+    target.product_id,
+    target.sku_id,
+    target.category_id,
+    target.brand_id,
+  ].filter(Boolean)) {
+    const doc = await ctx.db.get(id as string);
+    if (!doc) throw new Error("Promotion target reference not found");
+    if ((doc as { deleting_at?: number }).deleting_at) {
+      throw new Error("Promotion target is being deleted");
+    }
+  }
+}
+
 export const create = mutation({
   args: {
     ...promotionFields,
@@ -128,6 +156,7 @@ export const create = mutation({
     });
     for (const t of args.targets ?? []) {
       if (!t.product_id && !t.sku_id && !t.category_id && !t.brand_id) continue;
+      await assertTargetWritable(ctx, t);
       await ctx.db.insert("promotion_targets", { promotion_id: id, ...t });
     }
     return id;
@@ -184,12 +213,14 @@ export const setTargets = mutation({
     const existing = await ctx.db
       .query("promotion_targets")
       .withIndex("by_promotion", (q) => q.eq("promotion_id", args.promotion_id))
-      .collect();
+      .take(CASCADE_BATCH_LIMIT + 1);
+    assertBoundedCascade(existing, "Promotion target replacement");
     for (const t of existing) await ctx.db.delete(t._id);
     for (const t of args.targets) {
       if (!t.product_id && !t.sku_id && !t.category_id && !t.brand_id) {
         throw new Error("Each target must reference a product, SKU, category, or brand");
       }
+      await assertTargetWritable(ctx, t);
       await ctx.db.insert("promotion_targets", {
         promotion_id: args.promotion_id,
         ...t,
@@ -204,12 +235,14 @@ export const remove = mutation({
     const targets = await ctx.db
       .query("promotion_targets")
       .withIndex("by_promotion", (q) => q.eq("promotion_id", args.id))
-      .collect();
+      .take(CASCADE_BATCH_LIMIT + 1);
+    assertBoundedCascade(targets, "Promotion target cleanup");
     for (const t of targets) await ctx.db.delete(t._id);
     const items = await ctx.db
       .query("home_section_items")
       .withIndex("by_promotion", (q) => q.eq("promotion_id", args.id))
-      .collect();
+      .take(CASCADE_BATCH_LIMIT + 1);
+    assertBoundedCascade(items, "Promotion home-section cleanup");
     for (const item of items) await ctx.db.delete(item._id);
     await ctx.db.delete(args.id);
   },

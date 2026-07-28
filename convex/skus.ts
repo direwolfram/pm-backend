@@ -3,6 +3,14 @@ import { query, mutation } from "./functions";
 import { recomputeProductListSummary } from "./lib/productListSummaries";
 import type { InventoryDoc, PriceDoc, SkuDoc } from "./model";
 
+const CASCADE_BATCH_LIMIT = 100;
+
+function assertBoundedCascade(rows: unknown[], label: string) {
+  if (rows.length > CASCADE_BATCH_LIMIT) {
+    throw new Error(`${label} has too many dependents; run a batched cleanup`);
+  }
+}
+
 export const listAll = query({
   args: { search: v.optional(v.string()) },
   handler: async (ctx, args) => {
@@ -140,6 +148,9 @@ export const create = mutation({
   handler: async (ctx, args) => {
     const product = await ctx.db.get(args.product_id);
     if (!product) throw new Error("Product not found");
+    if ((product as { deleting_at?: number }).deleting_at) {
+      throw new Error("Product is being deleted");
+    }
     await assertUniqueSkuCode(ctx, args.sku_code, args.barcode);
     const id = await ctx.db.insert("skus", {
       product_id: args.product_id,
@@ -189,9 +200,10 @@ export const update = mutation({
     if (!sku) throw new Error("SKU not found");
     const nextProductId = patch.product_id ?? sku.product_id;
     const product = (await ctx.db.get(nextProductId as any)) as
-      | { name?: string }
+      | { name?: string; deleting_at?: number }
       | null;
     if (!product) throw new Error("Product not found");
+    if (product.deleting_at) throw new Error("Product is being deleted");
     if (patch.sku_code || patch.barcode) {
       await assertUniqueSkuCode(
         ctx,
@@ -253,12 +265,14 @@ export const remove = mutation({
     const prices = await ctx.db
       .query("prices")
       .withIndex("by_sku", (q) => q.eq("sku_id", args.id))
-      .collect();
+      .take(CASCADE_BATCH_LIMIT + 1);
+    assertBoundedCascade(prices, "SKU price cleanup");
     for (const p of prices) await ctx.db.delete(p._id);
     const inv = await ctx.db
       .query("inventory")
       .withIndex("by_sku", (q) => q.eq("sku_id", args.id))
-      .collect();
+      .take(CASCADE_BATCH_LIMIT + 1);
+    assertBoundedCascade(inv, "SKU inventory cleanup");
     for (const i of inv) await ctx.db.delete(i._id);
     await ctx.db.delete(args.id);
     // ensure a remaining SKU becomes default if we deleted the default

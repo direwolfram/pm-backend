@@ -107,6 +107,7 @@ export interface StoreDoc extends BaseDoc {
   latitude: number;
   longitude: number;
   timezone: string;
+  deleting_at?: number;
   created_at: number;
   updated_at: number;
 }
@@ -128,6 +129,7 @@ export interface BrandDoc extends BaseDoc {
   logo_url?: string;
   logo_color?: string;
   is_active: boolean;
+  deleting_at?: number;
 }
 
 export interface CategoryDoc extends BaseDoc {
@@ -141,6 +143,7 @@ export interface CategoryDoc extends BaseDoc {
   image_color?: string;
   sort_order: number;
   is_active: boolean;
+  deleting_at?: number;
 }
 
 export interface ProductAttribute {
@@ -192,6 +195,7 @@ export interface ProductDoc extends BaseDoc {
   default_price?: number;
   total_stock?: number;
   productListSummaryVersion?: number;
+  deleting_at?: number;
   attributes: ProductAttribute[];
   created_at: number;
   updated_at: number;
@@ -222,6 +226,7 @@ export interface SkuDoc extends BaseDoc {
   sort_order: number;
   is_default: boolean;
   is_active: boolean;
+  deleting_at?: number;
 }
 
 export interface PriceDoc extends BaseDoc {
@@ -270,6 +275,7 @@ export interface PromotionDoc extends BaseDoc {
   starts_at: number;
   ends_at: number;
   is_active: boolean;
+  deleting_at?: number;
 }
 
 export interface PromotionTargetDoc extends BaseDoc {
@@ -379,6 +385,7 @@ export interface OrderDoc extends BaseDoc {
   customer_notes?: string;
   item_count?: number;
   order_search_text?: string;
+  orderSummaryVersion?: number;
   placed_at: number;
   estimated_delivery_at?: number;
   delivered_at?: number;

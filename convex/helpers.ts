@@ -41,28 +41,56 @@ export function paginate<T>(
   };
 }
 
+export const MAX_PAGE_LIMIT = 200;
+export const MAX_COMPAT_OFFSET = 200;
+
 export function boundedPageArgs(opts?: { limit?: number; offset?: number }) {
+  const offset = Math.max(opts?.offset ?? 0, 0);
+  if (offset > MAX_COMPAT_OFFSET) {
+    throw new Error(
+      `offset pagination is only supported up to ${MAX_COMPAT_OFFSET}; use cursor pagination for deeper pages`,
+    );
+  }
   return {
-    limit: Math.min(Math.max(opts?.limit ?? 50, 1), 200),
-    offset: Math.max(opts?.offset ?? 0, 0),
+    limit: Math.min(Math.max(opts?.limit ?? 50, 1), MAX_PAGE_LIMIT),
+    offset,
   };
 }
 
 export function pageResponse<T>(
   data: T[],
-  args: { limit?: number; offset?: number; cursor?: string },
-  hasMore: boolean,
+  args: { limit?: number; offset?: number; cursor?: string | null },
+  pagination: {
+    nextCursor?: string | null;
+    continueCursor?: string | null;
+    isDone?: boolean;
+  },
 ) {
   const { limit, offset } = boundedPageArgs(args);
+  const nextCursor = pagination.nextCursor ?? pagination.continueCursor ?? null;
   return {
     data,
-    total: offset + data.length + (hasMore ? 1 : 0),
+    total: undefined,
+    totalIsExact: false,
     limit,
     offset,
-    cursor: data.length > 0 ? String((data.at(-1) as any)._id) : args.cursor,
-    nextCursor: hasMore ? String((data.at(-1) as any)._id) : null,
-    hasMore,
+    cursor: nextCursor,
+    nextCursor,
+    hasMore: !(pagination.isDone ?? true),
   };
+}
+
+export function offsetCompatResponse<T>(
+  rows: T[],
+  args: { limit?: number; offset?: number },
+) {
+  const { limit, offset } = boundedPageArgs(args);
+  const data = rows.slice(offset, offset + limit);
+  const hasMore = rows.length > offset + limit;
+  return pageResponse(data, args, {
+    nextCursor: null,
+    isDone: !hasMore,
+  });
 }
 
 export function money(n: number): number {

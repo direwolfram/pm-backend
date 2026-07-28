@@ -3,6 +3,14 @@ import { query, mutation } from "./functions";
 import { paginate } from "./helpers";
 import type { BrandDoc } from "./model";
 
+const CASCADE_BATCH_LIMIT = 100;
+
+function assertBoundedCascade(rows: unknown[], label: string) {
+  if (rows.length > CASCADE_BATCH_LIMIT) {
+    throw new Error(`${label} has too many dependents; run a batched cleanup`);
+  }
+}
+
 export const list = query({
   args: {
     search: v.optional(v.string()),
@@ -85,14 +93,16 @@ export const remove = mutation({
     const products = await ctx.db
       .query("products")
       .withIndex("by_brand", (q) => q.eq("brand_id", args.id))
-      .collect();
+      .take(CASCADE_BATCH_LIMIT + 1);
+    assertBoundedCascade(products, "Brand");
     for (const p of products) {
       await ctx.db.patch(p._id, { brand_id: undefined });
     }
     const targets = await ctx.db
       .query("promotion_targets")
       .withIndex("by_brand", (q) => q.eq("brand_id", args.id))
-      .collect();
+      .take(CASCADE_BATCH_LIMIT + 1);
+    assertBoundedCascade(targets, "Brand promotion cleanup");
     for (const t of targets) await ctx.db.delete(t._id);
     await ctx.db.delete(args.id);
   },

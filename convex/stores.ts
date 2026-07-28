@@ -3,6 +3,14 @@ import { query, mutation } from "./functions";
 import { now, paginate } from "./helpers";
 import type { DeliveryZoneDoc, StoreDoc } from "./model";
 
+const CASCADE_BATCH_LIMIT = 100;
+
+function assertBoundedCascade(rows: unknown[], label: string) {
+  if (rows.length > CASCADE_BATCH_LIMIT) {
+    throw new Error(`${label} has too many dependents; run a batched cleanup`);
+  }
+}
+
 export const list = query({
   args: {
     includeInactive: v.optional(v.boolean()),
@@ -112,17 +120,20 @@ export const remove = mutation({
     const zones = await ctx.db
       .query("delivery_zones")
       .withIndex("by_store", (q) => q.eq("store_id", args.id))
-      .collect();
+      .take(CASCADE_BATCH_LIMIT + 1);
+    assertBoundedCascade(zones, "Store delivery-zone cleanup");
     for (const z of zones) await ctx.db.delete(z._id);
     const inv = await ctx.db
       .query("inventory")
       .withIndex("by_store", (q) => q.eq("store_id", args.id))
-      .collect();
+      .take(CASCADE_BATCH_LIMIT + 1);
+    assertBoundedCascade(inv, "Store inventory cleanup");
     for (const row of inv) await ctx.db.delete(row._id);
     const prices = await ctx.db
       .query("prices")
       .withIndex("by_store", (q) => q.eq("store_id", args.id))
-      .collect();
+      .take(CASCADE_BATCH_LIMIT + 1);
+    assertBoundedCascade(prices, "Store price cleanup");
     for (const p of prices) await ctx.db.delete(p._id);
     await ctx.db.delete(args.id);
   },

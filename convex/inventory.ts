@@ -223,9 +223,15 @@ export const upsert = mutation({
       manualUnavailable: args.unavailable ?? existing?.status === "unavailable",
     });
     const sku = (await ctx.db.get(args.sku_id)) as SkuDoc | null;
+    if ((sku as { deleting_at?: number } | null)?.deleting_at) {
+      throw new Error("SKU is being deleted");
+    }
     const product = sku
       ? ((await ctx.db.get(sku.product_id as any)) as ProductDoc | null)
       : null;
+    if ((product as { deleting_at?: number } | null)?.deleting_at) {
+      throw new Error("Product is being deleted");
+    }
     const store = (await ctx.db.get(args.store_id)) as StoreDoc | null;
     if (existing) {
       await ctx.db.patch(existing._id as any, {

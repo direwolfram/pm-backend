@@ -3,6 +3,14 @@ import { query, mutation } from "./functions";
 import { paginate, slugify } from "./helpers";
 import type { CategoryDoc } from "./model";
 
+const CASCADE_BATCH_LIMIT = 100;
+
+function assertBoundedCascade(rows: unknown[], label: string) {
+  if (rows.length > CASCADE_BATCH_LIMIT) {
+    throw new Error(`${label} has too many dependents; run a batched cleanup`);
+  }
+}
+
 export const list = query({
   args: {
     includeInactive: v.optional(v.boolean()),
@@ -118,7 +126,7 @@ export const remove = mutation({
     const products = await ctx.db
       .query("products")
       .withIndex("by_category", (q) => q.eq("primary_category_id", args.id))
-      .collect();
+      .take(CASCADE_BATCH_LIMIT + 1);
     if (products.length > 0) {
       throw new Error(
         `Cannot delete: ${products.length} product(s) use this category`,
@@ -127,19 +135,22 @@ export const remove = mutation({
     const children = await ctx.db
       .query("categories")
       .withIndex("by_parent", (q) => q.eq("parent_id", args.id))
-      .collect();
+      .take(CASCADE_BATCH_LIMIT + 1);
+    assertBoundedCascade(children, "Category");
     for (const c of children) {
       await ctx.db.patch(c._id, { parent_id: undefined });
     }
     const items = await ctx.db
       .query("home_section_items")
       .withIndex("by_category", (q) => q.eq("category_id", args.id))
-      .collect();
+      .take(CASCADE_BATCH_LIMIT + 1);
+    assertBoundedCascade(items, "Category home-section cleanup");
     for (const item of items) await ctx.db.delete(item._id);
     const targets = await ctx.db
       .query("promotion_targets")
       .withIndex("by_category", (q) => q.eq("category_id", args.id))
-      .collect();
+      .take(CASCADE_BATCH_LIMIT + 1);
+    assertBoundedCascade(targets, "Category promotion cleanup");
     for (const t of targets) await ctx.db.delete(t._id);
     await ctx.db.delete(args.id);
   },

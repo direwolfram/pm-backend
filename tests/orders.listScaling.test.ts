@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
+import { convexTest } from "convex-test";
+import { api } from "../convex/_generated/api";
+import schema from "../convex/schema";
 import type { Id } from "../convex/_generated/dataModel";
 import { listHandler } from "../convex/orders";
 import { doc, FakeConvexDb } from "./fakeConvexDb";
+
+const modules = import.meta.glob("../convex/**/*.ts");
 
 function order(id: string, storeId: string, customerId: string, placedAt: number) {
   return doc("orders", {
@@ -87,5 +92,82 @@ describe("orders.list read scaling", () => {
     expect(db.stats.collect.order_items).toBeUndefined();
     expect(db.stats.get.customers).toBe(5);
     expect(db.stats.get.stores).toBe(1);
+  });
+});
+
+describe("orders.list cursor pagination", () => {
+  it("continues without skipping or duplicating orders that share placed_at", async () => {
+    const t = convexTest({ schema, modules });
+    await t.run(async (ctx) => {
+      const customerId = await ctx.db.insert("customers", {
+        phone_country_code: "+63",
+        phone_number: "900",
+        display_name: "Cursor Customer",
+        status: "active",
+        marketing_opt_in: false,
+        search_text: "cursor customer +63 900",
+        created_at: 1,
+        updated_at: 1,
+      });
+      const storeId = await ctx.db.insert("stores", {
+        name: "Store",
+        status: "active",
+        address: "A",
+        latitude: 0,
+        longitude: 0,
+        timezone: "Asia/Manila",
+        created_at: 1,
+        updated_at: 1,
+      });
+      const addressId = await ctx.db.insert("addresses", {
+        customer_id: customerId,
+        label: "home",
+        title: "Home",
+        full_address: "Home",
+        country_code: "PH",
+        latitude: 0,
+        longitude: 0,
+        is_default: true,
+        created_at: 1,
+        updated_at: 1,
+      });
+      for (let index = 0; index < 5; index += 1) {
+        await ctx.db.insert("orders", {
+          order_number: `PM-CURSOR-${index}`,
+          customer_id: customerId,
+          store_id: storeId,
+          address_id: addressId,
+          delivery_mode: "express",
+          status: "confirmed",
+          payment_status: "paid",
+          currency: "PHP",
+          subtotal_amount: 10,
+          discount_amount: 0,
+          delivery_fee_amount: 0,
+          total_amount: 10,
+          item_count: 1,
+          order_search_text: `pm-cursor-${index} cursor customer`,
+          orderSummaryVersion: 2,
+          placed_at: 1_000,
+        });
+      }
+    });
+
+    const first = await t.query(api.orders.list, { limit: 2 });
+    const second = await t.query(api.orders.list, {
+      limit: 2,
+      cursor: first.nextCursor,
+    });
+    const third = await t.query(api.orders.list, {
+      limit: 2,
+      cursor: second.nextCursor,
+    });
+    const seen = [...first.data, ...second.data, ...third.data].map(
+      (row) => row.order_number,
+    );
+
+    expect(new Set(seen).size).toBe(5);
+    expect(seen).toHaveLength(5);
+    expect(third.hasMore).toBe(false);
   });
 });

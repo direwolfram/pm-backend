@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
+import { convexTest } from "convex-test";
+import { api } from "../convex/_generated/api";
+import schema from "../convex/schema";
 import { listHandler } from "../convex/customers";
 import { doc, FakeConvexDb } from "./fakeConvexDb";
+
+const modules = import.meta.glob("../convex/**/*.ts");
 
 describe("customers.list read scaling", () => {
   it("uses customer aggregates without scanning orders", async () => {
@@ -48,5 +53,42 @@ describe("customers.list read scaling", () => {
     expect(result.data[0]).toMatchObject({ order_count: 0, total_spend: 0 });
     expect(db.stats.collect["customers.by_status_created"]).toBe(1);
     expect(db.stats.collect.orders).toBeUndefined();
+  });
+});
+
+describe("customers.list cursor pagination", () => {
+  it("continues across duplicate created_at values without duplicates", async () => {
+    const t = convexTest({ schema, modules });
+    await t.run(async (ctx) => {
+      for (let index = 0; index < 5; index += 1) {
+        await ctx.db.insert("customers", {
+          phone_country_code: "+63",
+          phone_number: `901${index}`,
+          display_name: `Customer ${index}`,
+          status: "active",
+          marketing_opt_in: false,
+          search_text: `customer ${index}`,
+          order_count: 0,
+          total_spend: 0,
+          customerStatsVersion: 1,
+          created_at: 1_000,
+          updated_at: 1_000,
+        });
+      }
+    });
+
+    const first = await t.query(api.customers.list, { limit: 2 });
+    const second = await t.query(api.customers.list, {
+      limit: 2,
+      cursor: first.nextCursor,
+    });
+    const third = await t.query(api.customers.list, {
+      limit: 2,
+      cursor: second.nextCursor,
+    });
+    const ids = [...first.data, ...second.data, ...third.data].map((row) => row._id);
+
+    expect(ids).toHaveLength(5);
+    expect(new Set(ids).size).toBe(5);
   });
 });

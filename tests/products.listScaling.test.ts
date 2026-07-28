@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
+import { convexTest } from "convex-test";
+import { api } from "../convex/_generated/api";
+import schema from "../convex/schema";
 import type { Id } from "../convex/_generated/dataModel";
 import { listHandler } from "../convex/products";
 import { doc, FakeConvexDb } from "./fakeConvexDb";
+
+const modules = import.meta.glob("../convex/**/*.ts");
 
 function product(id: string, categoryId: string, brandId: string, updatedAt: number) {
   return doc("products", {
@@ -80,5 +85,36 @@ describe("products.list read scaling", () => {
     expect(db.stats.collect.inventory).toBeUndefined();
     expect(db.stats.get.brands).toBe(1);
     expect(db.stats.get.categories).toBe(1);
+  });
+});
+
+describe("products.list query behavior", () => {
+  it("does not patch unsummarized legacy products from a query", async () => {
+    const t = convexTest({ schema, modules });
+    const productId = await t.run(async (ctx) => {
+      const categoryId = await ctx.db.insert("categories", {
+        name: "Category",
+        slug: "category",
+        sort_order: 1,
+        is_active: true,
+      });
+      return await ctx.db.insert("products", {
+        primary_category_id: categoryId,
+        name: "Legacy Product",
+        slug: "legacy-product",
+        status: "active",
+        rating_average: 0,
+        rating_count: 0,
+        attributes: [],
+        created_at: 1,
+        updated_at: 1,
+      });
+    });
+
+    const result = await t.query(api.products.list, { limit: 1 });
+    const product = await t.run(async (ctx) => await ctx.db.get(productId));
+
+    expect(result.data[0].name).toBe("Legacy Product");
+    expect(product?.productListSummaryVersion).toBeUndefined();
   });
 });

@@ -1,4 +1,5 @@
 import { v } from "convex/values";
+import { anyApi } from "convex/server";
 import { query, mutation, internalMutation } from "./functions";
 import { boundedPageArgs, money, now, pageResponse } from "./helpers";
 import {
@@ -13,6 +14,8 @@ import type {
   SupportTicketDoc,
 } from "./model";
 
+const CUSTOMER_BACKFILL_LIMIT = 100;
+
 async function pageCustomers(
   ctx: { db: any },
   args: {
@@ -20,16 +23,13 @@ async function pageCustomers(
     status?: CustomerDoc["status"];
     limit?: number;
     offset?: number;
-    cursor?: string;
+    cursor?: string | null;
   },
 ) {
   const pageArgs = boundedPageArgs(args);
   const limit = pageArgs.limit;
-  const offset = args.cursor ? 0 : pageArgs.offset;
-  const fetchLimit = Math.min(limit + offset + 1, 201);
-  const cursorCustomer = args.cursor
-    ? ((await ctx.db.get(args.cursor as any)) as CustomerDoc | null)
-    : null;
+  const fetchLimit = limit + pageArgs.offset + 1;
+  const useOffset = args.offset !== undefined && args.cursor === undefined;
   let builder;
   if (args.search?.trim()) {
     builder = ctx.db
@@ -42,22 +42,26 @@ async function pageCustomers(
   } else if (args.status) {
     builder = ctx.db
       .query("customers")
-      .withIndex("by_status_created", (q: any) => {
-        const range = q.eq("status", args.status);
-        return cursorCustomer
-          ? range.lt("created_at", cursorCustomer.created_at)
-          : range;
-      });
+      .withIndex("by_status_created", (q: any) => q.eq("status", args.status));
   } else {
-    builder = ctx.db.query("customers").withIndex("by_created", (q: any) =>
-      cursorCustomer ? q.lt("created_at", cursorCustomer.created_at) : q,
-    );
+    builder = ctx.db.query("customers").withIndex("by_created");
   }
-  const rows = ((await builder.order("desc").take(fetchLimit)) as CustomerDoc[]).slice(
-    offset,
-    offset + limit + 1,
-  );
-  return { rows: rows.slice(0, limit), hasMore: rows.length > limit };
+  const ordered = builder.order("desc");
+  if (!useOffset) {
+    const result = await ordered.paginate({
+      numItems: limit,
+      cursor: args.cursor ?? null,
+    });
+    return { rows: result.page as CustomerDoc[], pagination: result };
+  }
+  const rows = (await ordered.take(fetchLimit)) as CustomerDoc[];
+  return {
+    rows: rows.slice(pageArgs.offset, pageArgs.offset + limit),
+    pagination: {
+      isDone: rows.length <= pageArgs.offset + limit,
+      nextCursor: null,
+    },
+  };
 }
 
 export async function listHandler(
@@ -67,16 +71,16 @@ export async function listHandler(
     status?: CustomerDoc["status"];
     limit?: number;
     offset?: number;
-    cursor?: string;
+    cursor?: string | null;
   },
 ) {
-  const { rows, hasMore } = await pageCustomers(ctx, args);
+  const { rows, pagination } = await pageCustomers(ctx, args);
   const data = rows.map((c) => ({
     ...c,
     order_count: c.order_count ?? 0,
     total_spend: money(c.total_spend ?? 0),
   }));
-  return pageResponse(data, args, hasMore);
+  return pageResponse(data, args, pagination);
 }
 
 export const list = query({
@@ -92,10 +96,58 @@ export const list = query({
     ),
     limit: v.optional(v.number()),
     offset: v.optional(v.number()),
-    cursor: v.optional(v.string()),
+    cursor: v.optional(v.union(v.string(), v.null())),
   },
   handler: async (ctx, args) => {
     return await listHandler(ctx, args);
+  },
+});
+
+export const create = mutation({
+  args: {
+    phone_country_code: v.string(),
+    phone_number: v.string(),
+    display_name: v.optional(v.string()),
+    email: v.optional(v.string()),
+    avatar_url: v.optional(v.string()),
+    status: v.optional(
+      v.union(
+        v.literal("guest"),
+        v.literal("active"),
+        v.literal("blocked"),
+        v.literal("deleted"),
+      ),
+    ),
+    referral_code: v.optional(v.string()),
+    marketing_opt_in: v.optional(v.boolean()),
+  },
+  handler: async (ctx, args) => {
+    const duplicate = await ctx.db
+      .query("customers")
+      .withIndex("by_phone", (q) =>
+        q
+          .eq("phone_country_code", args.phone_country_code)
+          .eq("phone_number", args.phone_number),
+      )
+      .first();
+    if (duplicate) throw new Error("Customer phone already exists");
+    const t = now();
+    return await ctx.db.insert("customers", {
+      phone_country_code: args.phone_country_code,
+      phone_number: args.phone_number,
+      display_name: args.display_name,
+      email: args.email,
+      avatar_url: args.avatar_url,
+      status: args.status ?? "active",
+      referral_code: args.referral_code,
+      marketing_opt_in: args.marketing_opt_in ?? false,
+      search_text: customerSearchText(args),
+      order_count: 0,
+      total_spend: 0,
+      customerStatsVersion: CUSTOMER_ORDER_STATS_VERSION,
+      created_at: t,
+      updated_at: t,
+    });
   },
 });
 
@@ -165,20 +217,28 @@ export const updateProfile = mutation({
       search_text: customerSearchText({ ...customer, ...patch }),
       updated_at: now(),
     });
+    if (patch.display_name !== undefined) {
+      await ctx.scheduler.runAfter(0, anyApi.orders.refreshCustomerOrderSearch, {
+        customer_id: id,
+      });
+    }
     return id;
   },
 });
 
 export const backfillCustomerOrderStats = internalMutation({
-  args: { limit: v.optional(v.number()) },
+  args: { limit: v.optional(v.number()), cursor: v.optional(v.string()) },
   handler: async (ctx, args) => {
-    const limit = Math.min(Math.max(args.limit ?? 50, 1), 200);
-    const customers = (await ctx.db
+    const limit = Math.min(
+      Math.max(args.limit ?? 50, 1),
+      CUSTOMER_BACKFILL_LIMIT,
+    );
+    const result = await ctx.db
       .query("customers")
-      .withIndex("by_customer_stats_version", (q) =>
-        q.eq("customerStatsVersion", undefined),
-      )
-      .take(limit)) as CustomerDoc[];
+      .withIndex("by_created")
+      .order("asc")
+      .paginate({ numItems: limit, cursor: args.cursor ?? null });
+    const customers = result.page as CustomerDoc[];
     let patched = 0;
     for (const customer of customers) {
       const orders = (await ctx.db
@@ -194,18 +254,33 @@ export const backfillCustomerOrderStats = internalMutation({
         },
         { order_count: 0, total_spend: 0 },
       );
-      await ctx.db.patch(customer._id as any, {
+      const patch = {
         order_count: totals.order_count,
         total_spend: money(totals.total_spend),
-        search_text: customer.search_text ?? customerSearchText(customer),
+        search_text: customerSearchText(customer),
         customerStatsVersion: CUSTOMER_ORDER_STATS_VERSION,
+      };
+      if (
+        customer.order_count !== patch.order_count ||
+        customer.total_spend !== patch.total_spend ||
+        customer.search_text !== patch.search_text ||
+        customer.customerStatsVersion !== patch.customerStatsVersion
+      ) {
+        await ctx.db.patch(customer._id as any, patch);
+        patched += 1;
+      }
+    }
+    if (!result.isDone) {
+      await ctx.scheduler.runAfter(0, anyApi.customers.backfillCustomerOrderStats, {
+        limit,
+        cursor: result.continueCursor,
       });
-      patched += 1;
     }
     return {
       processed: customers.length,
       patched,
-      remainingMayExist: customers.length >= limit,
+      nextCursor: result.continueCursor,
+      remainingMayExist: !result.isDone,
     };
   },
 });

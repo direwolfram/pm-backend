@@ -115,6 +115,7 @@ export default defineSchema({
     latitude: v.number(),
     longitude: v.number(),
     timezone: v.string(),
+    deleting_at: v.optional(v.number()),
     created_at: v.number(),
     updated_at: v.number(),
   }).index("by_status", ["status"]),
@@ -136,6 +137,7 @@ export default defineSchema({
     logo_url: v.optional(v.string()),
     logo_color: v.optional(v.string()),
     is_active: v.boolean(),
+    deleting_at: v.optional(v.number()),
   }).index("by_name", ["name"]),
 
   categories: defineTable({
@@ -149,6 +151,7 @@ export default defineSchema({
     image_color: v.optional(v.string()),
     sort_order: v.number(),
     is_active: v.boolean(),
+    deleting_at: v.optional(v.number()),
   })
     .index("by_parent", ["parent_id"])
     .index("by_slug", ["slug"]),
@@ -203,6 +206,7 @@ export default defineSchema({
     default_price: v.optional(v.number()),
     total_stock: v.optional(v.number()),
     productListSummaryVersion: v.optional(v.number()),
+    deleting_at: v.optional(v.number()),
     attributes: v.array(
       v.object({ key: v.string(), label: v.string(), value: v.string() }),
     ),
@@ -277,6 +281,7 @@ export default defineSchema({
     sort_order: v.number(),
     is_default: v.boolean(),
     is_active: v.boolean(),
+    deleting_at: v.optional(v.number()),
   })
     .index("by_product", ["product_id"])
     .index("by_sku_code", ["sku_code"])
@@ -296,6 +301,7 @@ export default defineSchema({
   })
     .index("by_sku", ["sku_id"])
     .index("by_product", ["product_id"])
+    .index("by_sku_starts", ["sku_id", "starts_at"])
     .index("by_sku_store", ["sku_id", "store_id"])
     .index("by_store", ["store_id"])
     .index("by_price_summary_version", ["priceSummaryVersion"]),
@@ -427,11 +433,18 @@ export default defineSchema({
     ),
     pickPriority: v.number(),
     expiredAt: v.optional(v.number()),
+    nextShelfLifeRefreshAt: v.optional(v.number()),
   })
     .index("by_inventory_expiry", ["inventoryId", "expiryDate"])
     .index("by_near_expiry", ["isNearExpiry"])
     .index("by_expiry", ["expiryDate"])
-    .index("by_unexpired_expiry", ["expiredAt", "expiryDate"]),
+    .index("by_unexpired_expiry", ["expiredAt", "expiryDate"])
+    .index("by_shelf_life_due", ["nextShelfLifeRefreshAt", "expiryDate"])
+    .index("by_unexpired_shelf_life_due", [
+      "expiredAt",
+      "nextShelfLifeRefreshAt",
+      "expiryDate",
+    ]),
 
   deliverySlots: defineTable({
     fulfillmentCenterId: v.id("fulfillmentCenters"),
@@ -511,6 +524,7 @@ export default defineSchema({
     starts_at: v.number(),
     ends_at: v.number(),
     is_active: v.boolean(),
+    deleting_at: v.optional(v.number()),
   })
     .index("by_coupon_code", ["coupon_code"])
     .index("by_kind", ["kind"])
@@ -700,6 +714,7 @@ export default defineSchema({
     customer_notes: v.optional(v.string()),
     item_count: v.optional(v.number()),
     order_search_text: v.optional(v.string()),
+    orderSummaryVersion: v.optional(v.number()),
     placed_at: v.number(),
     estimated_delivery_at: v.optional(v.number()),
     delivered_at: v.optional(v.number()),
@@ -714,6 +729,7 @@ export default defineSchema({
     .index("by_status_placed", ["status", "placed_at"])
     .index("by_store_status_placed", ["store_id", "status", "placed_at"])
     .index("by_order_stats_backfill", ["item_count", "placed_at"])
+    .index("by_order_summary_version", ["orderSummaryVersion", "placed_at"])
     .searchIndex("search_orders", {
       searchField: "order_search_text",
       filterFields: ["status", "store_id"],
