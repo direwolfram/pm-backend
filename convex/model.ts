@@ -73,6 +73,10 @@ export interface CustomerDoc extends BaseDoc {
   status: CustomerStatus;
   referral_code?: string;
   marketing_opt_in: boolean;
+  search_text?: string;
+  order_count?: number;
+  total_spend?: number;
+  customerStatsVersion?: number;
   created_at: number;
   updated_at: number;
 }
@@ -183,6 +187,11 @@ export interface ProductDoc extends BaseDoc {
   image_color?: string;
   rating_average: number;
   rating_count: number;
+  sku_count?: number;
+  default_sku_id?: string;
+  default_price?: number;
+  total_stock?: number;
+  productListSummaryVersion?: number;
   attributes: ProductAttribute[];
   created_at: number;
   updated_at: number;
@@ -368,6 +377,8 @@ export interface OrderDoc extends BaseDoc {
   delivery_fee_amount: number;
   total_amount: number;
   customer_notes?: string;
+  item_count?: number;
+  order_search_text?: string;
   placed_at: number;
   estimated_delivery_at?: number;
   delivered_at?: number;

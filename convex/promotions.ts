@@ -206,10 +206,11 @@ export const remove = mutation({
       .withIndex("by_promotion", (q) => q.eq("promotion_id", args.id))
       .collect();
     for (const t of targets) await ctx.db.delete(t._id);
-    const items = await ctx.db.query("home_section_items").collect();
-    for (const item of items) {
-      if (item.promotion_id === args.id) await ctx.db.delete(item._id);
-    }
+    const items = await ctx.db
+      .query("home_section_items")
+      .withIndex("by_promotion", (q) => q.eq("promotion_id", args.id))
+      .collect();
+    for (const item of items) await ctx.db.delete(item._id);
     await ctx.db.delete(args.id);
   },
 });

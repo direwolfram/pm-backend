@@ -45,12 +45,23 @@ export default defineSchema({
     ),
     referral_code: v.optional(v.string()),
     marketing_opt_in: v.boolean(),
+    search_text: v.optional(v.string()),
+    order_count: v.optional(v.number()),
+    total_spend: v.optional(v.number()),
+    customerStatsVersion: v.optional(v.number()),
     created_at: v.number(),
     updated_at: v.number(),
   })
     .index("by_phone", ["phone_country_code", "phone_number"])
     .index("by_status", ["status"])
-    .index("by_referral_code", ["referral_code"]),
+    .index("by_referral_code", ["referral_code"])
+    .index("by_created", ["created_at"])
+    .index("by_status_created", ["status", "created_at"])
+    .index("by_customer_stats_version", ["customerStatsVersion"])
+    .searchIndex("search_customers", {
+      searchField: "search_text",
+      filterFields: ["status"],
+    }),
 
   otp_challenges: defineTable({
     phone_country_code: v.string(),
@@ -187,6 +198,11 @@ export default defineSchema({
     image_color: v.optional(v.string()),
     rating_average: v.number(),
     rating_count: v.number(),
+    sku_count: v.optional(v.number()),
+    default_sku_id: v.optional(v.id("skus")),
+    default_price: v.optional(v.number()),
+    total_stock: v.optional(v.number()),
+    productListSummaryVersion: v.optional(v.number()),
     attributes: v.array(
       v.object({ key: v.string(), label: v.string(), value: v.string() }),
     ),
@@ -201,6 +217,28 @@ export default defineSchema({
     .index("by_frequently_bought", ["isFrequentlyBought"])
     .index("by_slug", ["slug"])
     .index("by_status", ["status"])
+    .index("by_updated", ["updated_at"])
+    .index("by_status_updated", ["status", "updated_at"])
+    .index("by_category_updated", ["primary_category_id", "updated_at"])
+    .index("by_brand_updated", ["brand_id", "updated_at"])
+    .index("by_category_status_updated", [
+      "primary_category_id",
+      "status",
+      "updated_at",
+    ])
+    .index("by_brand_status_updated", ["brand_id", "status", "updated_at"])
+    .index("by_category_brand_updated", [
+      "primary_category_id",
+      "brand_id",
+      "updated_at",
+    ])
+    .index("by_category_brand_status_updated", [
+      "primary_category_id",
+      "brand_id",
+      "status",
+      "updated_at",
+    ])
+    .index("by_product_list_summary_version", ["productListSummaryVersion"])
     .searchIndex("search_products", {
       searchField: "name",
       filterFields: ["status", "primary_category_id", "brand_id"],
@@ -221,6 +259,7 @@ export default defineSchema({
     similar_product_id: v.id("products"),
   })
     .index("by_product", ["product_id"])
+    .index("by_similar_product", ["similar_product_id"])
     .index("by_pair", ["product_id", "similar_product_id"]),
 
   skus: defineTable({
@@ -390,7 +429,9 @@ export default defineSchema({
     expiredAt: v.optional(v.number()),
   })
     .index("by_inventory_expiry", ["inventoryId", "expiryDate"])
-    .index("by_near_expiry", ["isNearExpiry"]),
+    .index("by_near_expiry", ["isNearExpiry"])
+    .index("by_expiry", ["expiryDate"])
+    .index("by_unexpired_expiry", ["expiredAt", "expiryDate"]),
 
   deliverySlots: defineTable({
     fulfillmentCenterId: v.id("fulfillmentCenters"),
@@ -483,7 +524,10 @@ export default defineSchema({
     brand_id: v.optional(v.id("brands")),
   })
     .index("by_promotion", ["promotion_id"])
-    .index("by_product", ["product_id"]),
+    .index("by_product", ["product_id"])
+    .index("by_sku", ["sku_id"])
+    .index("by_category", ["category_id"])
+    .index("by_brand", ["brand_id"]),
 
   home_sections: defineTable({
     id: v.optional(v.string()),
@@ -564,7 +608,11 @@ export default defineSchema({
     category_id: v.optional(v.id("categories")),
     promotion_id: v.optional(v.id("promotions")),
     sort_order: v.number(),
-  }).index("by_section", ["section_id"]),
+  })
+    .index("by_section", ["section_id"])
+    .index("by_product", ["product_id"])
+    .index("by_category", ["category_id"])
+    .index("by_promotion", ["promotion_id"]),
 
   carts: defineTable({
     customer_id: v.optional(v.id("customers")),
@@ -650,6 +698,8 @@ export default defineSchema({
     delivery_fee_amount: v.number(),
     total_amount: v.number(),
     customer_notes: v.optional(v.string()),
+    item_count: v.optional(v.number()),
+    order_search_text: v.optional(v.string()),
     placed_at: v.number(),
     estimated_delivery_at: v.optional(v.number()),
     delivered_at: v.optional(v.number()),
@@ -658,7 +708,16 @@ export default defineSchema({
     .index("by_number", ["order_number"])
     .index("by_customer", ["customer_id", "placed_at"])
     .index("by_store", ["store_id"])
-    .index("by_status", ["status"]),
+    .index("by_status", ["status"])
+    .index("by_placed", ["placed_at"])
+    .index("by_store_placed", ["store_id", "placed_at"])
+    .index("by_status_placed", ["status", "placed_at"])
+    .index("by_store_status_placed", ["store_id", "status", "placed_at"])
+    .index("by_order_stats_backfill", ["item_count", "placed_at"])
+    .searchIndex("search_orders", {
+      searchField: "order_search_text",
+      filterFields: ["status", "store_id"],
+    }),
 
   order_items: defineTable({
     order_id: v.id("orders"),
@@ -670,7 +729,10 @@ export default defineSchema({
     unit_price: v.number(),
     compare_at_price: v.optional(v.number()),
     line_total: v.number(),
-  }).index("by_order", ["order_id"]),
+  })
+    .index("by_order", ["order_id"])
+    .index("by_product", ["product_id"])
+    .index("by_sku", ["sku_id"]),
 
   payment_methods: defineTable({
     customer_id: v.id("customers"),

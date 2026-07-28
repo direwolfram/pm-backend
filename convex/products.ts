@@ -1,10 +1,12 @@
 import { v } from "convex/values";
-import { query, mutation } from "./functions";
-import { now, paginate, slugify } from "./helpers";
+import { query, mutation, internalMutation } from "./functions";
+import { boundedPageArgs, now, pageResponse, slugify } from "./helpers";
+import {
+  PRODUCT_LIST_SUMMARY_VERSION,
+  recomputeProductListSummary,
+} from "./lib/productListSummaries";
 import type { Id } from "./_generated/dataModel";
 import type {
-  InventoryDoc,
-  PriceDoc,
   ProductDoc,
   ProductListRow,
   ProductMediaDoc,
@@ -28,6 +30,158 @@ function dummyImagesForProduct(name: string) {
   });
 }
 
+function productListIndex(args: {
+  status?: ProductDoc["status"];
+  category_id?: string;
+  brand_id?: string;
+}) {
+  if (args.category_id && args.brand_id && args.status) {
+    return "by_category_brand_status_updated";
+  }
+  if (args.category_id && args.brand_id) return "by_category_brand_updated";
+  if (args.category_id && args.status) return "by_category_status_updated";
+  if (args.brand_id && args.status) return "by_brand_status_updated";
+  if (args.category_id) return "by_category_updated";
+  if (args.brand_id) return "by_brand_updated";
+  if (args.status) return "by_status_updated";
+  return "by_updated";
+}
+
+async function pageProducts(
+  ctx: { db: any },
+  args: {
+    search?: string;
+    status?: ProductDoc["status"];
+    category_id?: string;
+    brand_id?: string;
+    limit?: number;
+    offset?: number;
+    cursor?: string;
+  },
+) {
+  const pageArgs = boundedPageArgs(args);
+  const limit = pageArgs.limit;
+  const offset = args.cursor ? 0 : pageArgs.offset;
+  const fetchLimit = Math.min(limit + offset + 1, 201);
+  const cursorProduct = args.cursor
+    ? ((await ctx.db.get(args.cursor as any)) as ProductDoc | null)
+    : null;
+  let builder;
+  if (args.search?.trim()) {
+    builder = ctx.db.query("products").withSearchIndex("search_products", (q: any) => {
+      let s = q.search("name", args.search!.trim());
+      if (args.status) s = s.eq("status", args.status);
+      if (args.category_id) s = s.eq("primary_category_id", args.category_id);
+      if (args.brand_id) s = s.eq("brand_id", args.brand_id);
+      return s;
+    });
+  } else {
+    builder = ctx.db
+      .query("products")
+      .withIndex(productListIndex(args), (q: any) => {
+        const withCursor = (range: any) =>
+          cursorProduct ? range.lt("updated_at", cursorProduct.updated_at) : range;
+        if (args.category_id && args.brand_id && args.status) {
+          return withCursor(
+            q
+              .eq("primary_category_id", args.category_id)
+              .eq("brand_id", args.brand_id)
+              .eq("status", args.status),
+          );
+        }
+        if (args.category_id && args.brand_id) {
+          return withCursor(
+            q
+              .eq("primary_category_id", args.category_id)
+              .eq("brand_id", args.brand_id),
+          );
+        }
+        if (args.category_id && args.status) {
+          return withCursor(
+            q.eq("primary_category_id", args.category_id).eq("status", args.status),
+          );
+        }
+        if (args.brand_id && args.status) {
+          return withCursor(q.eq("brand_id", args.brand_id).eq("status", args.status));
+        }
+        if (args.category_id) {
+          return withCursor(q.eq("primary_category_id", args.category_id));
+        }
+        if (args.brand_id) return withCursor(q.eq("brand_id", args.brand_id));
+        if (args.status) return withCursor(q.eq("status", args.status));
+        return withCursor(q);
+      });
+  }
+  const rows = ((await builder.order("desc").take(fetchLimit)) as ProductDoc[]).slice(
+    offset,
+    offset + limit + 1,
+  );
+  return { rows: rows.slice(0, limit), hasMore: rows.length > limit };
+}
+
+async function enrichProductPage(ctx: { db: any }, rows: ProductDoc[]) {
+  const [brands, categories, missingSummaries] = await Promise.all([
+    Promise.all(
+      Array.from(
+        new Set(rows.map((product) => product.brand_id).filter(Boolean)),
+      ).map(
+        async (id) =>
+          [id, (await ctx.db.get(id as any)) as { name?: string } | null] as const,
+      ),
+    ),
+    Promise.all(
+      Array.from(new Set(rows.map((product) => product.primary_category_id))).map(
+        async (id) =>
+          [id, (await ctx.db.get(id as any)) as { name?: string } | null] as const,
+      ),
+    ),
+    Promise.all(
+      rows
+        .filter(
+          (product) =>
+            product.productListSummaryVersion !== PRODUCT_LIST_SUMMARY_VERSION,
+        )
+        .map(async (product) => {
+          const summary = await recomputeProductListSummary(ctx, product._id);
+          return [product._id, summary] as const;
+        }),
+    ),
+  ]);
+  const brandName = new Map(brands);
+  const catName = new Map(categories);
+  const summaries = new Map(missingSummaries);
+  return rows.map((p): ProductListRow => {
+    const summary = summaries.get(p._id);
+    return {
+      ...p,
+      brand_name: p.brand_id ? brandName.get(p.brand_id)?.name : undefined,
+      brand: p.brand,
+      category_name: catName.get(p.primary_category_id)?.name,
+      sku_count: summary?.sku_count ?? p.sku_count ?? 0,
+      default_sku_id: summary?.default_sku_id ?? p.default_sku_id,
+      default_price: summary?.default_price ?? p.default_price,
+      total_stock: summary?.total_stock ?? p.total_stock ?? 0,
+    };
+  });
+}
+
+export async function listHandler(
+  ctx: { db: any },
+  args: {
+    search?: string;
+    status?: ProductDoc["status"];
+    category_id?: string;
+    brand_id?: string;
+    limit?: number;
+    offset?: number;
+    cursor?: string;
+  },
+) {
+  const { rows, hasMore } = await pageProducts(ctx, args);
+  const enriched = await enrichProductPage(ctx, rows);
+  return pageResponse(enriched, args, hasMore);
+}
+
 export const list = query({
   args: {
     search: v.optional(v.string()),
@@ -36,99 +190,10 @@ export const list = query({
     brand_id: v.optional(v.id("brands")),
     limit: v.optional(v.number()),
     offset: v.optional(v.number()),
+    cursor: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
-    let rows: ProductDoc[];
-    if (args.search) {
-      rows = (await ctx.db
-        .query("products")
-        .withSearchIndex("search_products", (q) => {
-          let s = q.search("name", args.search!);
-          if (args.status) s = s.eq("status", args.status);
-          if (args.category_id) s = s.eq("primary_category_id", args.category_id);
-          if (args.brand_id) s = s.eq("brand_id", args.brand_id);
-          return s;
-        })
-        .collect()) as ProductDoc[];
-    } else if (args.category_id) {
-      rows = (await ctx.db
-        .query("products")
-        .withIndex("by_category", (q) => q.eq("primary_category_id", args.category_id!))
-        .collect()) as ProductDoc[];
-      if (args.status) rows = rows.filter((p) => p.status === args.status);
-      if (args.brand_id) rows = rows.filter((p) => p.brand_id === args.brand_id);
-    } else if (args.brand_id) {
-      rows = (await ctx.db
-        .query("products")
-        .withIndex("by_brand", (q) => q.eq("brand_id", args.brand_id!))
-        .collect()) as ProductDoc[];
-      if (args.status) rows = rows.filter((p) => p.status === args.status);
-    } else if (args.status) {
-      rows = (await ctx.db
-        .query("products")
-        .withIndex("by_status", (q) => q.eq("status", args.status!))
-        .collect()) as ProductDoc[];
-    } else {
-      rows = (await ctx.db.query("products").collect()) as ProductDoc[];
-    }
-
-    const [brands, categories, skus, prices, inventory] = await Promise.all([
-      ctx.db.query("brands").collect(),
-      ctx.db.query("categories").collect(),
-      ctx.db.query("skus").collect(),
-      ctx.db.query("prices").collect(),
-      ctx.db.query("inventory").collect(),
-    ]);
-    const brandName = new Map(brands.map((b) => [b._id as string, b.name as string]));
-    const catName = new Map(categories.map((c) => [c._id as string, c.name as string]));
-    const skusByProduct = new Map<string, SkuDoc[]>();
-    for (const s of skus as SkuDoc[]) {
-      const arr = skusByProduct.get(s.product_id) ?? [];
-      arr.push(s);
-      skusByProduct.set(s.product_id, arr);
-    }
-    const priceBySku = new Map<string, PriceDoc[]>();
-    for (const p of prices as PriceDoc[]) {
-      const arr = priceBySku.get(p.sku_id) ?? [];
-      arr.push(p);
-      priceBySku.set(p.sku_id, arr);
-    }
-    const stockBySku = new Map<string, number>();
-    for (const i of inventory as InventoryDoc[]) {
-      if (i.sku_id === undefined || i.quantity_available === undefined) continue;
-      stockBySku.set(i.sku_id, (stockBySku.get(i.sku_id) ?? 0) + i.quantity_available);
-    }
-
-    const enriched: ProductListRow[] = rows.map((p) => {
-      const pSkus = (skusByProduct.get(p._id) ?? []).sort(
-        (a, b) => a.sort_order - b.sort_order,
-      );
-      const def = pSkus.find((s) => s.is_default) ?? pSkus[0];
-      let defaultPrice: number | undefined;
-      if (def) {
-        const active = (priceBySku.get(def._id) ?? []).filter(
-          (pr) => pr.starts_at <= Date.now() && (!pr.ends_at || pr.ends_at > Date.now()),
-        );
-        const base = active.find((pr) => !pr.store_id) ?? active[0];
-        defaultPrice = base?.sale_price;
-      }
-      const totalStock = pSkus.reduce(
-        (sum, s) => sum + (stockBySku.get(s._id) ?? 0),
-        0,
-      );
-      return {
-        ...p,
-        brand_name: p.brand_id ? brandName.get(p.brand_id) : undefined,
-        brand: p.brand,
-        category_name: catName.get(p.primary_category_id),
-        sku_count: pSkus.length,
-        default_sku_id: def?._id,
-        default_price: defaultPrice,
-        total_stock: totalStock,
-      };
-    });
-    enriched.sort((a, b) => b.updated_at - a.updated_at);
-    return paginate(enriched, args);
+    return await listHandler(ctx, args);
   },
 });
 
@@ -282,6 +347,9 @@ export const create = mutation({
       image_color: args.image_color,
       rating_average: 0,
       rating_count: 0,
+      sku_count: 0,
+      total_stock: 0,
+      productListSummaryVersion: PRODUCT_LIST_SUMMARY_VERSION,
       attributes: args.attributes ?? [],
       created_at: now(),
       updated_at: now(),
@@ -329,14 +397,36 @@ export const update = mutation({
   },
 });
 
+export const backfillProductListSummaries = internalMutation({
+  args: { limit: v.optional(v.number()) },
+  handler: async (ctx, args) => {
+    const limit = Math.min(Math.max(args.limit ?? 50, 1), 200);
+    const products = (await ctx.db
+      .query("products")
+      .withIndex("by_product_list_summary_version", (q) =>
+        q.eq("productListSummaryVersion", undefined),
+      )
+      .take(limit)) as ProductDoc[];
+    let patched = 0;
+    for (const product of products) {
+      if (await recomputeProductListSummary(ctx, product._id)) patched += 1;
+    }
+    return {
+      processed: products.length,
+      patched,
+      remainingMayExist: products.length >= limit,
+    };
+  },
+});
+
 /** SQL cascade: media, similar pairs, SKUs (+ their prices/inventory). */
 export const remove = mutation({
   args: { id: v.id("products") },
   handler: async (ctx, args) => {
     const orderItem = await ctx.db
       .query("order_items")
-      .collect()
-      .then((rows) => rows.find((r) => r.product_id === args.id));
+      .withIndex("by_product", (q) => q.eq("product_id", args.id))
+      .first();
     if (orderItem) {
       throw new Error(
         "Cannot delete: this product appears in orders. Set status to discontinued instead.",
@@ -348,12 +438,22 @@ export const remove = mutation({
       .collect();
     for (const m of media) await ctx.db.delete(m._id);
 
-    const pairs = await ctx.db.query("product_similar_products").collect();
-    for (const p of pairs) {
-      if (p.product_id === args.id || p.similar_product_id === args.id) {
-        await ctx.db.delete(p._id);
-      }
-    }
+    const [outgoingPairs, incomingPairs] = await Promise.all([
+      ctx.db
+        .query("product_similar_products")
+        .withIndex("by_product", (q) => q.eq("product_id", args.id))
+        .collect(),
+      ctx.db
+        .query("product_similar_products")
+        .withIndex("by_similar_product", (q) =>
+          q.eq("similar_product_id", args.id),
+        )
+        .collect(),
+    ]);
+    const pairIds = new Set(
+      [...outgoingPairs, ...incomingPairs].map((pair) => pair._id),
+    );
+    for (const id of pairIds) await ctx.db.delete(id);
     const skus = await ctx.db
       .query("skus")
       .withIndex("by_product", (q) => q.eq("product_id", args.id))
@@ -371,14 +471,16 @@ export const remove = mutation({
       for (const i of inv) await ctx.db.delete(i._id);
       await ctx.db.delete(s._id);
     }
-    const items = await ctx.db.query("home_section_items").collect();
-    for (const item of items) {
-      if (item.product_id === args.id) await ctx.db.delete(item._id);
-    }
-    const targets = await ctx.db.query("promotion_targets").collect();
-    for (const t of targets) {
-      if (t.product_id === args.id) await ctx.db.delete(t._id);
-    }
+    const items = await ctx.db
+      .query("home_section_items")
+      .withIndex("by_product", (q) => q.eq("product_id", args.id))
+      .collect();
+    for (const item of items) await ctx.db.delete(item._id);
+    const targets = await ctx.db
+      .query("promotion_targets")
+      .withIndex("by_product", (q) => q.eq("product_id", args.id))
+      .collect();
+    for (const t of targets) await ctx.db.delete(t._id);
     await ctx.db.delete(args.id);
   },
 });

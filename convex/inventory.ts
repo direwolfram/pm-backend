@@ -1,6 +1,7 @@
 import { v } from "convex/values";
 import { query, mutation } from "./functions";
 import { deriveInventoryStatus, now } from "./helpers";
+import { recomputeProductListSummary } from "./lib/productListSummaries";
 import type {
   InventoryDoc,
   InventoryRow,
@@ -240,9 +241,12 @@ export const upsert = mutation({
         storeName: store?.name,
         storeInventorySummaryVersion: STORE_INVENTORY_SUMMARY_VERSION,
       });
+      if (sku?.product_id) {
+        await recomputeProductListSummary(ctx, sku.product_id);
+      }
       return existing._id;
     }
-    return await ctx.db.insert("inventory", {
+    const id = await ctx.db.insert("inventory", {
       sku_id: args.sku_id,
       store_id: args.store_id,
       quantity_available: args.quantity_available,
@@ -258,6 +262,10 @@ export const upsert = mutation({
       storeName: store?.name,
       storeInventorySummaryVersion: STORE_INVENTORY_SUMMARY_VERSION,
     });
+    if (sku?.product_id) {
+      await recomputeProductListSummary(ctx, sku.product_id);
+    }
+    return id;
   },
 });
 
@@ -347,6 +355,9 @@ export const adjust = mutation({
       status,
       updated_at: now(),
     });
+    if (existing.productId) {
+      await recomputeProductListSummary(ctx, existing.productId);
+    }
     return { quantity_available: next, status };
   },
 });
@@ -405,6 +416,10 @@ export const setUnavailable = mutation({
 export const remove = mutation({
   args: { id: v.id("inventory") },
   handler: async (ctx, args) => {
+    const row = (await ctx.db.get(args.id)) as InventoryDoc | null;
     await ctx.db.delete(args.id);
+    if (row?.productId) {
+      await recomputeProductListSummary(ctx, row.productId);
+    }
   },
 });

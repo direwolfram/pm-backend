@@ -10,6 +10,10 @@ export function pickPriorityScore(expiryDate: number): number {
   return -expiryDate;
 }
 
+const MANILA_UTC_OFFSET_MS = 8 * 60 * 60 * 1000;
+
 export function shelfLifeDaysRemaining(expiryDate: number, nowMs: number): number {
-  return Math.floor((expiryDate - nowMs) / 86_400_000);
+  const expiryDay = Math.floor((expiryDate + MANILA_UTC_OFFSET_MS) / 86_400_000);
+  const today = Math.floor((nowMs + MANILA_UTC_OFFSET_MS) / 86_400_000);
+  return expiryDay - today;
 }

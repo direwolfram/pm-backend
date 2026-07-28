@@ -1,12 +1,83 @@
 import { v } from "convex/values";
-import { query, mutation } from "./functions";
-import { now, paginate } from "./helpers";
+import { query, mutation, internalMutation } from "./functions";
+import { boundedPageArgs, money, now, pageResponse } from "./helpers";
+import {
+  CUSTOMER_ORDER_STATS_VERSION,
+  customerSearchText,
+  orderCountsForCustomerStats,
+} from "./lib/customerAggregates";
 import type {
   AddressDoc,
   CustomerDoc,
   OrderDoc,
   SupportTicketDoc,
 } from "./model";
+
+async function pageCustomers(
+  ctx: { db: any },
+  args: {
+    search?: string;
+    status?: CustomerDoc["status"];
+    limit?: number;
+    offset?: number;
+    cursor?: string;
+  },
+) {
+  const pageArgs = boundedPageArgs(args);
+  const limit = pageArgs.limit;
+  const offset = args.cursor ? 0 : pageArgs.offset;
+  const fetchLimit = Math.min(limit + offset + 1, 201);
+  const cursorCustomer = args.cursor
+    ? ((await ctx.db.get(args.cursor as any)) as CustomerDoc | null)
+    : null;
+  let builder;
+  if (args.search?.trim()) {
+    builder = ctx.db
+      .query("customers")
+      .withSearchIndex("search_customers", (q: any) => {
+        let s = q.search("search_text", args.search!.trim().toLowerCase());
+        if (args.status) s = s.eq("status", args.status);
+        return s;
+      });
+  } else if (args.status) {
+    builder = ctx.db
+      .query("customers")
+      .withIndex("by_status_created", (q: any) => {
+        const range = q.eq("status", args.status);
+        return cursorCustomer
+          ? range.lt("created_at", cursorCustomer.created_at)
+          : range;
+      });
+  } else {
+    builder = ctx.db.query("customers").withIndex("by_created", (q: any) =>
+      cursorCustomer ? q.lt("created_at", cursorCustomer.created_at) : q,
+    );
+  }
+  const rows = ((await builder.order("desc").take(fetchLimit)) as CustomerDoc[]).slice(
+    offset,
+    offset + limit + 1,
+  );
+  return { rows: rows.slice(0, limit), hasMore: rows.length > limit };
+}
+
+export async function listHandler(
+  ctx: { db: any },
+  args: {
+    search?: string;
+    status?: CustomerDoc["status"];
+    limit?: number;
+    offset?: number;
+    cursor?: string;
+  },
+) {
+  const { rows, hasMore } = await pageCustomers(ctx, args);
+  const data = rows.map((c) => ({
+    ...c,
+    order_count: c.order_count ?? 0,
+    total_spend: money(c.total_spend ?? 0),
+  }));
+  return pageResponse(data, args, hasMore);
+}
 
 export const list = query({
   args: {
@@ -21,36 +92,10 @@ export const list = query({
     ),
     limit: v.optional(v.number()),
     offset: v.optional(v.number()),
+    cursor: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
-    let rows = (await ctx.db.query("customers").collect()) as CustomerDoc[];
-    if (args.status) rows = rows.filter((c) => c.status === args.status);
-    if (args.search) {
-      const s = args.search.toLowerCase();
-      rows = rows.filter(
-        (c) =>
-          (c.display_name ?? "").toLowerCase().includes(s) ||
-          c.phone_number.includes(s) ||
-          (c.email ?? "").toLowerCase().includes(s),
-      );
-    }
-    const orders = (await ctx.db.query("orders").collect()) as OrderDoc[];
-    const stats = new Map<string, { count: number; spend: number }>();
-    for (const o of orders) {
-      if (o.status === "cancelled" || o.status === "refunded") continue;
-      const cur = stats.get(o.customer_id) ?? { count: 0, spend: 0 };
-      cur.count += 1;
-      cur.spend += o.total_amount;
-      stats.set(o.customer_id, cur);
-    }
-    const enriched = rows
-      .map((c) => ({
-        ...c,
-        order_count: stats.get(c._id)?.count ?? 0,
-        total_spend: Math.round((stats.get(c._id)?.spend ?? 0) * 100) / 100,
-      }))
-      .sort((a, b) => b.created_at - a.created_at);
-    return paginate(enriched, args);
+    return await listHandler(ctx, args);
   },
 });
 
@@ -115,7 +160,52 @@ export const updateProfile = mutation({
     const { id, ...patch } = args;
     const customer = await ctx.db.get(id);
     if (!customer) throw new Error("Customer not found");
-    await ctx.db.patch(id, { ...patch, updated_at: now() });
+    await ctx.db.patch(id, {
+      ...patch,
+      search_text: customerSearchText({ ...customer, ...patch }),
+      updated_at: now(),
+    });
     return id;
+  },
+});
+
+export const backfillCustomerOrderStats = internalMutation({
+  args: { limit: v.optional(v.number()) },
+  handler: async (ctx, args) => {
+    const limit = Math.min(Math.max(args.limit ?? 50, 1), 200);
+    const customers = (await ctx.db
+      .query("customers")
+      .withIndex("by_customer_stats_version", (q) =>
+        q.eq("customerStatsVersion", undefined),
+      )
+      .take(limit)) as CustomerDoc[];
+    let patched = 0;
+    for (const customer of customers) {
+      const orders = (await ctx.db
+        .query("orders")
+        .withIndex("by_customer", (q) => q.eq("customer_id", customer._id))
+        .collect()) as OrderDoc[];
+      const totals = orders.reduce(
+        (acc, order) => {
+          const stats = orderCountsForCustomerStats(order);
+          acc.order_count += stats.order_count;
+          acc.total_spend += stats.total_spend;
+          return acc;
+        },
+        { order_count: 0, total_spend: 0 },
+      );
+      await ctx.db.patch(customer._id as any, {
+        order_count: totals.order_count,
+        total_spend: money(totals.total_spend),
+        search_text: customer.search_text ?? customerSearchText(customer),
+        customerStatsVersion: CUSTOMER_ORDER_STATS_VERSION,
+      });
+      patched += 1;
+    }
+    return {
+      processed: customers.length,
+      patched,
+      remainingMayExist: customers.length >= limit,
+    };
   },
 });

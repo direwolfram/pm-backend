@@ -1,6 +1,7 @@
 import { v } from "convex/values";
-import { query, mutation } from "./functions";
-import { now, paginate } from "./helpers";
+import { query, mutation, internalMutation } from "./functions";
+import { boundedPageArgs, now, pageResponse } from "./helpers";
+import { applyOrderStatsChange } from "./lib/customerAggregates";
 import type {
   AddressDoc,
   CustomerDoc,
@@ -30,6 +31,158 @@ const paymentStatus = v.union(
   v.literal("refunded"),
 );
 
+function orderSearchText(order: OrderDoc, customer?: CustomerDoc | null) {
+  return [
+    order.order_number,
+    customer?.display_name ?? "",
+    customer?.phone_country_code ?? "",
+    customer?.phone_number ?? "",
+    customer ? `${customer.phone_country_code}${customer.phone_number}` : "",
+  ]
+    .join(" ")
+    .toLowerCase();
+}
+
+function orderIndex(args: {
+  status?: OrderStatus;
+  store_id?: string;
+  placed_from?: number;
+  placed_to?: number;
+}) {
+  if (args.store_id && args.status) return "by_store_status_placed";
+  if (args.store_id) return "by_store_placed";
+  if (args.status) return "by_status_placed";
+  return "by_placed";
+}
+
+async function pageOrders(
+  ctx: { db: any },
+  args: {
+    status?: OrderStatus;
+    store_id?: string;
+    search?: string;
+    limit?: number;
+    offset?: number;
+    cursor?: string;
+    placed_from?: number;
+    placed_to?: number;
+  },
+) {
+  const pageArgs = boundedPageArgs(args);
+  const limit = pageArgs.limit;
+  const offset = args.cursor ? 0 : pageArgs.offset;
+  const fetchLimit = Math.min(limit + offset + 1, 201);
+  const cursorOrder = args.cursor
+    ? ((await ctx.db.get(args.cursor as any)) as OrderDoc | null)
+    : null;
+  let queryBuilder;
+  if (args.search?.trim()) {
+    queryBuilder = ctx.db.query("orders").withSearchIndex("search_orders", (q: any) => {
+      let s = q.search("order_search_text", args.search!.trim().toLowerCase());
+      if (args.status) s = s.eq("status", args.status);
+      if (args.store_id) s = s.eq("store_id", args.store_id);
+      return s;
+    });
+  } else {
+    const indexName = orderIndex(args);
+    queryBuilder = ctx.db.query("orders").withIndex(indexName, (q: any) => {
+      const withBounds = (range: any) => {
+        let out = range;
+        if (cursorOrder) {
+          const upper =
+            args.placed_to !== undefined
+              ? Math.min(cursorOrder.placed_at, args.placed_to)
+              : cursorOrder.placed_at;
+          out =
+            args.placed_to !== undefined && args.placed_to < cursorOrder.placed_at
+              ? out.lte("placed_at", upper)
+              : out.lt("placed_at", upper);
+        } else if (args.placed_to !== undefined) {
+          out = out.lte("placed_at", args.placed_to);
+        }
+        if (args.placed_from !== undefined) out = out.gte("placed_at", args.placed_from);
+        return out;
+      };
+      if (args.store_id && args.status) {
+        return withBounds(
+          q.eq("store_id", args.store_id).eq("status", args.status),
+        );
+      }
+      if (args.store_id) return withBounds(q.eq("store_id", args.store_id));
+      if (args.status) return withBounds(q.eq("status", args.status));
+      return withBounds(q);
+    });
+  }
+  const rows = ((await queryBuilder.order("desc").take(fetchLimit)) as OrderDoc[])
+    .filter(
+      (order) =>
+        (args.placed_from === undefined || order.placed_at >= args.placed_from) &&
+        (args.placed_to === undefined || order.placed_at <= args.placed_to),
+    )
+    .slice(offset, offset + limit + 1);
+  return { rows: rows.slice(0, limit), hasMore: rows.length > limit };
+}
+
+async function enrichOrders(ctx: { db: any }, orders: OrderDoc[]) {
+  const [customers, stores, fallbackCounts] = await Promise.all([
+    Promise.all(
+      Array.from(new Set(orders.map((order) => order.customer_id))).map(
+        async (id) => [id, (await ctx.db.get(id as any)) as CustomerDoc | null] as const,
+      ),
+    ),
+    Promise.all(
+      Array.from(new Set(orders.map((order) => order.store_id))).map(
+        async (id) => [id, (await ctx.db.get(id as any)) as StoreDoc | null] as const,
+      ),
+    ),
+    Promise.all(
+      orders
+        .filter((order) => order.item_count === undefined)
+        .map(async (order) => {
+          const items = (await ctx.db
+            .query("order_items")
+            .withIndex("by_order", (q: any) => q.eq("order_id", order._id))
+            .collect()) as OrderItemDoc[];
+          return [
+            order._id,
+            items.reduce((sum, item) => sum + item.quantity, 0),
+          ] as const;
+        }),
+    ),
+  ]);
+  const customersById = new Map(customers);
+  const storesById = new Map(stores);
+  const itemCounts = new Map(fallbackCounts);
+  return orders.map((o): OrderListRow => {
+    const c = customersById.get(o.customer_id);
+    return {
+      ...o,
+      customer_name:
+        c?.display_name ?? `${c?.phone_country_code ?? ""}${c?.phone_number ?? ""}`,
+      store_name: storesById.get(o.store_id)?.name,
+      item_count: o.item_count ?? itemCounts.get(o._id) ?? 0,
+    };
+  });
+}
+
+export async function listHandler(
+  ctx: { db: any },
+  args: {
+    status?: OrderStatus;
+    store_id?: string;
+    search?: string;
+    limit?: number;
+    offset?: number;
+    cursor?: string;
+    placed_from?: number;
+    placed_to?: number;
+  },
+) {
+  const { rows, hasMore } = await pageOrders(ctx, args);
+  const enriched = await enrichOrders(ctx, rows);
+  return pageResponse(enriched, args, hasMore);
+}
+
 /** Allowed forward transitions + terminal escape hatches. */
 const TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
   pending_payment: ["confirmed", "cancelled"],
@@ -49,64 +202,12 @@ export const list = query({
     search: v.optional(v.string()),
     limit: v.optional(v.number()),
     offset: v.optional(v.number()),
+    cursor: v.optional(v.string()),
+    placed_from: v.optional(v.number()),
+    placed_to: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
-    let rows: OrderDoc[];
-    if (args.status) {
-      rows = (await ctx.db
-        .query("orders")
-        .withIndex("by_status", (q) => q.eq("status", args.status!))
-        .collect()) as OrderDoc[];
-    } else if (args.store_id) {
-      rows = (await ctx.db
-        .query("orders")
-        .withIndex("by_store", (q) => q.eq("store_id", args.store_id!))
-        .collect()) as OrderDoc[];
-    } else {
-      rows = (await ctx.db.query("orders").collect()) as OrderDoc[];
-    }
-    if (args.store_id && args.status) {
-      rows = rows.filter((o) => o.store_id === args.store_id);
-    }
-    const customers = new Map(
-      ((await ctx.db.query("customers").collect()) as CustomerDoc[]).map((c) => [
-        c._id,
-        c,
-      ]),
-    );
-    const stores = new Map(
-      ((await ctx.db.query("stores").collect()) as StoreDoc[]).map((s) => [
-        s._id,
-        s,
-      ]),
-    );
-    const orderItems = (await ctx.db
-      .query("order_items")
-      .collect()) as OrderItemDoc[];
-    const itemCounts = new Map<string, number>();
-    for (const i of orderItems) {
-      itemCounts.set(i.order_id, (itemCounts.get(i.order_id) ?? 0) + i.quantity);
-    }
-    let enriched: OrderListRow[] = rows.map((o) => {
-      const c = customers.get(o.customer_id);
-      return {
-        ...o,
-        customer_name:
-          c?.display_name ?? `${c?.phone_country_code ?? ""}${c?.phone_number ?? ""}`,
-        store_name: stores.get(o.store_id)?.name,
-        item_count: itemCounts.get(o._id) ?? 0,
-      };
-    });
-    if (args.search) {
-      const s = args.search.toLowerCase();
-      enriched = enriched.filter(
-        (o) =>
-          o.order_number.toLowerCase().includes(s) ||
-          (o.customer_name ?? "").toLowerCase().includes(s),
-      );
-    }
-    enriched.sort((a, b) => b.placed_at - a.placed_at);
-    return paginate(enriched, args);
+    return await listHandler(ctx, args);
   },
 });
 
@@ -158,6 +259,14 @@ export const updateStatus = mutation({
     if (args.status === "delivered") patch.delivered_at = now();
     if (args.status === "cancelled") patch.cancelled_at = now();
     await ctx.db.patch(args.id, patch);
+    await applyOrderStatsChange(ctx, order, {
+      ...order,
+      status: args.status,
+      delivered_at:
+        args.status === "delivered" ? (patch.delivered_at as number) : order.delivered_at,
+      cancelled_at:
+        args.status === "cancelled" ? (patch.cancelled_at as number) : order.cancelled_at,
+    });
     return args.id;
   },
 });
@@ -180,5 +289,40 @@ export const updatePaymentStatus = mutation({
       });
     }
     return args.id;
+  },
+});
+
+export const backfillOrderListSummaries = internalMutation({
+  args: { limit: v.optional(v.number()) },
+  handler: async (ctx, args) => {
+    const limit = Math.min(Math.max(args.limit ?? 50, 1), 200);
+    const orders = (await ctx.db
+      .query("orders")
+      .withIndex("by_order_stats_backfill", (q) => q.eq("item_count", undefined))
+      .take(limit)) as OrderDoc[];
+    let patched = 0;
+    for (const order of orders) {
+      const [items, customer] = await Promise.all([
+        ctx.db
+          .query("order_items")
+          .withIndex("by_order", (q: any) => q.eq("order_id", order._id))
+          .collect(),
+        ctx.db.get(order.customer_id as any),
+      ]);
+      const itemCount = (items as OrderItemDoc[]).reduce(
+        (sum, item) => sum + item.quantity,
+        0,
+      );
+      await ctx.db.patch(order._id as any, {
+        item_count: itemCount,
+        order_search_text: orderSearchText(order, customer as CustomerDoc | null),
+      });
+      patched += 1;
+    }
+    return {
+      processed: orders.length,
+      patched,
+      remainingMayExist: orders.length >= limit,
+    };
   },
 });

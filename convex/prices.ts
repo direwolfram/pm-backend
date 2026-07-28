@@ -1,6 +1,7 @@
 import { v } from "convex/values";
 import { query, mutation } from "./functions";
 import { assertPricePair, now } from "./helpers";
+import { recomputeProductListSummary } from "./lib/productListSummaries";
 import type { PriceDoc } from "./model";
 
 const PRICE_SUMMARY_VERSION = 1;
@@ -95,9 +96,13 @@ export const upsert = mutation({
         ends_at: args.ends_at,
         priceSummaryVersion: PRICE_SUMMARY_VERSION,
       });
+      await recomputeProductListSummary(
+        ctx,
+        (sku as { product_id: string }).product_id,
+      );
       return args.id;
     }
-    return await ctx.db.insert("prices", {
+    const id = await ctx.db.insert("prices", {
       sku_id: args.sku_id,
       product_id: (sku as { product_id: string }).product_id,
       store_id: args.store_id,
@@ -109,13 +114,19 @@ export const upsert = mutation({
       ends_at: args.ends_at,
       priceSummaryVersion: PRICE_SUMMARY_VERSION,
     });
+    await recomputeProductListSummary(ctx, (sku as { product_id: string }).product_id);
+    return id;
   },
 });
 
 export const remove = mutation({
   args: { id: v.id("prices") },
   handler: async (ctx, args) => {
+    const price = (await ctx.db.get(args.id)) as PriceDoc | null;
     await ctx.db.delete(args.id);
+    if (price?.product_id) {
+      await recomputeProductListSummary(ctx, price.product_id);
+    }
   },
 });
 

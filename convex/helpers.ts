@@ -41,6 +41,30 @@ export function paginate<T>(
   };
 }
 
+export function boundedPageArgs(opts?: { limit?: number; offset?: number }) {
+  return {
+    limit: Math.min(Math.max(opts?.limit ?? 50, 1), 200),
+    offset: Math.max(opts?.offset ?? 0, 0),
+  };
+}
+
+export function pageResponse<T>(
+  data: T[],
+  args: { limit?: number; offset?: number; cursor?: string },
+  hasMore: boolean,
+) {
+  const { limit, offset } = boundedPageArgs(args);
+  return {
+    data,
+    total: offset + data.length + (hasMore ? 1 : 0),
+    limit,
+    offset,
+    cursor: data.length > 0 ? String((data.at(-1) as any)._id) : args.cursor,
+    nextCursor: hasMore ? String((data.at(-1) as any)._id) : null,
+    hasMore,
+  };
+}
+
 export function money(n: number): number {
   return Math.round(n * 100) / 100;
 }

@@ -1,5 +1,6 @@
 import { v } from "convex/values";
 import { query, mutation } from "./functions";
+import { recomputeProductListSummary } from "./lib/productListSummaries";
 import type { InventoryDoc, PriceDoc, SkuDoc } from "./model";
 
 export const listAll = query({
@@ -159,6 +160,7 @@ export const create = mutation({
     if (args.is_default) {
       await unsetOtherDefaults(ctx, args.product_id, id as string);
     }
+    await recomputeProductListSummary(ctx, args.product_id);
     return id;
   },
 });
@@ -225,6 +227,10 @@ export const update = mutation({
     if (patch.is_default) {
       await unsetOtherDefaults(ctx, sku.product_id, id as string);
     }
+    await recomputeProductListSummary(ctx, sku.product_id);
+    if (nextProductId !== sku.product_id) {
+      await recomputeProductListSummary(ctx, nextProductId);
+    }
     return id;
   },
 });
@@ -237,8 +243,8 @@ export const remove = mutation({
     if (!sku) throw new Error("SKU not found");
     const orderItem = await ctx.db
       .query("order_items")
-      .collect()
-      .then((rows) => rows.find((r) => r.sku_id === args.id));
+      .withIndex("by_sku", (q) => q.eq("sku_id", args.id))
+      .first();
     if (orderItem) {
       throw new Error(
         "Cannot delete: this SKU appears in orders. Deactivate it instead.",
@@ -265,5 +271,6 @@ export const remove = mutation({
         await ctx.db.patch(remaining[0]._id as any, { is_default: true });
       }
     }
+    await recomputeProductListSummary(ctx, sku.product_id);
   },
 });

@@ -1,4 +1,5 @@
 import { v } from "convex/values";
+import { anyApi } from "convex/server";
 import { internalMutation, mutation, query } from "./functions";
 import {
   computeSellable,
@@ -18,6 +19,7 @@ type UserId = ConvexId<"users">;
 type QuickStatus = "in_stock" | "low_stock" | "out_of_stock" | "unavailable";
 
 const QUICK_INVENTORY_SUMMARY_VERSION = 1;
+const SHELF_LIFE_BATCH_LIMIT = 100;
 
 interface QuickInventoryDoc {
   _id: InventoryId;
@@ -1072,25 +1074,64 @@ export const expireCartReservations = internalMutation({
 });
 
 export const updateShelfLife = internalMutation({
-  args: {},
-  handler: async (ctx) => {
+  args: {
+    cursorExpiryDate: v.optional(v.number()),
+    limit: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
     const t = now();
-    const batches = (await ctx.db.query("batches").collect()) as BatchDoc[];
+    const limit = Math.min(
+      Math.max(args.limit ?? SHELF_LIFE_BATCH_LIMIT, 1),
+      SHELF_LIFE_BATCH_LIMIT,
+    );
+    const batches = (await ctx.db
+      .query("batches")
+      .withIndex("by_unexpired_expiry", (q) => {
+        const base = q.eq("expiredAt", undefined);
+        return args.cursorExpiryDate === undefined
+          ? base
+          : base.gt("expiryDate", args.cursorExpiryDate);
+      })
+      .order("asc")
+      .take(limit + 1)) as BatchDoc[];
+    const page = batches.slice(0, limit);
     const touchedInventoryIds = new Set<InventoryId>();
-    for (const batch of batches) {
-      if (batch.expiredAt !== undefined) continue;
+    let patched = 0;
+    for (const batch of page) {
       const daysRemaining = shelfLifeDaysRemaining(batch.expiryDate, t);
-      await ctx.db.patch(batch._id, {
+      const next = {
         shelfLifeDaysRemaining: daysRemaining,
         isNearExpiry: daysRemaining <= 2,
         pickPriority: pickPriorityScore(batch.expiryDate),
-      });
-      touchedInventoryIds.add(batch.inventoryId);
+      };
+      if (
+        batch.shelfLifeDaysRemaining !== next.shelfLifeDaysRemaining ||
+        batch.isNearExpiry !== next.isNearExpiry ||
+        batch.pickPriority !== next.pickPriority
+      ) {
+        await ctx.db.patch(batch._id, next);
+        touchedInventoryIds.add(batch.inventoryId);
+        patched += 1;
+      }
     }
     for (const inventoryId of touchedInventoryIds) {
       await ctx.db.patch(inventoryId, await computeBatchSummary(ctx, inventoryId));
     }
-    return { updated: batches.length };
+    const hasMore = batches.length > limit;
+    if (hasMore && page.at(-1)) {
+      await ctx.scheduler.runAfter(0, anyApi.quickInventory.updateShelfLife, {
+        cursorExpiryDate: page.at(-1)!.expiryDate,
+        limit,
+      });
+    }
+    return {
+      processed: page.length,
+      patched,
+      touchedInventory: touchedInventoryIds.size,
+      nextCursorExpiryDate: hasMore ? page.at(-1)?.expiryDate : undefined,
+      remainingMayExist: hasMore,
+      timezone: "Asia/Manila",
+    };
   },
 });
 

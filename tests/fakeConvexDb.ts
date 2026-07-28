@@ -3,20 +3,29 @@ type TableName =
   | "inventoryPricing"
   | "batches"
   | "products"
+  | "customers"
+  | "orders"
+  | "order_items"
   | "fulfillmentCenters"
   | "stores"
+  | "delivery_zones"
   | "skus"
   | "prices"
   | "product_similar_products"
   | "product_media"
   | "categories"
-  | "brands";
+  | "brands"
+  | "home_section_items"
+  | "promotion_targets";
 
 type Row = Record<string, unknown> & { _id: string };
 
 interface IndexRangeBuilder {
   eq(field: string, value: unknown): IndexRangeBuilder;
   lt(field: string, value: unknown): IndexRangeBuilder;
+  lte(field: string, value: unknown): IndexRangeBuilder;
+  gt(field: string, value: unknown): IndexRangeBuilder;
+  gte(field: string, value: unknown): IndexRangeBuilder;
 }
 
 interface QueryStats {
@@ -79,6 +88,18 @@ export class FakeConvexDb {
             constraints.set(`${field}:lt`, value);
             return builder;
           },
+          lte: (field: string, value: unknown) => {
+            constraints.set(`${field}:lte`, value);
+            return builder;
+          },
+          gt: (field: string, value: unknown) => {
+            constraints.set(`${field}:gt`, value);
+            return builder;
+          },
+          gte: (field: string, value: unknown) => {
+            constraints.set(`${field}:gte`, value);
+            return builder;
+          },
         };
         range?.(builder);
         return query;
@@ -117,6 +138,15 @@ export class FakeConvexDb {
         if (field.endsWith(":lt")) {
           const realField = field.slice(0, -3);
           if (!(row[realField] < expected)) return false;
+        } else if (field.endsWith(":lte")) {
+          const realField = field.slice(0, -4);
+          if (!(row[realField] <= expected)) return false;
+        } else if (field.endsWith(":gt")) {
+          const realField = field.slice(0, -3);
+          if (!(row[realField] > expected)) return false;
+        } else if (field.endsWith(":gte")) {
+          const realField = field.slice(0, -4);
+          if (!(row[realField] >= expected)) return false;
         } else if (row[field] !== expected) {
           return false;
         }

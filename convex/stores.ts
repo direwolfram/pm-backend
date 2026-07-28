@@ -114,14 +114,16 @@ export const remove = mutation({
       .withIndex("by_store", (q) => q.eq("store_id", args.id))
       .collect();
     for (const z of zones) await ctx.db.delete(z._id);
-    const inv = await ctx.db.query("inventory").collect();
-    for (const row of inv) {
-      if (row.store_id === args.id) await ctx.db.delete(row._id);
-    }
-    const prices = await ctx.db.query("prices").collect();
-    for (const p of prices) {
-      if (p.store_id === args.id) await ctx.db.delete(p._id);
-    }
+    const inv = await ctx.db
+      .query("inventory")
+      .withIndex("by_store", (q) => q.eq("store_id", args.id))
+      .collect();
+    for (const row of inv) await ctx.db.delete(row._id);
+    const prices = await ctx.db
+      .query("prices")
+      .withIndex("by_store", (q) => q.eq("store_id", args.id))
+      .collect();
+    for (const p of prices) await ctx.db.delete(p._id);
     await ctx.db.delete(args.id);
   },
 });

@@ -91,10 +91,9 @@ export const remove = mutation({
     }
     const targets = await ctx.db
       .query("promotion_targets")
+      .withIndex("by_brand", (q) => q.eq("brand_id", args.id))
       .collect();
-    for (const t of targets) {
-      if (t.brand_id === args.id) await ctx.db.delete(t._id);
-    }
+    for (const t of targets) await ctx.db.delete(t._id);
     await ctx.db.delete(args.id);
   },
 });
