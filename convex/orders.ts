@@ -1,6 +1,6 @@
 import { v } from "convex/values";
 import { anyApi } from "convex/server";
-import { query, mutation, internalMutation } from "./functions";
+import { query, mutation, internalMutation, internalQuery } from "./functions";
 import {
   assertNonNegative,
   assertPositiveQuantity,
@@ -35,6 +35,22 @@ const ORDER_SUMMARY_BATCH_LIMIT = 100;
  * validated during summary recomputation (never silently truncated).
  */
 export const MAX_ORDER_ITEMS = 1_000;
+
+/**
+ * Hard cap on the number of order documents a single list request may scan
+ * outside of its returned page.
+ *
+ * Convex search queries cannot be paginated or range-filtered by placed_at,
+ * and an index range cannot be counted without reading it. So for search
+ * result sets, date-window totals, and missing maintained counters the only
+ * correct option is a bounded scan: each request reads at most
+ * ORDER_LIST_SCAN_CAP + 1 documents and explicitly rejects the query when
+ * the domain exceeds the cap, instead of silently returning incomplete
+ * results. Equality-filtered (status/store) queries without a date window
+ * never scan: their exact totals come from transactionally maintained
+ * listCounts rows and their pages from index pagination.
+ */
+export const ORDER_LIST_SCAN_CAP = 512;
 
 const orderStatus = v.union(
   v.literal("pending_payment"),
@@ -129,6 +145,21 @@ function orderListScope(args: {
   };
 }
 
+/**
+ * Bounded exact count of a query domain. Reads at most cap + 1 documents;
+ * throws an explicit error when the domain is larger so callers never see a
+ * silently truncated total.
+ */
+async function boundedDomainCount(
+  buildQuery: () => { take: (n: number) => Promise<unknown[]> },
+  cap: number,
+  tooLargeMessage: string,
+) {
+  const rows = await buildQuery().take(cap + 1);
+  if (rows.length > cap) throw new Error(tooLargeMessage);
+  return rows.length;
+}
+
 async function pageOrders(
   ctx: { db: any },
   args: {
@@ -157,18 +188,28 @@ async function pageOrders(
     // Search domain: status/store are search filter fields; the placed_at
     // window is applied to the full match set BEFORE the logical page is
     // produced, so pages are complete (never post-filtered fixed pages).
-    // Reads are bounded by the match set, not the table.
-    const matches = (
-      (await ctx.db
-        .query("orders")
-        .withSearchIndex("search_orders", (q: any) => {
-          let s = q.search("order_search_text", args.search!.trim().toLowerCase());
-          if (args.status) s = s.eq("status", args.status);
-          if (args.store_id) s = s.eq("store_id", args.store_id);
-          return s;
-        })
-        .collect()) as OrderDoc[]
-    ).filter(inWindow);
+    // Convex search queries cannot be paginated, so the match set is read
+    // with a hard cap: requests stay bounded no matter how large order
+    // history grows, and a match domain larger than the cap is rejected
+    // explicitly rather than silently truncated.
+    const rawMatches = (await ctx.db
+      .query("orders")
+      .withSearchIndex("search_orders", (q: any) => {
+        let s = q.search("order_search_text", args.search!.trim().toLowerCase());
+        if (args.status) s = s.eq("status", args.status);
+        if (args.store_id) s = s.eq("store_id", args.store_id);
+        return s;
+      })
+      .take(ORDER_LIST_SCAN_CAP + 1)) as OrderDoc[];
+    // A full take means more matches may exist that this request did not
+    // read; filtering those down to a page could silently drop in-window
+    // results, so reject instead of returning an incomplete result set.
+    if (rawMatches.length > ORDER_LIST_SCAN_CAP) {
+      throw new Error(
+        `Search matched more than ${ORDER_LIST_SCAN_CAP} orders; narrow the search term, status, store, or date filters`,
+      );
+    }
+    const matches = rawMatches.filter(inWindow);
     const skip = useOffset
       ? pageArgs.offset
       : cursor === null
@@ -210,14 +251,22 @@ async function pageOrders(
       if (args.status) return withBounds(q.eq("status", args.status));
       return withBounds(q);
     });
-  // Exact totals: maintained counters for equality-only queries (O(1)); a
-  // count of the index range (bounded by the match domain) for date windows
-  // or missing counter rows.
+  // Exact totals: maintained counters for equality-only queries (O(1)).
+  // Date-window totals and missing counter rows cannot be produced without
+  // reading the domain, so they use a bounded scan that rejects domains
+  // larger than the cap instead of scanning unboundedly or guessing.
   const maintained = hasWindow
     ? undefined
     : await exactListTotal(ctx, "orders", orderTotalKey(args));
   const total =
-    maintained ?? ((await makeBuilder().collect()) as OrderDoc[]).length;
+    maintained ??
+    (await boundedDomainCount(
+      makeBuilder,
+      ORDER_LIST_SCAN_CAP,
+      hasWindow
+        ? `More than ${ORDER_LIST_SCAN_CAP} orders fall inside this date window; narrow placed_from/placed_to or add a status/store filter`
+        : `Order list counters are missing for this filter and more than ${ORDER_LIST_SCAN_CAP} orders match; run listCounts.reconcileListCounts for scope "orders" before querying`,
+    ));
 
   const ordered = makeBuilder().order("desc");
   if (!useOffset) {
@@ -713,6 +762,66 @@ export const refreshCustomerOrderSearch = internalMutation({
       patched,
       nextCursor: result.continueCursor,
       remainingMayExist: !result.isDone,
+    };
+  },
+});
+
+/**
+ * Rollout/readiness probe for the order list summaries. Reports how many
+ * orders are still behind ORDER_SUMMARY_VERSION (bounded sample: counts at
+ * most ORDER_LIST_SCAN_CAP + 1 rows) so deploys can gate on
+ * backfillOrderListSummaries before relying on search/item_count reads.
+ */
+export const orderSummaryReadiness = internalQuery({
+  args: {},
+  handler: async (ctx) => {
+    const stale = await ctx.db
+      .query("orders")
+      .withIndex("by_order_summary_version", (q) =>
+        q.lt("orderSummaryVersion", ORDER_SUMMARY_VERSION),
+      )
+      .take(ORDER_LIST_SCAN_CAP + 1);
+    return {
+      version: ORDER_SUMMARY_VERSION,
+      stale: stale.length,
+      overflow: stale.length > ORDER_LIST_SCAN_CAP,
+      ready: stale.length === 0,
+    };
+  },
+});
+
+/**
+ * Deep, idempotent reconciliation for order summaries. Unlike
+ * backfillOrderListSummaries (which selects by version), this sweeps EVERY
+ * order in fixed-size pages and recomputes item_count + order_search_text,
+ * so state that is stale while carrying the current version (e.g. corrupted
+ * by a historical bug or a direct DB edit) is also repaired. Patches do not
+ * touch the scan ordering, so the continuation cursor stays valid across
+ * batches and retries.
+ */
+export const reconcileOrderSummaries = internalMutation({
+  args: { limit: v.optional(v.number()), cursor: v.optional(v.string()) },
+  handler: async (ctx, args) => {
+    const limit = Math.min(Math.max(args.limit ?? 50, 1), ORDER_SUMMARY_BATCH_LIMIT);
+    const result = await ctx.db
+      .query("orders")
+      .order("asc")
+      .paginate({ numItems: limit, cursor: args.cursor ?? null });
+    let patched = 0;
+    for (const order of result.page as OrderDoc[]) {
+      if (await patchOrderSummary(ctx, order)) patched += 1;
+    }
+    if (!result.isDone) {
+      await ctx.scheduler.runAfter(0, anyApi.orders.reconcileOrderSummaries, {
+        limit,
+        cursor: result.continueCursor,
+      });
+    }
+    return {
+      done: result.isDone,
+      processed: result.page.length,
+      patched,
+      nextCursor: result.isDone ? undefined : result.continueCursor,
     };
   },
 });

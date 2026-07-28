@@ -31,6 +31,11 @@ interface IndexRangeBuilder {
   gte(field: string, value: unknown): IndexRangeBuilder;
 }
 
+interface SearchFilterBuilder {
+  search(field: string, term: string): SearchFilterBuilder;
+  eq(field: string, value: unknown): SearchFilterBuilder;
+}
+
 interface QueryStats {
   collect: Record<string, number>;
   first: Record<string, number>;
@@ -107,6 +112,24 @@ export class FakeConvexDb {
         range?.(builder);
         return query;
       },
+      withSearchIndex: (
+        name: string,
+        searchFilter: (q: SearchFilterBuilder) => SearchFilterBuilder,
+      ) => {
+        indexName = `search:${name}`;
+        const builder: SearchFilterBuilder = {
+          search: (field: string, term: string) => {
+            constraints.set(`search:${field}`, term.toLowerCase());
+            return builder;
+          },
+          eq: (field: string, value: unknown) => {
+            constraints.set(field, value);
+            return builder;
+          },
+        };
+        searchFilter(builder);
+        return query;
+      },
       order: () => {
         return query;
       },
@@ -153,7 +176,12 @@ export class FakeConvexDb {
   private applyConstraints(table: TableName, constraints: Map<string, unknown>) {
     return (this.rows[table] ?? []).filter((row) => {
       for (const [field, expected] of constraints) {
-        if (field.endsWith(":lt")) {
+        if (field.startsWith("search:")) {
+          const realField = field.slice(7);
+          const haystack = String(row[realField] ?? "").toLowerCase();
+          const tokens = String(expected).split(/\s+/).filter(Boolean);
+          if (!tokens.every((token) => haystack.includes(token))) return false;
+        } else if (field.endsWith(":lt")) {
           const realField = field.slice(0, -3);
           if (!(row[realField] < expected)) return false;
         } else if (field.endsWith(":lte")) {
