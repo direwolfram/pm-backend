@@ -19,15 +19,32 @@ function makeQuickRows(count: number) {
       lastUpdatedAt: 1,
       isActive: true,
       isLowStock: false,
+      isQuickInventory: true,
+      quickStatus: "in_stock",
       productName: `Product ${n}`,
       productBrand: "PocketMart",
       fulfillmentCenterName: "Center A",
+      pricingSummary:
+        index % 2 === 0
+          ? {
+              _id: `price_${n}`,
+              inventoryId: `inv_${n}`,
+              dynamicPrice: 100 + index,
+              flashSaleReservedQty: 0,
+              membershipExclusiveQty: 0,
+              isSurgeActive: false,
+            }
+          : undefined,
+      batchCount: index % 3,
+      nearExpiryBatchCount: index % 2,
+      earliestExpiryDate: index % 3 ? 1000 + index : undefined,
+      quickInventorySummaryVersion: 1,
     });
   });
 }
 
 describe("quickInventory.listByCenter", () => {
-  it("uses inventory summaries for search and limits expensive enrichment to returned rows", async () => {
+  it("uses inventory summaries and does not query pricing or batches per returned row", async () => {
     const rows = makeQuickRows(120);
     const db = new FakeConvexDb({
       inventory: rows,
@@ -78,10 +95,17 @@ describe("quickInventory.listByCenter", () => {
       "SKU-003",
       "SKU-004",
     ]);
-    expect(db.stats.get.products).toBe(5);
-    expect(db.stats.get.fulfillmentCenters).toBe(1);
-    expect(db.stats.first["inventoryPricing.by_inventory"]).toBe(5);
-    expect(db.stats.collect["batches.by_inventory_expiry"]).toBe(5);
+    expect(result[0].pricing).toMatchObject({ dynamicPrice: 100 });
+    expect(result[1].pricing).toBeNull();
+    expect(result[2]).toMatchObject({
+      batchCount: 2,
+      nearExpiryBatchCount: 0,
+      earliestExpiryDate: 1002,
+    });
+    expect(db.stats.get.products).toBeUndefined();
+    expect(db.stats.get.fulfillmentCenters).toBeUndefined();
+    expect(db.stats.first["inventoryPricing.by_inventory"]).toBeUndefined();
+    expect(db.stats.collect["batches.by_inventory_expiry"]).toBeUndefined();
   });
 
   it("does not fetch every product to apply search", async () => {
@@ -129,8 +153,46 @@ describe("quickInventory.listByCenter", () => {
     );
 
     expect(result.map((row) => row.sku)).toEqual(["SKU-099"]);
-    expect(db.stats.get.products).toBe(1);
-    expect(db.stats.first["inventoryPricing.by_inventory"]).toBe(1);
-    expect(db.stats.collect["batches.by_inventory_expiry"]).toBe(1);
+    expect(db.stats.get.products).toBeUndefined();
+    expect(db.stats.first["inventoryPricing.by_inventory"]).toBeUndefined();
+    expect(db.stats.collect["batches.by_inventory_expiry"]).toBeUndefined();
+  });
+
+  it("keeps child query counts constant as page size and unrelated inventory grow", async () => {
+    const rows = makeQuickRows(240);
+    const unrelated = Array.from({ length: 500 }, (_, index) =>
+      doc("inventory", {
+        _id: `legacy_${index}`,
+        sku_id: `sku_${index}`,
+        store_id: "store_a",
+        quantity_available: 10,
+        quantity_reserved: 0,
+        low_stock_threshold: 5,
+        status: "in_stock",
+        updated_at: 1,
+      }),
+    );
+    const smallDb = new FakeConvexDb({ inventory: rows, inventoryPricing: [], batches: [] });
+    const largeDb = new FakeConvexDb({
+      inventory: [...rows, ...unrelated],
+      inventoryPricing: [],
+      batches: [],
+    });
+
+    await listByCenterHandler(
+      { db: smallDb },
+      { fulfillmentCenterId: "center_a" as Id<"fulfillmentCenters">, limit: 5 },
+    );
+    await listByCenterHandler(
+      { db: largeDb },
+      { fulfillmentCenterId: "center_a" as Id<"fulfillmentCenters">, limit: 200 },
+    );
+
+    expect(smallDb.stats.first["inventoryPricing.by_inventory"]).toBeUndefined();
+    expect(smallDb.stats.collect["batches.by_inventory_expiry"]).toBeUndefined();
+    expect(largeDb.stats.first["inventoryPricing.by_inventory"]).toBeUndefined();
+    expect(largeDb.stats.collect["batches.by_inventory_expiry"]).toBeUndefined();
+    expect(largeDb.stats.collect.inventory).toBeUndefined();
+    expect(largeDb.stats.collect["inventory.by_center_active"]).toBe(1);
   });
 });

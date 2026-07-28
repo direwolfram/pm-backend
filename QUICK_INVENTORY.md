@@ -10,6 +10,16 @@ npx convex run quickInventorySeed:run
 
 The seed creates 3 fulfillment centers, 20 products, 50 inventory rows, 10 perishable batches, delivery slots, and a sample user.
 
+## Backfill inventory summaries
+
+`quickInventory.listByCenter` reads pricing and batch metadata from maintained
+inventory summaries. Existing databases should run the bounded migration until
+`remainingMayExist` is `false`:
+
+```bash
+npx convex run quickInventory:backfillInventorySummaries '{"limit":100}'
+```
+
 ## Reservation flow
 
 1. Find stock:

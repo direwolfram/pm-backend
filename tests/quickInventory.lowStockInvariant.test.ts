@@ -189,4 +189,54 @@ describe("quick inventory low-stock invariant", () => {
       isLowStock: false,
     });
   });
+
+  it("backfills quick inventory pricing and batch summaries in bounded chunks", async () => {
+    const t = convexTest({ schema, modules });
+    const { inventoryId } = await insertInventory(t);
+    await t.run(async (ctx) => {
+      await ctx.db.patch(inventoryId, {
+        pricingSummary: undefined,
+        batchCount: undefined,
+        nearExpiryBatchCount: undefined,
+        earliestExpiryDate: undefined,
+        quickInventorySummaryVersion: undefined,
+      });
+      await ctx.db.insert("inventoryPricing", {
+        inventoryId,
+        dynamicPrice: 123,
+        flashSaleReservedQty: 1,
+        membershipExclusiveQty: 2,
+        isSurgeActive: true,
+      });
+      await ctx.db.insert("batches", {
+        inventoryId,
+        batchNumber: "BACKFILL-1",
+        quantity: 1,
+        expiryDate: Date.now() + 24 * 60 * 60 * 1000,
+        shelfLifeDaysRemaining: 1,
+        isNearExpiry: true,
+        discountPercent: 0,
+        qualityCheckStatus: "passed",
+        pickPriority: 1,
+      });
+    });
+
+    await expect(
+      t.mutation(api.quickInventory.backfillInventorySummaries, {
+        limit: 1,
+      }),
+    ).resolves.toEqual({ processed: 1, remainingMayExist: true });
+    await expect(readInventory(t, inventoryId)).resolves.toMatchObject({
+      pricingSummary: { dynamicPrice: 123, isSurgeActive: true },
+      batchCount: 1,
+      nearExpiryBatchCount: 1,
+      earliestExpiryDate: Date.now() + 24 * 60 * 60 * 1000,
+      quickInventorySummaryVersion: 1,
+    });
+    await expect(
+      t.mutation(api.quickInventory.backfillInventorySummaries, {
+        limit: 1,
+      }),
+    ).resolves.toEqual({ processed: 0, remainingMayExist: false });
+  });
 });
