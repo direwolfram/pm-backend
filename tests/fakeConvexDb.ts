@@ -5,7 +5,12 @@ type TableName =
   | "products"
   | "fulfillmentCenters"
   | "stores"
-  | "skus";
+  | "skus"
+  | "prices"
+  | "product_similar_products"
+  | "product_media"
+  | "categories"
+  | "brands";
 
 type Row = Record<string, unknown> & { _id: string };
 

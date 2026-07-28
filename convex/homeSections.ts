@@ -452,20 +452,30 @@ function configString(config: unknown, key: string): string | undefined {
   return typeof value === "string" && value ? value : undefined;
 }
 
+const SECTION_REFERENCE_LIMIT = 50;
+
+function boundedRefs(ids: string[], label: string) {
+  const uniqueIds = unique(ids);
+  if (uniqueIds.length > SECTION_REFERENCE_LIMIT) {
+    throw new Error(`${label} references cannot exceed ${SECTION_REFERENCE_LIMIT}`);
+  }
+  return uniqueIds;
+}
+
 function referencedIds(section: HomeSectionDoc) {
   return {
-    productIds: unique([...(section.productIds as string[] | undefined ?? []), ...configArray(section.config, "productIds")]),
-    categoryIds: unique([
+    productIds: boundedRefs([...(section.productIds as string[] | undefined ?? []), ...configArray(section.config, "productIds")], "productIds"),
+    categoryIds: boundedRefs([
       ...(section.categoryIds as string[] | undefined ?? []),
       ...configArray(section.config, "categoryIds"),
       configString(section.config, "categoryId"),
-    ].filter(Boolean) as string[]),
-    promotionIds: unique([...(section.promotionIds as string[] | undefined ?? []), ...configArray(section.config, "promotionIds")]),
-    storeIds: unique([...(section.storeIds as string[] | undefined ?? []), ...configArray(section.config, "storeIds")]),
-    brandIds: unique([
+    ].filter(Boolean) as string[], "categoryIds"),
+    promotionIds: boundedRefs([...(section.promotionIds as string[] | undefined ?? []), ...configArray(section.config, "promotionIds")], "promotionIds"),
+    storeIds: boundedRefs([...(section.storeIds as string[] | undefined ?? []), ...configArray(section.config, "storeIds")], "storeIds"),
+    brandIds: boundedRefs([
       ...(section.brandIds as string[] | undefined ?? []),
       configString(section.config, "brandId"),
-    ].filter(Boolean) as string[]),
+    ].filter(Boolean) as string[], "brandIds"),
   };
 }
 
@@ -479,11 +489,11 @@ async function ensureReferences(ctx: { db: any }, section: HomeSectionDoc) {
     ...refs.brandIds.map((id) => ["brands", id, (doc: BrandDoc | null) => !!doc?.is_active] as [string, string, (doc: any) => boolean]),
   ];
   const inactive: string[] = [];
-  for (const [table, id, isActive] of checks) {
+  await Promise.all(checks.map(async ([table, id, isActive]) => {
     const doc = await ctx.db.get(id as any);
     if (!doc) throw new Error(`Referenced ${table} document does not exist: ${id}`);
     if (!isActive(doc)) inactive.push(`${table}:${id}`);
-  }
+  }));
   if (section.isActive && inactive.length && !section.allowEmpty) {
     throw new Error(`Active section has inactive references: ${inactive.join(", ")}`);
   }
@@ -1029,34 +1039,40 @@ export const list = query({
       .map((section) => (requestedTab && effectiveTab === "All" ? sectionWithDisplayTab(section, requestedTab) : section));
 
     const resolutionContext = buildResolutionContext(ctx, sections, args);
-    const visibleResponses = [];
-    for (const section of sections) {
-      const response = await responseForSection(resolutionContext, section, args);
-      if (
-        productSectionKinds.has(section.kind) &&
-        !section.allowEmpty &&
-        (!response.resolvedData.products || response.resolvedData.products.length === 0)
-      ) {
-        continue;
-      }
-      if (
-        (section.kind === "category_grid" || section.kind === "category_tabs") &&
-        !section.allowEmpty &&
-        (!response.resolvedData.categories || response.resolvedData.categories.length === 0) &&
-        referencedIds(section).categoryIds.length
-      ) {
-        continue;
-      }
-      if (
-        (section.kind === "promo_banner" || section.kind === "promo_carousel") &&
-        !section.allowEmpty &&
-        (!response.resolvedData.promotions || response.resolvedData.promotions.length === 0) &&
-        referencedIds(section).promotionIds.length
-      ) {
-        continue;
-      }
-      visibleResponses.push(response);
-    }
+    const resolvedResponses = await Promise.all(
+      sections.map(async (section) => ({
+        section,
+        response: await responseForSection(resolutionContext, section, args),
+      })),
+    );
+    const visibleResponses = resolvedResponses
+      .filter(({ section, response }) => {
+        if (
+          productSectionKinds.has(section.kind) &&
+          !section.allowEmpty &&
+          (!response.resolvedData.products || response.resolvedData.products.length === 0)
+        ) {
+          return false;
+        }
+        if (
+          (section.kind === "category_grid" || section.kind === "category_tabs") &&
+          !section.allowEmpty &&
+          (!response.resolvedData.categories || response.resolvedData.categories.length === 0) &&
+          referencedIds(section).categoryIds.length
+        ) {
+          return false;
+        }
+        if (
+          (section.kind === "promo_banner" || section.kind === "promo_carousel") &&
+          !section.allowEmpty &&
+          (!response.resolvedData.promotions || response.resolvedData.promotions.length === 0) &&
+          referencedIds(section).promotionIds.length
+        ) {
+          return false;
+        }
+        return true;
+      })
+      .map(({ response }) => response);
     return {
       data: visibleResponses.slice(offset, offset + limit),
       total: visibleResponses.length,
@@ -1110,15 +1126,14 @@ export const adminList = query({
     if (args.state === "archived") rows = rows.filter((s) => !!s.archivedAt);
     if (!args.state || args.state === "all") rows = rows.filter((s) => !s.archivedAt);
     rows.sort((a, b) => a.tab.localeCompare(b.tab) || (a.sortOrder ?? 0) - (b.sortOrder ?? 0));
-    const data = [];
     const page = rows.slice(offset, offset + limit);
     const resolutionContext = buildResolutionContext(ctx, page, {});
-    for (const section of page) {
-      data.push({
+    const data = await Promise.all(
+      page.map(async (section) => ({
         ...section,
         preview: await responseForSection(resolutionContext, section, {}),
-      });
-    }
+      })),
+    );
     return { data, total: rows.length, limit, offset };
   },
 });

@@ -414,19 +414,8 @@ export async function listByCenterHandler(
     rows = rows.filter((row) => (row.quickStatus ?? stockStatus(row)) === args.status);
   }
 
-  const needsProductLookup = rows.filter((row) => row.productName === undefined);
-  const productLookup = await fetchProductsById(
-    ctx,
-    needsProductLookup.map((row) => row.productId!),
-  );
-
-  const needsCenterLookup = rows.filter(
-    (row) => row.fulfillmentCenterName === undefined,
-  );
-  const centerLookup = await fetchCentersById(
-    ctx,
-    needsCenterLookup.map((row) => row.fulfillmentCenterId!),
-  );
+  const productLookup = new Map<ProductId, ProductDoc | null>();
+  const centerLookup = new Map<CenterId, FulfillmentCenterDoc | null>();
 
   if (args.search) {
     const search = args.search.toLowerCase();
@@ -1123,18 +1112,29 @@ export const flagNearExpiry = internalMutation({
 });
 
 export const backfillInventorySummaries = mutation({
-  args: { limit: v.optional(v.number()) },
+  args: { limit: v.optional(v.number()), cursor: v.optional(v.string()) },
   handler: async (ctx, args) => {
     const limit = Math.min(Math.max(args.limit ?? 50, 1), 200);
-    const rows = (await ctx.db
+    const candidateLimit = args.cursor ? Math.min(limit * 2, 400) : limit;
+    const candidates = (await ctx.db
       .query("inventory")
       .withIndex("by_summary_version", (q) =>
         q.eq("quickInventorySummaryVersion", undefined),
       )
-      .take(limit)) as QuickInventoryDoc[];
+      .take(candidateLimit)) as QuickInventoryDoc[];
+    const cursorIndex = args.cursor
+      ? candidates.findIndex((row) => row._id === args.cursor)
+      : -1;
+    const rows = candidates
+      .slice(cursorIndex >= 0 ? cursorIndex + 1 : 0)
+      .slice(0, limit);
     for (const row of rows) {
       await patchInventorySummaries(ctx, row);
     }
-    return { processed: rows.length, remainingMayExist: rows.length === limit };
+    return {
+      processed: rows.length,
+      nextCursor: rows.at(-1)?._id,
+      remainingMayExist: candidates.length >= candidateLimit,
+    };
   },
 });

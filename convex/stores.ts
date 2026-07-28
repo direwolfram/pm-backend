@@ -73,6 +73,30 @@ export const update = mutation({
     const store = await ctx.db.get(id);
     if (!store) throw new Error("Store not found");
     await ctx.db.patch(id, { ...patch, updated_at: now() });
+    if (patch.name) {
+      const [prices, inventory] = await Promise.all([
+        ctx.db
+          .query("prices")
+          .withIndex("by_store", (q) => q.eq("store_id", id))
+          .collect(),
+        ctx.db
+          .query("inventory")
+          .withIndex("by_store", (q) => q.eq("store_id", id))
+          .collect(),
+      ]);
+      for (const price of prices) {
+        await ctx.db.patch(price._id, {
+          storeName: patch.name,
+          priceSummaryVersion: 1,
+        });
+      }
+      for (const row of inventory) {
+        await ctx.db.patch(row._id, {
+          storeName: patch.name,
+          storeInventorySummaryVersion: 1,
+        });
+      }
+    }
     return id;
   },
 });

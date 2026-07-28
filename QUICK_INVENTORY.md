@@ -20,6 +20,20 @@ inventory summaries. Existing databases should run the bounded migration until
 npx convex run quickInventory:backfillInventorySummaries '{"limit":100}'
 ```
 
+The migration is idempotent and returns `nextCursor`; callers may pass that
+cursor on the next run, or safely retry without it because already-patched rows
+leave the pending-summary index. During migration, rows missing summaries use
+compatibility fallback reads only after pagination, so search and exact
+product-name sorting for those rows become fully precise after backfill.
+
+Legacy store inventory and price history have their own maintained display/read
+summaries:
+
+```bash
+npx convex run inventory:backfillStoreInventorySummaries '{"limit":100}'
+npx convex run prices:backfillPriceSummaries '{"limit":100}'
+```
+
 ## Reservation flow
 
 1. Find stock:

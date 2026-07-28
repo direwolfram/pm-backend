@@ -217,12 +217,15 @@ export interface SkuDoc extends BaseDoc {
 
 export interface PriceDoc extends BaseDoc {
   sku_id: string;
+  product_id?: string;
   store_id?: string;
+  storeName?: string;
   currency: string;
   sale_price: number;
   compare_at_price?: number;
   starts_at: number;
   ends_at?: number;
+  priceSummaryVersion?: number;
 }
 
 export interface InventoryDoc extends BaseDoc {
@@ -237,6 +240,9 @@ export interface InventoryDoc extends BaseDoc {
   skuCode?: string;
   variantLabel?: string;
   productName?: string;
+  storeName?: string;
+  productId?: string;
+  storeInventorySummaryVersion?: number;
 }
 
 export interface PromotionDoc extends BaseDoc {

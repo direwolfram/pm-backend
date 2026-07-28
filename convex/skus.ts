@@ -30,27 +30,49 @@ export const listAll = query({
   },
 });
 
+export async function listByProductHandler(
+  ctx: { db: any },
+  args: { product_id: string },
+) {
+    const [skus, prices, inventory] = (await Promise.all([
+      ctx.db
+        .query("skus")
+        .withIndex("by_product", (q: any) => q.eq("product_id", args.product_id))
+        .collect(),
+      ctx.db
+        .query("prices")
+        .withIndex("by_product", (q: any) => q.eq("product_id", args.product_id))
+        .collect(),
+      ctx.db
+        .query("inventory")
+        .withIndex("by_product_id", (q: any) => q.eq("productId", args.product_id))
+        .collect(),
+    ])) as [SkuDoc[], PriceDoc[], InventoryDoc[]];
+    skus.sort((a, b) => a.sort_order - b.sort_order);
+    const pricesBySku = new Map<string, PriceDoc[]>();
+    for (const price of prices) {
+      const rows = pricesBySku.get(price.sku_id) ?? [];
+      rows.push(price);
+      pricesBySku.set(price.sku_id, rows);
+    }
+    const inventoryBySku = new Map<string, InventoryDoc[]>();
+    for (const row of inventory) {
+      if (row.sku_id === undefined) continue;
+      const rows = inventoryBySku.get(row.sku_id) ?? [];
+      rows.push(row);
+      inventoryBySku.set(row.sku_id, rows);
+    }
+  return skus.map((s) => ({
+      ...s,
+      prices: pricesBySku.get(s._id) ?? [],
+      inventory: inventoryBySku.get(s._id) ?? [],
+    }));
+}
+
 export const listByProduct = query({
   args: { product_id: v.id("products") },
   handler: async (ctx, args) => {
-    const skus = (await ctx.db
-      .query("skus")
-      .withIndex("by_product", (q) => q.eq("product_id", args.product_id))
-      .collect()) as SkuDoc[];
-    skus.sort((a, b) => a.sort_order - b.sort_order);
-    const result = [];
-    for (const s of skus) {
-      const prices = (await ctx.db
-        .query("prices")
-        .withIndex("by_sku", (q) => q.eq("sku_id", s._id))
-        .collect()) as PriceDoc[];
-      const inventory = (await ctx.db
-        .query("inventory")
-        .withIndex("by_sku", (q) => q.eq("sku_id", s._id))
-        .collect()) as InventoryDoc[];
-      result.push({ ...s, prices, inventory });
-    }
-    return result;
+    return await listByProductHandler(ctx, args);
   },
 });
 
@@ -163,6 +185,11 @@ export const update = mutation({
     const { id, ...patch } = args;
     const sku = (await ctx.db.get(id)) as SkuDoc | null;
     if (!sku) throw new Error("SKU not found");
+    const nextProductId = patch.product_id ?? sku.product_id;
+    const product = (await ctx.db.get(nextProductId as any)) as
+      | { name?: string }
+      | null;
+    if (!product) throw new Error("Product not found");
     if (patch.sku_code || patch.barcode) {
       await assertUniqueSkuCode(
         ctx,
@@ -172,6 +199,29 @@ export const update = mutation({
       );
     }
     await ctx.db.patch(id, patch);
+    const prices = await ctx.db
+      .query("prices")
+      .withIndex("by_sku", (q) => q.eq("sku_id", id))
+      .collect();
+    for (const price of prices) {
+      await ctx.db.patch(price._id, {
+        product_id: nextProductId,
+        priceSummaryVersion: 1,
+      });
+    }
+    const inventory = await ctx.db
+      .query("inventory")
+      .withIndex("by_sku", (q) => q.eq("sku_id", id))
+      .collect();
+    for (const row of inventory) {
+      await ctx.db.patch(row._id, {
+        productId: nextProductId,
+        skuCode: patch.sku_code ?? sku.sku_code,
+        variantLabel: patch.variant_label ?? sku.variant_label,
+        productName: product.name,
+        storeInventorySummaryVersion: 1,
+      });
+    }
     if (patch.is_default) {
       await unsetOtherDefaults(ctx, sku.product_id, id as string);
     }

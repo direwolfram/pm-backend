@@ -15,7 +15,8 @@ The test suite uses Vitest plus `convex-test` for isolated Convex fixtures with
 deterministic clocks. Regression coverage includes inventory read-volume
 instrumentation, quick-inventory stock accounting invariants, order/payment
 transitions, SKU default handling, category-cycle prevention, pricing and
-promotion windows, and home-section visibility.
+promotion windows, home-section visibility, SKU child-read scaling, repeated
+store price lookups, and bounded similar-product fan-out.
 
 CI runs the same test, typecheck, lint, and build commands on pushes and pull
 requests via `.github/workflows/ci.yml`.

@@ -159,7 +159,7 @@ describe("quickInventory.listByCenter", () => {
   });
 
   it("keeps child query counts constant as page size and unrelated inventory grow", async () => {
-    const rows = makeQuickRows(240);
+    const rows = makeQuickRows(600);
     const unrelated = Array.from({ length: 500 }, (_, index) =>
       doc("inventory", {
         _id: `legacy_${index}`,
@@ -172,27 +172,96 @@ describe("quickInventory.listByCenter", () => {
         updated_at: 1,
       }),
     );
+    const pricingHistory = Array.from({ length: 1000 }, (_, index) =>
+      doc("inventoryPricing", {
+        _id: `unrelated_price_${index}`,
+        inventoryId: `unrelated_inventory_${index}`,
+        dynamicPrice: index,
+        flashSaleReservedQty: 0,
+        membershipExclusiveQty: 0,
+        isSurgeActive: false,
+      }),
+    );
+    const batchHistory = Array.from({ length: 1000 }, (_, index) =>
+      doc("batches", {
+        _id: `unrelated_batch_${index}`,
+        inventoryId: `unrelated_inventory_${index}`,
+        batchNumber: `B-${index}`,
+        quantity: 1,
+        expiryDate: index,
+        shelfLifeDaysRemaining: 10,
+        isNearExpiry: false,
+        discountPercent: 0,
+        qualityCheckStatus: "passed",
+        pickPriority: index,
+      }),
+    );
     const smallDb = new FakeConvexDb({ inventory: rows, inventoryPricing: [], batches: [] });
     const largeDb = new FakeConvexDb({
       inventory: [...rows, ...unrelated],
-      inventoryPricing: [],
-      batches: [],
+      inventoryPricing: pricingHistory,
+      batches: batchHistory,
     });
 
-    await listByCenterHandler(
-      { db: smallDb },
-      { fulfillmentCenterId: "center_a" as Id<"fulfillmentCenters">, limit: 5 },
-    );
-    await listByCenterHandler(
-      { db: largeDb },
-      { fulfillmentCenterId: "center_a" as Id<"fulfillmentCenters">, limit: 200 },
-    );
+    for (const limit of [5, 50, 500]) {
+      await listByCenterHandler(
+        { db: limit === 5 ? smallDb : largeDb },
+        { fulfillmentCenterId: "center_a" as Id<"fulfillmentCenters">, limit },
+      );
+    }
 
     expect(smallDb.stats.first["inventoryPricing.by_inventory"]).toBeUndefined();
     expect(smallDb.stats.collect["batches.by_inventory_expiry"]).toBeUndefined();
     expect(largeDb.stats.first["inventoryPricing.by_inventory"]).toBeUndefined();
     expect(largeDb.stats.collect["batches.by_inventory_expiry"]).toBeUndefined();
     expect(largeDb.stats.collect.inventory).toBeUndefined();
-    expect(largeDb.stats.collect["inventory.by_center_active"]).toBe(1);
+    expect(largeDb.stats.collect["inventory.by_center_active"]).toBe(2);
+  });
+
+  it("caps missing-summary product and center fallback to the returned page", async () => {
+    const rows = makeQuickRows(120).map((row) => ({
+      ...row,
+      productName: undefined,
+      productBrand: undefined,
+      fulfillmentCenterName: undefined,
+    }));
+    const db = new FakeConvexDb({
+      inventory: rows,
+      products: rows.slice(0, 5).map((row) =>
+        doc("products", {
+          _id: row.productId,
+          name: `Fallback ${row.sku}`,
+          brand: "Fallback",
+          primary_category_id: "cat",
+          slug: `fallback-${row.sku}`,
+          status: "active",
+          rating_average: 0,
+          rating_count: 0,
+          attributes: [],
+          created_at: 1,
+          updated_at: 1,
+        }),
+      ),
+      fulfillmentCenters: [
+        doc("fulfillmentCenters", {
+          _id: "center_a",
+          name: "Center A",
+          address: "A",
+          latitude: 0,
+          longitude: 0,
+          serviceablePincodes: [],
+          isActive: true,
+        }),
+      ],
+    });
+
+    const result = await listByCenterHandler(
+      { db },
+      { fulfillmentCenterId: "center_a" as Id<"fulfillmentCenters">, limit: 5 },
+    );
+
+    expect(result).toHaveLength(5);
+    expect(db.stats.get.products).toBe(5);
+    expect(db.stats.get.fulfillmentCenters).toBe(1);
   });
 });

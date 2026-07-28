@@ -19,6 +19,7 @@ const productStatus = v.union(
 );
 
 const dummyProductImageColors = ["F7C948", "90CDF4", "C6F6D5", "FBB6CE"];
+const SIMILAR_PRODUCT_LIMIT = 24;
 
 function dummyImagesForProduct(name: string) {
   return dummyProductImageColors.map((color, index) => {
@@ -131,9 +132,10 @@ export const list = query({
   },
 });
 
-export const get = query({
-  args: { id: v.id("products") },
-  handler: async (ctx, args) => {
+export async function getHandler(
+  ctx: { db: any; storage: { getUrl(id: Id<"_storage">): Promise<string | null> } },
+  args: { id: Id<"products"> },
+) {
     const product = (await ctx.db.get(args.id)) as ProductDoc | null;
     if (!product) throw new Error("Product not found");
     const media = (await ctx.db
@@ -152,12 +154,17 @@ export const get = query({
       .query("product_similar_products")
       .withIndex("by_product", (q) => q.eq("product_id", args.id))
       .collect();
-    const similarIds = similarPairs.map((p) => p.similar_product_id as string);
-    const similar: ProductDoc[] = [];
-    for (const sid of similarIds) {
-      const sp = (await ctx.db.get(sid as Id<"products">)) as ProductDoc | null;
-      if (sp) similar.push(sp);
-    }
+    const similarIds = Array.from(
+      new Set(similarPairs.map((p) => p.similar_product_id as string)),
+    ).slice(0, SIMILAR_PRODUCT_LIMIT);
+    const similar = (
+      await Promise.all(
+        similarIds.map(
+          async (sid) =>
+            (await ctx.db.get(sid as Id<"products">)) as ProductDoc | null,
+        ),
+      )
+    ).filter((sp): sp is ProductDoc => !!sp);
     const skus = (await ctx.db
       .query("skus")
       .withIndex("by_product", (q) => q.eq("product_id", args.id))
@@ -173,6 +180,12 @@ export const get = query({
       brand_name: (brand as { name?: string } | null)?.name,
       category_name: (category as { name?: string } | null)?.name,
     };
+}
+
+export const get = query({
+  args: { id: v.id("products") },
+  handler: async (ctx, args) => {
+    return await getHandler(ctx, args);
   },
 });
 
@@ -300,6 +313,18 @@ export const update = mutation({
       ...(categoryId ? { categoryId } : {}),
       updated_at: now(),
     });
+    if (patch.name) {
+      const inventory = await ctx.db
+        .query("inventory")
+        .withIndex("by_product_id", (q) => q.eq("productId", id))
+        .collect();
+      for (const row of inventory) {
+        await ctx.db.patch(row._id, {
+          productName: patch.name,
+          storeInventorySummaryVersion: 1,
+        });
+      }
+    }
     return id;
   },
 });

@@ -154,31 +154,44 @@ export async function lowStockAlertsHandler(
     .sort((a, b) => a.quantity_available - b.quantity_available)
     .slice(0, limit);
 
+  const rowsMissingSkuSummary = candidates.filter(
+    (row) =>
+      row.skuCode === undefined ||
+      row.variantLabel === undefined ||
+      row.productName === undefined ||
+      row.storeName === undefined,
+  );
   const skuCache = await fetchById<SkuDoc>(
     ctx,
-    candidates.map((row) => row.sku_id),
+    rowsMissingSkuSummary.map((row) => row.sku_id),
   );
   const productCache = await fetchById<ProductDoc>(
     ctx,
-    candidates
+    rowsMissingSkuSummary
       .map((row) => skuCache.get(row.sku_id)?.product_id)
       .filter((id): id is string => id !== undefined),
   );
   const storeCache = await fetchById<{ name: string }>(
     ctx,
-    candidates.map((row) => row.store_id),
+    rowsMissingSkuSummary.map((row) => row.store_id),
   );
 
   const out = [];
   for (const row of candidates) {
     const sku = skuCache.get(row.sku_id);
-    if (!sku) continue;
+    if (!sku && (row.skuCode === undefined || row.variantLabel === undefined)) {
+      continue;
+    }
     out.push({
       ...row,
-      sku_code: sku.sku_code,
-      variant_label: sku.variant_label,
-      product_name: productCache.get(sku.product_id)?.name ?? "(deleted)",
-      store_name: storeCache.get(row.store_id)?.name ?? "(deleted store)",
+      sku_code: row.skuCode ?? sku?.sku_code ?? "(deleted sku)",
+      variant_label: row.variantLabel ?? sku?.variant_label ?? "(deleted sku)",
+      product_name:
+        row.productName ??
+        (sku ? productCache.get(sku.product_id)?.name : undefined) ??
+        "(deleted)",
+      store_name:
+        row.storeName ?? storeCache.get(row.store_id)?.name ?? "(deleted store)",
     });
   }
   return out;

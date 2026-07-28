@@ -14,6 +14,10 @@ function alertRows(status: "low_stock" | "out_of_stock", count: number) {
       low_stock_threshold: 5,
       status,
       updated_at: 1,
+      skuCode: `SKU-sku_${status}_${n}`,
+      variantLabel: "Default",
+      productName: `Product sku_${status}_${n}`,
+      storeName: `Store ${index % 4}`,
     });
   });
 }
@@ -102,8 +106,8 @@ describe("dashboard.lowStockAlerts", () => {
     expect(db.stats.documentsReturned["inventory.by_status_quantity"]).toBe(16);
     expect(db.stats.collect.inventory).toBeUndefined();
     expect(db.stats.collect.order_items).toBeUndefined();
-    expect(db.stats.get.skus).toBe(8);
-    expect(db.stats.get.products).toBe(8);
-    expect(db.stats.get.stores).toBe(4);
+    expect(db.stats.get.skus).toBeUndefined();
+    expect(db.stats.get.products).toBeUndefined();
+    expect(db.stats.get.stores).toBeUndefined();
   });
 });

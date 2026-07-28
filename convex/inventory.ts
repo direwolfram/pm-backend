@@ -7,6 +7,7 @@ import type {
   InventoryStatus,
   ProductDoc,
   SkuDoc,
+  StoreDoc,
 } from "./model";
 
 const inventoryStatus = v.union(
@@ -15,6 +16,8 @@ const inventoryStatus = v.union(
   v.literal("out_of_stock"),
   v.literal("unavailable"),
 );
+
+const STORE_INVENTORY_SUMMARY_VERSION = 1;
 
 interface ListByStoreArgs {
   store_id: string;
@@ -92,16 +95,8 @@ export async function listByStoreHandler(
   }
   rows = rows.filter(isLegacyInventoryRow);
 
-  const missingSummaryRows = rows.filter(
-    (row) =>
-      row.productName === undefined ||
-      row.skuCode === undefined ||
-      row.variantLabel === undefined,
-  );
-  const { skuCache, productCache } = await loadSkuProductLookups(
-    ctx,
-    missingSummaryRows,
-  );
+  const skuCache = new Map<string, SkuDoc | null>();
+  const productCache = new Map<string, ProductDoc | null>();
 
   if (args.search) {
     const s = args.search.toLowerCase();
@@ -125,7 +120,11 @@ export async function listByStoreHandler(
   const { limit, offset } = inventoryPageArgs(args);
   const pageRows = rows.slice(offset, offset + limit);
   const pageMissing = pageRows.filter(
-    (row) => !skuCache.has(row.sku_id) || !row.productName,
+    (row) =>
+      !skuCache.has(row.sku_id) &&
+      (row.productName === undefined ||
+        row.skuCode === undefined ||
+        row.variantLabel === undefined),
   );
   const pageLookups = await loadSkuProductLookups(ctx, pageMissing);
   for (const [id, sku] of pageLookups.skuCache) skuCache.set(id, sku);
@@ -136,14 +135,15 @@ export async function listByStoreHandler(
   const data: InventoryRow[] = [];
   for (const row of pageRows) {
     const sku = skuCache.get(row.sku_id);
-    if (!sku) continue;
-    const product = productCache.get(sku.product_id);
+    const product = sku ? productCache.get(sku.product_id) : null;
+    const productId = sku?.product_id ?? row.productId;
+    if (!productId) continue;
     data.push({
       ...row,
-      sku_code: sku.sku_code,
-      variant_label: sku.variant_label,
-      product_name: product?.name ?? "(deleted product)",
-      product_id: sku.product_id,
+      sku_code: row.skuCode ?? sku?.sku_code ?? "(deleted sku)",
+      variant_label: row.variantLabel ?? sku?.variant_label ?? "(deleted sku)",
+      product_name: row.productName ?? product?.name ?? "(deleted product)",
+      product_id: productId,
     });
   }
   return { data, total: rows.length, limit, offset };
@@ -225,6 +225,7 @@ export const upsert = mutation({
     const product = sku
       ? ((await ctx.db.get(sku.product_id as any)) as ProductDoc | null)
       : null;
+    const store = (await ctx.db.get(args.store_id)) as StoreDoc | null;
     if (existing) {
       await ctx.db.patch(existing._id as any, {
         quantity_available: args.quantity_available,
@@ -235,6 +236,9 @@ export const upsert = mutation({
         skuCode: sku?.sku_code,
         variantLabel: sku?.variant_label,
         productName: product?.name,
+        productId: sku?.product_id,
+        storeName: store?.name,
+        storeInventorySummaryVersion: STORE_INVENTORY_SUMMARY_VERSION,
       });
       return existing._id;
     }
@@ -250,7 +254,64 @@ export const upsert = mutation({
       skuCode: sku?.sku_code,
       variantLabel: sku?.variant_label,
       productName: product?.name,
+      productId: sku?.product_id,
+      storeName: store?.name,
+      storeInventorySummaryVersion: STORE_INVENTORY_SUMMARY_VERSION,
     });
+  },
+});
+
+export const backfillStoreInventorySummaries = mutation({
+  args: { limit: v.optional(v.number()), cursor: v.optional(v.string()) },
+  handler: async (ctx, args) => {
+    const limit = Math.min(Math.max(args.limit ?? 50, 1), 200);
+    const candidateLimit = args.cursor ? Math.min(limit * 2, 400) : limit;
+    const candidates = ((await ctx.db
+      .query("inventory")
+      .withIndex("by_store_inventory_summary_version", (q: any) =>
+        q.eq("storeInventorySummaryVersion", undefined),
+      )
+      .take(candidateLimit)) as InventoryDoc[])
+      .filter(isLegacyInventoryRow);
+    const cursorIndex = args.cursor
+      ? candidates.findIndex((row) => row._id === args.cursor)
+      : -1;
+    const rows = candidates
+      .slice(cursorIndex >= 0 ? cursorIndex + 1 : 0)
+      .slice(0, limit);
+    let patched = 0;
+    for (const row of rows) {
+      const sku = (await ctx.db.get(row.sku_id as any)) as SkuDoc | null;
+      const product = sku
+        ? ((await ctx.db.get(sku.product_id as any)) as ProductDoc | null)
+        : null;
+      const store = (await ctx.db.get(row.store_id as any)) as StoreDoc | null;
+      const patch = {
+        skuCode: sku?.sku_code,
+        variantLabel: sku?.variant_label,
+        productName: product?.name,
+        productId: sku?.product_id,
+        storeName: store?.name,
+        storeInventorySummaryVersion: STORE_INVENTORY_SUMMARY_VERSION,
+      };
+      if (
+        row.skuCode !== patch.skuCode ||
+        row.variantLabel !== patch.variantLabel ||
+        row.productName !== patch.productName ||
+        row.productId !== patch.productId ||
+        row.storeName !== patch.storeName ||
+        row.storeInventorySummaryVersion !== patch.storeInventorySummaryVersion
+      ) {
+        await ctx.db.patch(row._id as any, patch);
+        patched += 1;
+      }
+    }
+    return {
+      processed: rows.length,
+      patched,
+      nextCursor: rows.at(-1)?._id,
+      remainingMayExist: candidates.length >= candidateLimit,
+    };
   },
 });
 

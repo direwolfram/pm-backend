@@ -245,16 +245,21 @@ export default defineSchema({
 
   prices: defineTable({
     sku_id: v.id("skus"),
+    product_id: v.optional(v.id("products")),
     store_id: v.optional(v.id("stores")),
+    storeName: v.optional(v.string()),
     currency: v.string(),
     sale_price: v.number(),
     compare_at_price: v.optional(v.number()),
     starts_at: v.number(),
     ends_at: v.optional(v.number()),
+    priceSummaryVersion: v.optional(v.number()),
   })
     .index("by_sku", ["sku_id"])
+    .index("by_product", ["product_id"])
     .index("by_sku_store", ["sku_id", "store_id"])
-    .index("by_store", ["store_id"]),
+    .index("by_store", ["store_id"])
+    .index("by_price_summary_version", ["priceSummaryVersion"]),
 
   inventory: defineTable({
     sku_id: v.optional(v.id("skus")),
@@ -272,6 +277,8 @@ export default defineSchema({
     updated_at: v.optional(v.number()),
     skuCode: v.optional(v.string()),
     variantLabel: v.optional(v.string()),
+    storeName: v.optional(v.string()),
+    storeInventorySummaryVersion: v.optional(v.number()),
 
     sku: v.optional(v.string()),
     productId: v.optional(v.id("products")),
@@ -314,8 +321,10 @@ export default defineSchema({
     .index("by_sku_store", ["sku_id", "store_id"])
     .index("by_store", ["store_id"])
     .index("by_store_status", ["store_id", "status"])
+    .index("by_store_inventory_summary_version", ["storeInventorySummaryVersion"])
     .index("by_status_quantity", ["status", "quantity_available"])
     .index("by_sku", ["sku_id"])
+    .index("by_product_id", ["productId"])
     .index("by_sku_center", ["sku", "fulfillmentCenterId"])
     .index("by_center_active", ["fulfillmentCenterId", "isActive"])
     .index("by_quick_inventory", ["isQuickInventory"])

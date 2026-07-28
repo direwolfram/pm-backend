@@ -12,6 +12,7 @@ function legacyInventoryRows(storeId: string, count: number) {
     return doc("inventory", {
       _id: `inv_${storeId}_${n}`,
       sku_id: `sku_${storeId}_${n}`,
+      productId: `product_sku_${storeId}_${n}`,
       store_id: storeId,
       quantity_available: index % 4 === 0 ? 0 : 12,
       quantity_reserved: index % 3,
@@ -91,6 +92,34 @@ describe("inventory store queries", () => {
     ]);
     expect(db.stats.collect["inventory.by_store"]).toBe(1);
     expect(db.stats.collect.inventory).toBeUndefined();
+    expect(db.stats.get.skus).toBeUndefined();
+    expect(db.stats.get.products).toBeUndefined();
+  });
+
+  it("caps missing-summary fallback to the returned page", async () => {
+    const targetRows = legacyInventoryRows("store_a", 80).map((row, index) =>
+      index < 10
+        ? {
+            ...row,
+            skuCode: undefined,
+            variantLabel: undefined,
+            productName: undefined,
+          }
+        : row,
+    );
+    const refs = skusAndProducts(targetRows);
+    const db = new FakeConvexDb({
+      inventory: targetRows,
+      skus: refs.skus,
+      products: refs.products,
+    });
+
+    const result = await listByStoreHandler(
+      { db },
+      { store_id: "store_a" as Id<"stores">, limit: 3 },
+    );
+
+    expect(result.data).toHaveLength(3);
     expect(db.stats.get.skus).toBe(3);
     expect(db.stats.get.products).toBe(3);
   });
