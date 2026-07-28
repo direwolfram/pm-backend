@@ -17,8 +17,13 @@ jobs:
           node-version: 22
           cache: npm
 
+      - name: Update npm
+        # npm 10.x bundled with Node 22 intermittently crashes `npm ci` with
+        # "Exit handler never called!"; latest npm carries the fix.
+        run: npm install -g npm@latest
+
       - name: Install
-        run: npm ci
+        run: npm ci --no-audit --no-fund
 
       - name: Test
         run: npm test
