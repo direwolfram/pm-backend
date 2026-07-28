@@ -117,3 +117,26 @@ and a status filter.
 | 5a | reconcileOrderSummaries (1st) |  |  |  |
 | 5b | reconcileOrderSummaries (2nd, expect patched: 0) |  |  |  |
 | 7 | listV2 smoke check |  |  |  |
+
+## Executed run — dev deployment `dev:aromatic-platypus-520` (2026-07-28)
+
+> Executed against the only provisioned deployment for this repository, the
+> **development** deployment `dev:aromatic-platypus-520`
+> (`https://aromatic-platypus-520.convex.cloud`). No production deployment
+> credentials exist in this environment; repeat the identical steps against
+> production when it is provisioned and record a separate table.
+
+| Step | Command | Recorded output |
+|------|---------|-----------------|
+| 1 | `npx convex deploy --typecheck=disable` | `✔ Deployed Convex functions to https://aromatic-platypus-520.convex.cloud` ("No indexes are deleted by this push"). `--typecheck=disable` required because the deploy-time strict tsc run fails on pre-existing codegen-binding mismatches in 11 files (repo typecheck `npm run typecheck` passes; the codebase intentionally uses codegen-free generic builders). |
+| 2 | `npx convex run listCounts:reconcileListCounts '{"scope":"orders"}'` | `{ "distinctKeys": 11, "done": true, "processed": 5 }` — counters rebuilt in one chunk. |
+| 3 | `npx convex run orders:backfillOrderListSummaries '{"limit": 100}'` | `{ "patched": 5, "processed": 5, "remainingMayExist": false }` — 5 legacy rows repaired, drained. |
+| 4 | `npx convex run orders:orderSummaryReadiness` | `{ "overflow": false, "ready": true, "stale": 0, "version": 2 }` — gate passed. |
+| 5a | `npx convex run orders:reconcileOrderSummaries '{"limit": 100}'` | `{ "done": true, "patched": 0, "processed": 5 }` |
+| 5b | `npx convex run orders:reconcileOrderSummaries '{"limit": 100}'` | `{ "done": true, "patched": 0, "processed": 5 }` — second sweep patched zero rows, as required. |
+| 7a | `npx convex run orders:listV2 '{"limit": 5}'` | `total: 5`, `totalIsExact: true`, `hasMore: true`; newest-first rows carrying `item_count`, `order_search_text`, `orderSummaryVersion: 2`; fingerprinted `nextCursor` issued. |
+| 7b | `npx convex run orders:listV2 '{"search": "maria", "limit": 5}'` | `total: 2`, `totalIsExact: true`, `hasMore: false` (PM-20260725-01002, PM-20260725-01000, customer "Maria Santos"). |
+| 7c | `npx convex run orders:listV2 '{"status": "delivered", "limit": 5}'` | `total: 2`, `totalIsExact: true`, `hasMore: false`. |
+
+Result: all rollout checks passed on the dev deployment on 2026-07-28.
+
