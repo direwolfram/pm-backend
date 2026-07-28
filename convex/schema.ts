@@ -292,6 +292,7 @@ export default defineSchema({
     .index("by_sku_store", ["sku_id", "store_id"])
     .index("by_store", ["store_id"])
     .index("by_store_status", ["store_id", "status"])
+    .index("by_status_quantity", ["status", "quantity_available"])
     .index("by_sku", ["sku_id"])
     .index("by_sku_center", ["sku", "fulfillmentCenterId"])
     .index("by_center_active", ["fulfillmentCenterId", "isActive"])
