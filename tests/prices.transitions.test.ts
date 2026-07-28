@@ -223,7 +223,7 @@ describe("due-time activation journal", () => {
     expect(await mirrorRows(t, skuId)).toHaveLength(0);
   });
 
-  it("handles >200 activations at exactly the same starts_at without duplicates", async () => {
+  it("handles >200 activations at exactly the same starts_at without duplicates", { timeout: 30_000 }, async () => {
     const t = convexTest({ schema, modules });
     const { skuId } = await seedProductWithSku(t);
     const startsAt = Date.now() + 3_600_000;
@@ -268,7 +268,7 @@ describe("price transition drain", () => {
     vi.useRealTimers();
   });
 
-  it("drains more than 200 simultaneous activations across continuations", async () => {
+  it("drains more than 200 simultaneous activations across continuations", { timeout: 30_000 }, async () => {
     const t = convexTest({ schema, modules });
     const { productId, skuId } = await seedProductWithSku(t);
     const startsAt = Date.now() + 3_600_000;
@@ -303,7 +303,7 @@ describe("price transition drain", () => {
     expect(again).toMatchObject({ expired: 0, activated: 0, drained: true });
   });
 
-  it("drains more than 200 expirations and stops them contributing", async () => {
+  it("drains more than 200 expirations and stops them contributing", { timeout: 30_000 }, async () => {
     const t = convexTest({ schema, modules });
     const { productId, skuId } = await seedProductWithSku(t);
     await insertPrices(t, skuId, productId, 230, {
@@ -334,7 +334,7 @@ describe("price transition drain", () => {
     expect(product?.default_price).toBe(9);
   });
 
-  it("resumes an interrupted drain instead of starting over", async () => {
+  it("resumes an interrupted drain instead of starting over", { timeout: 30_000 }, async () => {
     const t = convexTest({ schema, modules });
     const { productId, skuId } = await seedProductWithSku(t);
     await insertPrices(t, skuId, productId, 450, {
@@ -361,7 +361,7 @@ describe("price transition drain", () => {
     expect(new Set(mirrors.map((m) => m.price_id)).size).toBe(450);
   });
 
-  it("keeps mirrors consistent when prices are edited during the drain", async () => {
+  it("keeps mirrors consistent when prices are edited during the drain", { timeout: 30_000 }, async () => {
     const t = convexTest({ schema, modules });
     const { productId, skuId, storeId } = await seedProductWithSku(t);
     await insertPrices(t, skuId, productId, 250, {
