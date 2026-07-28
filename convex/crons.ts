@@ -20,10 +20,4 @@ crons.daily(
   anyApi.quickInventory.flagNearExpiry,
 );
 
-crons.interval(
-  "Refresh replenishment alerts",
-  { minutes: 15 },
-  anyApi.quickInventory.replenishmentAlert,
-);
-
 export default crons;

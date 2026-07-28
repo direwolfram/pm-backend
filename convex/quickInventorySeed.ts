@@ -103,6 +103,7 @@ export const run = mutation({
     ];
 
     const centerIds: ConvexId<"fulfillmentCenters">[] = [];
+    const centerNames = new Map<ConvexId<"fulfillmentCenters">, string>();
     for (const center of centers) {
       const centerId = await ctx.db.insert("fulfillmentCenters", {
         ...center,
@@ -135,6 +136,7 @@ export const run = mutation({
       }
       await ctx.db.patch(centerId, { zoneIds });
       centerIds.push(centerId);
+      centerNames.set(centerId, center.name);
     }
 
     const products: SeedProduct[] = Array.from({ length: 20 }).map((_, index) => {
@@ -237,6 +239,19 @@ export const run = mutation({
           lastUpdatedAt: t,
           isActive: true,
           isLowStock: isLowStock(sellable, replenishmentThreshold),
+          isQuickInventory: true,
+          quickStatus:
+            sellable <= 0
+              ? "out_of_stock"
+              : isLowStock(sellable, replenishmentThreshold)
+                ? "low_stock"
+                : "in_stock",
+          productName: product.name,
+          productBrand: product.brand,
+          fulfillmentCenterName: centerNames.get(centerId),
+          batchCount: 0,
+          nearExpiryBatchCount: 0,
+          quickInventorySummaryVersion: 1,
         });
         inventoryIds.push(inventoryId);
         inventoryCount += 1;
@@ -258,6 +273,11 @@ export const run = mutation({
         discountPercent: daysRemaining <= 2 ? 10 : 0,
         qualityCheckStatus: "passed",
         pickPriority: pickPriorityScore(expiryDate),
+      });
+      await ctx.db.patch(inventoryId, {
+        batchCount: 1,
+        nearExpiryBatchCount: daysRemaining <= 2 ? 1 : 0,
+        earliestExpiryDate: expiryDate,
       });
     }
 

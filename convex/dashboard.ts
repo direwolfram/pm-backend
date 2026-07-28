@@ -4,13 +4,46 @@ import type {
   CustomerDoc,
   InventoryDoc,
   OrderDoc,
-  OrderItemDoc,
   ProductDoc,
   PromotionDoc,
   SkuDoc,
   SupportTicketDoc,
 } from "./model";
 import type { DashboardStats } from "./model";
+
+interface IndexRangeBuilder {
+  eq(fieldName: string, value: unknown): IndexRangeBuilder;
+}
+
+interface QueryBuilder<T> {
+  withIndex(
+    indexName: string,
+    indexRange?: (q: IndexRangeBuilder) => IndexRangeBuilder,
+  ): QueryBuilder<T>;
+  take(n: number): Promise<T[]>;
+}
+
+interface DbReader {
+  get(id: string): Promise<unknown | null>;
+  query<T = unknown>(tableName: string): QueryBuilder<T>;
+}
+
+function alertLimit(limit?: number) {
+  return Math.min(Math.max(limit ?? 12, 1), 100);
+}
+
+async function fetchById<T>(
+  ctx: { db: DbReader },
+  ids: string[],
+): Promise<Map<string, T | null>> {
+  const out = new Map<string, T | null>();
+  await Promise.all(
+    Array.from(new Set(ids)).map(async (id) => {
+      out.set(id, (await ctx.db.get(id)) as T | null);
+    }),
+  );
+  return out;
+}
 
 export const stats = query({
   args: {},
@@ -97,48 +130,75 @@ export const recentOrders = query({
   },
 });
 
+export async function lowStockAlertsHandler(
+  ctx: { db: DbReader },
+  args: { limit?: number },
+) {
+  const limit = alertLimit(args.limit);
+  const [lowStock, outOfStock] = await Promise.all([
+    ctx.db
+      .query<InventoryDoc>("inventory")
+      .withIndex("by_status_quantity", (q) =>
+        q.eq("status", "low_stock"),
+      )
+      .take(limit),
+    ctx.db
+      .query<InventoryDoc>("inventory")
+      .withIndex("by_status_quantity", (q) =>
+        q.eq("status", "out_of_stock"),
+      )
+      .take(limit),
+  ]);
+  const candidates = ([...lowStock, ...outOfStock] as InventoryDoc[])
+    .filter((i) => i.sku_id !== undefined && i.store_id !== undefined)
+    .sort((a, b) => a.quantity_available - b.quantity_available)
+    .slice(0, limit);
+
+  const rowsMissingSkuSummary = candidates.filter(
+    (row) =>
+      row.skuCode === undefined ||
+      row.variantLabel === undefined ||
+      row.productName === undefined ||
+      row.storeName === undefined,
+  );
+  const skuCache = await fetchById<SkuDoc>(
+    ctx,
+    rowsMissingSkuSummary.map((row) => row.sku_id),
+  );
+  const productCache = await fetchById<ProductDoc>(
+    ctx,
+    rowsMissingSkuSummary
+      .map((row) => skuCache.get(row.sku_id)?.product_id)
+      .filter((id): id is string => id !== undefined),
+  );
+  const storeCache = await fetchById<{ name: string }>(
+    ctx,
+    rowsMissingSkuSummary.map((row) => row.store_id),
+  );
+
+  const out = [];
+  for (const row of candidates) {
+    const sku = skuCache.get(row.sku_id);
+    if (!sku && (row.skuCode === undefined || row.variantLabel === undefined)) {
+      continue;
+    }
+    out.push({
+      ...row,
+      sku_code: row.skuCode ?? sku?.sku_code ?? "(deleted sku)",
+      variant_label: row.variantLabel ?? sku?.variant_label ?? "(deleted sku)",
+      product_name:
+        row.productName ??
+        (sku ? productCache.get(sku.product_id)?.name : undefined) ??
+        "(deleted)",
+      store_name:
+        row.storeName ?? storeCache.get(row.store_id)?.name ?? "(deleted store)",
+    });
+  }
+  return out;
+}
+
 export const lowStockAlerts = query({
   args: { limit: v.optional(v.number()) },
-  handler: async (ctx, args) => {
-    const inventory = (await ctx.db.query("inventory").collect()) as InventoryDoc[];
-    const low = inventory.filter(
-      (i) =>
-        i.sku_id !== undefined &&
-        i.store_id !== undefined &&
-        (i.status === "low_stock" || i.status === "out_of_stock"),
-    );
-    const skuCache = new Map<string, SkuDoc | null>();
-    const productCache = new Map<string, ProductDoc | null>();
-    const storeCache = new Map(
-      (await ctx.db.query("stores").collect()).map((s) => [
-        s._id as string,
-        s.name as string,
-      ]),
-    );
-    const items = (await ctx.db.query("order_items").collect()) as OrderItemDoc[];
-    const out = [];
-    for (const row of low) {
-      if (!skuCache.has(row.sku_id)) {
-        skuCache.set(row.sku_id, (await ctx.db.get(row.sku_id as any)) as SkuDoc | null);
-      }
-      const sku = skuCache.get(row.sku_id);
-      if (!sku) continue;
-      if (!productCache.has(sku.product_id)) {
-        productCache.set(
-          sku.product_id,
-          (await ctx.db.get(sku.product_id as any)) as ProductDoc | null,
-        );
-      }
-      out.push({
-        ...row,
-        sku_code: sku.sku_code,
-        variant_label: sku.variant_label,
-        product_name: productCache.get(sku.product_id)?.name ?? "(deleted)",
-        store_name: storeCache.get(row.store_id) ?? "(deleted store)",
-      });
-    }
-    out.sort((a, b) => a.quantity_available - b.quantity_available);
-    void items;
-    return out.slice(0, args.limit ?? 12);
-  },
+  handler: async (ctx, args) =>
+    lowStockAlertsHandler(ctx as { db: DbReader }, args),
 });

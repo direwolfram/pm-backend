@@ -245,16 +245,21 @@ export default defineSchema({
 
   prices: defineTable({
     sku_id: v.id("skus"),
+    product_id: v.optional(v.id("products")),
     store_id: v.optional(v.id("stores")),
+    storeName: v.optional(v.string()),
     currency: v.string(),
     sale_price: v.number(),
     compare_at_price: v.optional(v.number()),
     starts_at: v.number(),
     ends_at: v.optional(v.number()),
+    priceSummaryVersion: v.optional(v.number()),
   })
     .index("by_sku", ["sku_id"])
+    .index("by_product", ["product_id"])
     .index("by_sku_store", ["sku_id", "store_id"])
-    .index("by_store", ["store_id"]),
+    .index("by_store", ["store_id"])
+    .index("by_price_summary_version", ["priceSummaryVersion"]),
 
   inventory: defineTable({
     sku_id: v.optional(v.id("skus")),
@@ -270,6 +275,10 @@ export default defineSchema({
     )),
     restock_at: v.optional(v.number()),
     updated_at: v.optional(v.number()),
+    skuCode: v.optional(v.string()),
+    variantLabel: v.optional(v.string()),
+    storeName: v.optional(v.string()),
+    storeInventorySummaryVersion: v.optional(v.number()),
 
     sku: v.optional(v.string()),
     productId: v.optional(v.id("products")),
@@ -283,13 +292,46 @@ export default defineSchema({
     lastUpdatedAt: v.optional(v.number()),
     isActive: v.optional(v.boolean()),
     isLowStock: v.optional(v.boolean()),
+    isQuickInventory: v.optional(v.boolean()),
+    quickStatus: v.optional(v.union(
+      v.literal("in_stock"),
+      v.literal("low_stock"),
+      v.literal("out_of_stock"),
+      v.literal("unavailable"),
+    )),
+    productName: v.optional(v.string()),
+    productBrand: v.optional(v.string()),
+    fulfillmentCenterName: v.optional(v.string()),
+    pricingSummary: v.optional(v.object({
+      _id: v.id("inventoryPricing"),
+      _creationTime: v.optional(v.number()),
+      inventoryId: v.id("inventory"),
+      dynamicPrice: v.number(),
+      flashSaleReservedQty: v.number(),
+      membershipExclusiveQty: v.number(),
+      discountStartAt: v.optional(v.number()),
+      discountEndAt: v.optional(v.number()),
+      isSurgeActive: v.boolean(),
+    })),
+    batchCount: v.optional(v.number()),
+    nearExpiryBatchCount: v.optional(v.number()),
+    earliestExpiryDate: v.optional(v.number()),
+    quickInventorySummaryVersion: v.optional(v.number()),
   })
     .index("by_sku_store", ["sku_id", "store_id"])
+    .index("by_store", ["store_id"])
     .index("by_store_status", ["store_id", "status"])
+    .index("by_store_inventory_summary_version", ["storeInventorySummaryVersion"])
+    .index("by_status_quantity", ["status", "quantity_available"])
     .index("by_sku", ["sku_id"])
+    .index("by_product_id", ["productId"])
     .index("by_sku_center", ["sku", "fulfillmentCenterId"])
     .index("by_center_active", ["fulfillmentCenterId", "isActive"])
+    .index("by_quick_inventory", ["isQuickInventory"])
+    .index("by_quick_status", ["quickStatus"])
+    .index("by_center_quick_status", ["fulfillmentCenterId", "quickStatus"])
     .index("by_low_stock", ["fulfillmentCenterId", "isLowStock"])
+    .index("by_summary_version", ["quickInventorySummaryVersion"])
     .index("by_last_updated", ["lastUpdatedAt"]),
 
   fulfillmentCenters: defineTable({
@@ -508,6 +550,13 @@ export default defineSchema({
   })
     .index("by_key", ["key"])
     .index("by_tab", ["tab", "sortOrder"]),
+
+  home_tab_layouts: defineTable({
+    tab: v.string(),
+    overrideEnabled: v.boolean(),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  }).index("by_tab", ["tab"]),
 
   home_section_items: defineTable({
     section_id: v.id("home_sections"),

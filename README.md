@@ -1,5 +1,33 @@
 # React + TypeScript + Vite
 
+## Verification
+
+Local checks:
+
+```bash
+npm test
+npm run typecheck
+npm run lint
+npm run build
+```
+
+The test suite uses Vitest plus `convex-test` for isolated Convex fixtures with
+deterministic clocks. Regression coverage includes inventory read-volume
+instrumentation, quick-inventory stock accounting invariants, order/payment
+transitions, SKU default handling, category-cycle prevention, pricing and
+promotion windows, home-section visibility, SKU child-read scaling, repeated
+store price lookups, and bounded similar-product fan-out.
+
+CI runs the same test, typecheck, lint, and build commands on pushes and pull
+requests via `.github/workflows/ci.yml`.
+
+## Authorization Model
+
+Current Convex admin functions are callable by the configured client without
+per-function identity checks. The regression tests document that current
+boundary so a future auth layer can intentionally change it with explicit test
+updates.
+
 This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
 
 Currently, two official plugins are available:

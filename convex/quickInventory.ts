@@ -15,6 +15,9 @@ type CenterId = ConvexId<"fulfillmentCenters">;
 type BatchId = ConvexId<"batches">;
 type ReservationId = ConvexId<"cartReservations">;
 type UserId = ConvexId<"users">;
+type QuickStatus = "in_stock" | "low_stock" | "out_of_stock" | "unavailable";
+
+const QUICK_INVENTORY_SUMMARY_VERSION = 1;
 
 interface QuickInventoryDoc {
   _id: InventoryId;
@@ -30,6 +33,16 @@ interface QuickInventoryDoc {
   lastUpdatedAt?: number;
   isActive?: boolean;
   isLowStock?: boolean;
+  isQuickInventory?: boolean;
+  quickStatus?: QuickStatus;
+  productName?: string;
+  productBrand?: string;
+  fulfillmentCenterName?: string;
+  pricingSummary?: InventoryPricingDoc;
+  batchCount?: number;
+  nearExpiryBatchCount?: number;
+  earliestExpiryDate?: number;
+  quickInventorySummaryVersion?: number;
 }
 
 interface ProductDoc {
@@ -104,6 +117,7 @@ interface CartReservationDoc {
 
 interface InventoryPricingDoc {
   _id: ConvexId<"inventoryPricing">;
+  _creationTime?: number;
   inventoryId: InventoryId;
   dynamicPrice: number;
   flashSaleReservedQty: number;
@@ -111,6 +125,32 @@ interface InventoryPricingDoc {
   discountStartAt?: number;
   discountEndAt?: number;
   isSurgeActive: boolean;
+}
+
+interface ListByCenterArgs {
+  fulfillmentCenterId?: CenterId;
+  status?: QuickStatus;
+  search?: string;
+  limit?: number;
+}
+
+interface IndexRangeBuilder {
+  eq(fieldName: string, value: unknown): IndexRangeBuilder;
+}
+
+interface QueryBuilder<T> {
+  withIndex(
+    indexName: string,
+    indexRange?: (q: IndexRangeBuilder) => IndexRangeBuilder,
+  ): QueryBuilder<T>;
+  collect(): Promise<T[]>;
+  first(): Promise<T | null>;
+  take(n: number): Promise<T[]>;
+}
+
+interface DbReader {
+  get(id: string): Promise<unknown | null>;
+  query<T = unknown>(tableName: string): QueryBuilder<T>;
 }
 
 const qualityCheckStatus = v.union(
@@ -158,7 +198,7 @@ function withComputed(row: QuickInventoryDoc) {
   };
 }
 
-function stockStatus(row: QuickInventoryDoc): "in_stock" | "low_stock" | "out_of_stock" | "unavailable" {
+function stockStatus(row: QuickInventoryDoc): QuickStatus {
   if (row.isActive === false) return "unavailable";
   const computed = withComputed(row);
   if (computed.isOutOfStock) return "out_of_stock";
@@ -170,14 +210,271 @@ function quickInventoryPatch(
   availableQuantity: number,
   reservedQuantity: number,
   replenishmentThreshold: number,
+  isActive?: boolean,
 ) {
   const sellable = computeSellable(availableQuantity, reservedQuantity);
+  const low = isLowStock(sellable, replenishmentThreshold);
+  const quickStatus: QuickStatus =
+    isActive === false
+      ? "unavailable"
+      : sellable <= 0
+        ? "out_of_stock"
+        : low
+          ? "low_stock"
+          : "in_stock";
   return {
     availableQuantity,
     reservedQuantity,
-    isLowStock: isLowStock(sellable, replenishmentThreshold),
+    isLowStock: low,
+    quickStatus,
+    isQuickInventory: true,
     lastUpdatedAt: now(),
   };
+}
+
+function quickInventoryLimit(limit?: number): number {
+  return Math.min(Math.max(limit ?? 300, 1), 500);
+}
+
+function isQuickInventoryRow(row: QuickInventoryDoc): boolean {
+  return !!(row.sku && row.productId && row.fulfillmentCenterId);
+}
+
+function rowSearchText(
+  row: QuickInventoryDoc,
+  product?: ProductDoc | null,
+  center?: FulfillmentCenterDoc | null,
+): string {
+  return `${row.sku ?? ""} ${row.productName ?? product?.name ?? ""} ${row.productBrand ?? product?.brand ?? ""} ${row.fulfillmentCenterName ?? center?.name ?? ""}`.toLowerCase();
+}
+
+function rowSortName(row: QuickInventoryDoc, product?: ProductDoc | null): string {
+  return row.productName ?? product?.name ?? row.sku ?? "";
+}
+
+function productForRow(row: QuickInventoryDoc, product?: ProductDoc | null) {
+  if (product) return product;
+  if (row.productName === undefined) return null;
+  return {
+    _id: row.productId!,
+    sku: row.sku,
+    name: row.productName,
+    brand: row.productBrand,
+  };
+}
+
+function centerForRow(
+  row: QuickInventoryDoc,
+  center?: FulfillmentCenterDoc | null,
+) {
+  if (center) return center;
+  if (row.fulfillmentCenterName === undefined) return null;
+  return {
+    _id: row.fulfillmentCenterId!,
+    name: row.fulfillmentCenterName,
+  };
+}
+
+async function fetchProductsById(
+  ctx: { db: DbReader },
+  productIds: ProductId[],
+): Promise<Map<ProductId, ProductDoc | null>> {
+  const products = new Map<ProductId, ProductDoc | null>();
+  await Promise.all(
+    Array.from(new Set(productIds)).map(async (productId) => {
+      products.set(productId, (await ctx.db.get(productId)) as ProductDoc | null);
+    }),
+  );
+  return products;
+}
+
+async function fetchCentersById(
+  ctx: { db: DbReader },
+  centerIds: CenterId[],
+): Promise<Map<CenterId, FulfillmentCenterDoc | null>> {
+  const centers = new Map<CenterId, FulfillmentCenterDoc | null>();
+  await Promise.all(
+    Array.from(new Set(centerIds)).map(async (centerId) => {
+      centers.set(
+        centerId,
+        (await ctx.db.get(centerId)) as FulfillmentCenterDoc | null,
+      );
+    }),
+  );
+  return centers;
+}
+
+function batchSummaryFromBatches(batches: BatchDoc[]) {
+  const sorted = [...batches].sort((a, b) => a.expiryDate - b.expiryDate);
+  return {
+    batchCount: sorted.length,
+    nearExpiryBatchCount: sorted.filter((batch) => batch.isNearExpiry).length,
+    earliestExpiryDate: sorted[0]?.expiryDate,
+  };
+}
+
+function pricingSummaryFromDoc(pricing: InventoryPricingDoc | null) {
+  if (!pricing) return undefined;
+  return {
+    _id: pricing._id,
+    _creationTime: pricing._creationTime,
+    inventoryId: pricing.inventoryId,
+    dynamicPrice: pricing.dynamicPrice,
+    flashSaleReservedQty: pricing.flashSaleReservedQty,
+    membershipExclusiveQty: pricing.membershipExclusiveQty,
+    discountStartAt: pricing.discountStartAt,
+    discountEndAt: pricing.discountEndAt,
+    isSurgeActive: pricing.isSurgeActive,
+  };
+}
+
+async function computeBatchSummary(ctx: { db: DbReader }, inventoryId: InventoryId) {
+  const batches = (await ctx.db
+    .query<BatchDoc>("batches")
+    .withIndex("by_inventory_expiry", (q) => q.eq("inventoryId", inventoryId))
+    .collect()) as BatchDoc[];
+  return batchSummaryFromBatches(batches);
+}
+
+async function computePricingSummary(
+  ctx: { db: DbReader },
+  inventoryId: InventoryId,
+) {
+  const pricing = (await ctx.db
+    .query<InventoryPricingDoc>("inventoryPricing")
+    .withIndex("by_inventory", (q) => q.eq("inventoryId", inventoryId))
+    .first()) as InventoryPricingDoc | null;
+  return pricingSummaryFromDoc(pricing);
+}
+
+async function patchInventorySummaries(
+  ctx: { db: DbReader & { patch(id: string, patch: Record<string, unknown>): Promise<void> } },
+  row: QuickInventoryDoc,
+) {
+  if (!isQuickInventoryRow(row)) {
+    await ctx.db.patch(row._id, {
+      quickInventorySummaryVersion: QUICK_INVENTORY_SUMMARY_VERSION,
+    });
+    return;
+  }
+  const [product, center, pricingSummary, batchSummary] = await Promise.all([
+    ctx.db.get(row.productId!) as Promise<ProductDoc | null>,
+    ctx.db.get(row.fulfillmentCenterId!) as Promise<FulfillmentCenterDoc | null>,
+    computePricingSummary(ctx, row._id),
+    computeBatchSummary(ctx, row._id),
+  ]);
+  await ctx.db.patch(row._id, {
+    isQuickInventory: true,
+    quickStatus: stockStatus(row),
+    productName: product?.name ?? row.productName,
+    productBrand: product?.brand ?? row.productBrand,
+    fulfillmentCenterName: center?.name ?? row.fulfillmentCenterName,
+    pricingSummary: pricingSummary ?? undefined,
+    ...batchSummary,
+    quickInventorySummaryVersion: QUICK_INVENTORY_SUMMARY_VERSION,
+  });
+}
+
+export async function listByCenterHandler(
+  ctx: { db: DbReader },
+  args: ListByCenterArgs,
+) {
+  const limit = quickInventoryLimit(args.limit);
+  const rawRows = args.fulfillmentCenterId
+    ? args.status
+      ? ((await ctx.db
+          .query<QuickInventoryDoc>("inventory")
+          .withIndex("by_center_quick_status", (q) =>
+            q
+              .eq("fulfillmentCenterId", args.fulfillmentCenterId!)
+              .eq("quickStatus", args.status!),
+          )
+          .collect()) as QuickInventoryDoc[])
+      : ((await ctx.db
+          .query<QuickInventoryDoc>("inventory")
+          .withIndex("by_center_active", (q) =>
+            q.eq("fulfillmentCenterId", args.fulfillmentCenterId!),
+          )
+          .collect()) as QuickInventoryDoc[])
+    : args.status
+      ? ((await ctx.db
+          .query<QuickInventoryDoc>("inventory")
+          .withIndex("by_quick_status", (q) =>
+            q.eq("quickStatus", args.status!),
+          )
+          .collect()) as QuickInventoryDoc[])
+      : ((await ctx.db
+          .query<QuickInventoryDoc>("inventory")
+          .withIndex("by_quick_inventory", (q) =>
+            q.eq("isQuickInventory", true),
+          )
+          .collect()) as QuickInventoryDoc[]);
+  let rows = rawRows.filter(isQuickInventoryRow);
+  if (args.status) {
+    rows = rows.filter((row) => (row.quickStatus ?? stockStatus(row)) === args.status);
+  }
+
+  const productLookup = new Map<ProductId, ProductDoc | null>();
+  const centerLookup = new Map<CenterId, FulfillmentCenterDoc | null>();
+
+  if (args.search) {
+    const search = args.search.toLowerCase();
+    rows = rows.filter((row) =>
+      rowSearchText(
+        row,
+        productLookup.get(row.productId!),
+        centerLookup.get(row.fulfillmentCenterId!),
+      ).includes(search),
+    );
+  }
+
+  rows.sort((a, b) => {
+    const aStatus = stockStatus(a);
+    const bStatus = stockStatus(b);
+    if (aStatus !== bStatus) return aStatus.localeCompare(bStatus);
+    return rowSortName(a, productLookup.get(a.productId!)).localeCompare(
+      rowSortName(b, productLookup.get(b.productId!)),
+    );
+  });
+
+  const pageRows = rows.slice(0, limit);
+  const missingPageProducts = pageRows.filter(
+    (row) => row.productName === undefined && !productLookup.has(row.productId!),
+  );
+  const missingPageCenters = pageRows.filter(
+    (row) =>
+      row.fulfillmentCenterName === undefined &&
+      !centerLookup.has(row.fulfillmentCenterId!),
+  );
+  const [pageProducts, pageCenters] = await Promise.all([
+    fetchProductsById(
+      ctx,
+      missingPageProducts.map((row) => row.productId!),
+    ),
+    fetchCentersById(
+      ctx,
+      missingPageCenters.map((row) => row.fulfillmentCenterId!),
+    ),
+  ]);
+  for (const [id, product] of pageProducts) productLookup.set(id, product);
+  for (const [id, center] of pageCenters) centerLookup.set(id, center);
+
+  return pageRows.map((row) => {
+    const computed = withComputed(row);
+    return {
+      ...computed,
+      status: row.quickStatus ?? stockStatus(row),
+      product: productForRow(row, productLookup.get(row.productId!)),
+      fulfillmentCenter: centerForRow(
+        row,
+        centerLookup.get(row.fulfillmentCenterId!),
+      ),
+      pricing: row.pricingSummary ?? null,
+      batchCount: row.batchCount ?? 0,
+      nearExpiryBatchCount: row.nearExpiryBatchCount ?? 0,
+      earliestExpiryDate: row.earliestExpiryDate,
+    };
+  });
 }
 
 export const getInventoryBySkuAndCenter = query({
@@ -262,55 +559,7 @@ export const listByCenter = query({
     limit: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
-    const rawRows = args.fulfillmentCenterId
-      ? ((await ctx.db
-          .query("inventory")
-          .withIndex("by_center_active", (q) =>
-            q.eq("fulfillmentCenterId", args.fulfillmentCenterId!),
-          )
-          .collect()) as QuickInventoryDoc[])
-      : ((await ctx.db.query("inventory").collect()) as QuickInventoryDoc[]);
-    const rows = rawRows.filter((row) => row.sku && row.productId && row.fulfillmentCenterId);
-    const centerIds = Array.from(new Set(rows.map((row) => row.fulfillmentCenterId!)));
-    const centers = new Map<CenterId, FulfillmentCenterDoc>();
-    for (const centerId of centerIds) {
-      const center = (await ctx.db.get(centerId)) as FulfillmentCenterDoc | null;
-      if (center) centers.set(centerId, center);
-    }
-
-    const out = [];
-    for (const row of rows) {
-      const product = (await ctx.db.get(row.productId!)) as ProductDoc | null;
-      const center = centers.get(row.fulfillmentCenterId!);
-      const pricing = (await ctx.db
-        .query("inventoryPricing")
-        .withIndex("by_inventory", (q) => q.eq("inventoryId", row._id))
-        .first()) as InventoryPricingDoc | null;
-      const batches = (await ctx.db
-        .query("batches")
-        .withIndex("by_inventory_expiry", (q) => q.eq("inventoryId", row._id))
-        .collect()) as BatchDoc[];
-      const computed = withComputed(row);
-      const statusValue = stockStatus(row);
-      if (args.status && statusValue !== args.status) continue;
-      const searchable = `${row.sku ?? ""} ${product?.name ?? ""} ${product?.brand ?? ""} ${center?.name ?? ""}`.toLowerCase();
-      if (args.search && !searchable.includes(args.search.toLowerCase())) continue;
-      out.push({
-        ...computed,
-        status: statusValue,
-        product,
-        fulfillmentCenter: center,
-        pricing,
-        batchCount: batches.length,
-        nearExpiryBatchCount: batches.filter((batch) => batch.isNearExpiry).length,
-        earliestExpiryDate: batches[0]?.expiryDate,
-      });
-    }
-    out.sort((a, b) => {
-      if (a.status !== b.status) return a.status.localeCompare(b.status);
-      return (a.product?.name ?? a.sku ?? "").localeCompare(b.product?.name ?? b.sku ?? "");
-    });
-    return out.slice(0, Math.min(Math.max(args.limit ?? 300, 1), 500));
+    return listByCenterHandler(ctx, args);
   },
 });
 
@@ -537,6 +786,7 @@ export const reserveInventory = mutation({
         row.availableQuantity!,
         row.reservedQuantity! + args.quantity,
         row.replenishmentThreshold!,
+        row.isActive,
       ),
     });
     const reservationId = await ctx.db.insert("cartReservations", {
@@ -569,6 +819,7 @@ export const releaseReservation = mutation({
         row.availableQuantity!,
         Math.max(row.reservedQuantity! - reservation.quantity, 0),
         row.replenishmentThreshold!,
+        row.isActive,
       ),
     });
     await ctx.db.patch(reservation._id, { status: "released" });
@@ -597,6 +848,7 @@ export const convertReservation = mutation({
         row.availableQuantity! - reservation.quantity,
         Math.max(row.reservedQuantity! - reservation.quantity, 0),
         row.replenishmentThreshold!,
+        row.isActive,
       ),
     });
     await ctx.db.patch(reservation._id, { status: "converted" });
@@ -623,7 +875,12 @@ export const updateInventory = mutation({
       throw new Error("Adjustment would make availableQuantity negative");
     }
     await ctx.db.patch(args.inventoryId, {
-      ...quickInventoryPatch(nextAvailable, row.reservedQuantity!, row.replenishmentThreshold!),
+      ...quickInventoryPatch(
+        nextAvailable,
+        row.reservedQuantity!,
+        row.replenishmentThreshold!,
+        row.isActive,
+      ),
     });
     await ctx.db.insert("inventoryLogs", {
       inventoryId: args.inventoryId,
@@ -673,7 +930,15 @@ export const createBatch = mutation({
         row.availableQuantity! + args.quantity,
         row.reservedQuantity!,
         row.replenishmentThreshold!,
+        row.isActive,
       ),
+      batchCount: (row.batchCount ?? 0) + 1,
+      nearExpiryBatchCount:
+        (row.nearExpiryBatchCount ?? 0) + (daysRemaining <= 2 ? 1 : 0),
+      earliestExpiryDate:
+        row.earliestExpiryDate === undefined
+          ? args.expiryDate
+          : Math.min(row.earliestExpiryDate, args.expiryDate),
     });
     return batchId;
   },
@@ -696,6 +961,7 @@ export const markBatchExpired = mutation({
         row.availableQuantity! - decrement,
         row.reservedQuantity!,
         row.replenishmentThreshold!,
+        row.isActive,
       ),
     });
     await ctx.db.patch(args.batchId, {
@@ -703,6 +969,7 @@ export const markBatchExpired = mutation({
       qualityCheckStatus: "failed",
       expiredAt: now(),
     });
+    await ctx.db.patch(batch.inventoryId, await computeBatchSummary(ctx, batch.inventoryId));
     return { success: true, decrementedQuantity: decrement };
   },
 });
@@ -734,9 +1001,21 @@ export const updateDynamicPrice = mutation({
     };
     if (existing) {
       await ctx.db.patch(existing._id, payload);
+      await ctx.db.patch(args.inventoryId, {
+        pricingSummary: {
+          ...payload,
+          _id: existing._id,
+          _creationTime: (existing as InventoryPricingDoc)._creationTime,
+        },
+      });
       return existing._id;
     }
-    return await ctx.db.insert("inventoryPricing", payload);
+    const id = await ctx.db.insert("inventoryPricing", payload);
+    const inserted = (await ctx.db.get(id)) as InventoryPricingDoc | null;
+    await ctx.db.patch(args.inventoryId, {
+      pricingSummary: pricingSummaryFromDoc(inserted),
+    });
+    return id;
   },
 });
 
@@ -755,6 +1034,7 @@ export const replenishStock = mutation({
         row.availableQuantity! + args.quantity,
         row.reservedQuantity!,
         row.replenishmentThreshold!,
+        row.isActive,
       ),
       expectedReplenishmentAt: undefined,
     });
@@ -781,6 +1061,7 @@ export const expireCartReservations = internalMutation({
           row.availableQuantity!,
           Math.max(row.reservedQuantity! - reservation.quantity, 0),
           row.replenishmentThreshold!,
+          row.isActive,
         ),
       });
       await ctx.db.patch(reservation._id, { status: "expired" });
@@ -795,6 +1076,7 @@ export const updateShelfLife = internalMutation({
   handler: async (ctx) => {
     const t = now();
     const batches = (await ctx.db.query("batches").collect()) as BatchDoc[];
+    const touchedInventoryIds = new Set<InventoryId>();
     for (const batch of batches) {
       if (batch.expiredAt !== undefined) continue;
       const daysRemaining = shelfLifeDaysRemaining(batch.expiryDate, t);
@@ -803,6 +1085,10 @@ export const updateShelfLife = internalMutation({
         isNearExpiry: daysRemaining <= 2,
         pickPriority: pickPriorityScore(batch.expiryDate),
       });
+      touchedInventoryIds.add(batch.inventoryId);
+    }
+    for (const inventoryId of touchedInventoryIds) {
+      await ctx.db.patch(inventoryId, await computeBatchSummary(ctx, inventoryId));
     }
     return { updated: batches.length };
   },
@@ -825,29 +1111,30 @@ export const flagNearExpiry = internalMutation({
   },
 });
 
-export const replenishmentAlert = internalMutation({
-  args: {},
-  handler: async (ctx) => {
-    const rows = (await ctx.db.query("inventory").collect()) as QuickInventoryDoc[];
-    let alerts = 0;
+export const backfillInventorySummaries = mutation({
+  args: { limit: v.optional(v.number()), cursor: v.optional(v.string()) },
+  handler: async (ctx, args) => {
+    const limit = Math.min(Math.max(args.limit ?? 50, 1), 200);
+    const candidateLimit = args.cursor ? Math.min(limit * 2, 400) : limit;
+    const candidates = (await ctx.db
+      .query("inventory")
+      .withIndex("by_summary_version", (q) =>
+        q.eq("quickInventorySummaryVersion", undefined),
+      )
+      .take(candidateLimit)) as QuickInventoryDoc[];
+    const cursorIndex = args.cursor
+      ? candidates.findIndex((row) => row._id === args.cursor)
+      : -1;
+    const rows = candidates
+      .slice(cursorIndex >= 0 ? cursorIndex + 1 : 0)
+      .slice(0, limit);
     for (const row of rows) {
-      if (
-        row.availableQuantity === undefined ||
-        row.reservedQuantity === undefined ||
-        row.replenishmentThreshold === undefined
-      ) {
-        continue;
-      }
-      const sellable = computeSellable(row.availableQuantity, row.reservedQuantity);
-      const low = isLowStock(sellable, row.replenishmentThreshold);
-      if (low) alerts += 1;
-      if (row.isLowStock !== low) {
-        await ctx.db.patch(row._id, {
-          isLowStock: low,
-          lastUpdatedAt: now(),
-        });
-      }
+      await patchInventorySummaries(ctx, row);
     }
-    return { lowStockRows: alerts };
+    return {
+      processed: rows.length,
+      nextCursor: rows.at(-1)?._id,
+      remainingMayExist: candidates.length >= candidateLimit,
+    };
   },
 });

@@ -217,12 +217,15 @@ export interface SkuDoc extends BaseDoc {
 
 export interface PriceDoc extends BaseDoc {
   sku_id: string;
+  product_id?: string;
   store_id?: string;
+  storeName?: string;
   currency: string;
   sale_price: number;
   compare_at_price?: number;
   starts_at: number;
   ends_at?: number;
+  priceSummaryVersion?: number;
 }
 
 export interface InventoryDoc extends BaseDoc {
@@ -234,6 +237,12 @@ export interface InventoryDoc extends BaseDoc {
   status: InventoryStatus;
   restock_at?: number;
   updated_at: number;
+  skuCode?: string;
+  variantLabel?: string;
+  productName?: string;
+  storeName?: string;
+  productId?: string;
+  storeInventorySummaryVersion?: number;
 }
 
 export interface PromotionDoc extends BaseDoc {
@@ -305,6 +314,13 @@ export interface HomeSectionDoc extends BaseDoc {
   is_active?: boolean;
 }
 
+export interface HomeTabLayoutDoc extends BaseDoc {
+  tab: string;
+  overrideEnabled: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+
 export interface HomeSectionResponse {
   id: string;
   key: string;
@@ -314,6 +330,11 @@ export interface HomeSectionResponse {
   tab: string;
   sortOrder: number;
   layoutVariant?: string;
+  backgroundColor?: string;
+  textColor?: string;
+  imageUrl?: string;
+  iconEmoji?: string;
+  maxItems?: number;
   config: Record<string, unknown>;
   resolvedData: Record<string, unknown> & {
     products?: Array<ProductDoc | Record<string, unknown>>;
