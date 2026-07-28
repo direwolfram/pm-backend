@@ -339,6 +339,23 @@ export default defineSchema({
     .index("by_price_summary_version", ["priceSummaryVersion"]),
 
   /**
+   * Persisted next-transition records for prices with a future starts_at:
+   * one row at starts_at - PRICE_ACTIVE_LOOKAHEAD_MS (materialize the mirror
+   * before activation) and one at starts_at (refresh stored summaries).
+   * prices.scheduleTransition drains rows with due_at <= now in bounded
+   * batches, so a price created days or months before its activation is
+   * always materialized on time without rescanning price history.
+   * Written transactionally by prices.upsert and every price-deletion path
+   * cleans it up; prices.backfillPriceTransitions journals legacy rows.
+   */
+  priceTransitions: defineTable({
+    price_id: v.id("prices"),
+    due_at: v.number(),
+  })
+    .index("by_due", ["due_at"])
+    .index("by_price", ["price_id"]),
+
+  /**
    * Persisted materialization of the price set that is currently active or
    * scheduled to activate within PRICE_ACTIVE_LOOKAHEAD_MS, per SKU. Lets the
    * product list select the correct active price with a bounded read instead

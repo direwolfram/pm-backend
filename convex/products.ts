@@ -9,6 +9,7 @@ import {
   PRODUCT_LIST_SUMMARY_VERSION,
   recomputeProductListSummary,
 } from "./lib/productListSummaries";
+import { deletePriceTransitionJournal } from "./prices";
 import {
   applyListCountChange,
   exactListTotal,
@@ -29,6 +30,35 @@ const productStatus = v.union(
   v.literal("hidden"),
   v.literal("discontinued"),
 );
+
+/**
+ * Hard cap on documents a single list request may scan outside its returned
+ * page (search match sets and counter-missing totals). Convex search queries
+ * cannot be paginated and index ranges cannot be counted without reading
+ * them, so these domains are read with take(CAP + 1) and rejected explicitly
+ * when larger — never silently truncated and never an unbounded collect.
+ */
+export const PRODUCT_LIST_SCAN_CAP = 512;
+
+/** Deterministic newest-first total order with a unique tie-breaker. */
+export function compareProductsNewestFirst(a: ProductDoc, b: ProductDoc) {
+  if (a.updated_at !== b.updated_at) return b.updated_at - a.updated_at;
+  return a._id < b._id ? 1 : a._id > b._id ? -1 : 0;
+}
+
+/**
+ * Bounded exact count of a query domain; throws when the domain exceeds the
+ * cap so callers never see a silently truncated total.
+ */
+async function boundedDomainCount(
+  buildQuery: () => { take: (n: number) => Promise<unknown[]> },
+  cap: number,
+  tooLargeMessage: string,
+) {
+  const rows = await buildQuery().take(cap + 1);
+  if (rows.length > cap) throw new Error(tooLargeMessage);
+  return rows.length;
+}
 
 const dummyProductImageColors = ["F7C948", "90CDF4", "C6F6D5", "FBB6CE"];
 const SIMILAR_PRODUCT_LIMIT = 24;
@@ -92,8 +122,11 @@ async function pageProducts(
   const cursor = unwrapCursor(scope, args.cursor);
   const isSearch = !!args.search?.trim();
   if (isSearch) {
-    // Search domain: exact total = size of the filtered match set; reads are
-    // bounded by matches, not the table.
+    // Search domain: exact total = size of the filtered match set. Convex
+    // search queries cannot be paginated, so the match set is read with a
+    // hard cap and sorted deterministically (newest-first, _id tie-break);
+    // an over-cap match domain is rejected explicitly instead of being
+    // collected unboundedly or silently truncated.
     const matches = (await ctx.db
       .query("products")
       .withSearchIndex("search_products", (q: any) => {
@@ -103,7 +136,13 @@ async function pageProducts(
         if (args.brand_id) s = s.eq("brand_id", args.brand_id);
         return s;
       })
-      .collect()) as ProductDoc[];
+      .take(PRODUCT_LIST_SCAN_CAP + 1)) as ProductDoc[];
+    if (matches.length > PRODUCT_LIST_SCAN_CAP) {
+      throw new Error(
+        `Search matched more than ${PRODUCT_LIST_SCAN_CAP} products; narrow the search term or filters`,
+      );
+    }
+    matches.sort(compareProductsNewestFirst);
     const skip = useOffset
       ? pageArgs.offset
       : cursor === null
@@ -152,11 +191,17 @@ async function pageProducts(
         if (args.status) return q.eq("status", args.status);
         return q;
       });
-  // Exact total: maintained counters (O(1)); missing counter rows fall back
-  // to a bounded count of the match domain.
+  // Exact total: maintained counters (O(1)). Missing counter rows use a
+  // bounded scan that rejects over-cap domains explicitly — never a
+  // request-time full-range collect.
   const maintained = await exactListTotal(ctx, "products", productTotalKey(args));
   const total =
-    maintained ?? ((await makeBuilder().collect()) as ProductDoc[]).length;
+    maintained ??
+    (await boundedDomainCount(
+      makeBuilder,
+      PRODUCT_LIST_SCAN_CAP,
+      `Product list counters are missing for this filter and more than ${PRODUCT_LIST_SCAN_CAP} products match; run listCounts.reconcileListCounts for scope "products" before querying`,
+    ));
   const ordered = makeBuilder().order("desc");
   if (!useOffset) {
     const result = await ordered.paginate({
@@ -265,6 +310,17 @@ export async function listHandler(
   return pageResponse(enriched, args, pagination);
 }
 
+/**
+ * products.list — legacy-compatible endpoint.
+ *
+ * Preserved for legacy callers during the migration to products.listV2.
+ * Semantics shared with listV2 (see pageProducts): deterministic newest-first
+ * ordering (updated_at desc, _id desc), exact numeric totals (maintained
+ * counters; bounded scans elsewhere), token search over product names with
+ * the PRODUCT_LIST_SCAN_CAP domain cap, and legacy offsets honored up to
+ * MAX_COMPAT_OFFSET (200) with a documented error beyond. New callers must
+ * use products.listV2.
+ */
 export const list = query({
   args: {
     search: v.optional(v.string()),
@@ -273,6 +329,33 @@ export const list = query({
     brand_id: v.optional(v.id("brands")),
     limit: v.optional(v.number()),
     offset: v.optional(v.number()),
+    cursor: v.optional(v.union(v.string(), v.null())),
+  },
+  handler: async (ctx, args) => {
+    return await listHandler(ctx, args);
+  },
+});
+
+/**
+ * products.listV2 — explicitly versioned, cursor-first endpoint.
+ *
+ * - Pagination: opaque cursors fingerprinted to search/status/category/brand
+ *   filters; no `offset` argument — deep paging is cursor-only.
+ * - Ordering: newest-first (updated_at desc, _id desc) on every path, so
+ *   identical timestamps can never skip or duplicate rows across pages.
+ * - Totals: exact numeric totals; search domains larger than
+ *   PRODUCT_LIST_SCAN_CAP are rejected explicitly, never estimated.
+ * - Reads: one capped page plus bounded metadata; enrichment fetches only
+ *   the brands/categories/summaries referenced by the returned page,
+ *   deduplicated, and never writes from the query.
+ */
+export const listV2 = query({
+  args: {
+    search: v.optional(v.string()),
+    status: v.optional(productStatus),
+    category_id: v.optional(v.id("categories")),
+    brand_id: v.optional(v.id("brands")),
+    limit: v.optional(v.number()),
     cursor: v.optional(v.union(v.string(), v.null())),
   },
   handler: async (ctx, args) => {
@@ -632,6 +715,7 @@ export const continueProductDelete = internalMutation({
       .take(CASCADE_BATCH_LIMIT - operations);
     for (const pr of prices) {
       await ctx.db.delete(pr._id);
+      await deletePriceTransitionJournal(ctx, pr._id);
       operations += 1;
     }
     if (operations >= CASCADE_BATCH_LIMIT) {

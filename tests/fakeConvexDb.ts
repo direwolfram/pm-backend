@@ -12,6 +12,7 @@ type TableName =
   | "skus"
   | "prices"
   | "pricesActive"
+  | "priceTransitions"
   | "listCounts"
   | "transitionState"
   | "product_similar_products"

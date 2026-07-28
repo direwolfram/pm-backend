@@ -298,7 +298,7 @@ function PromotionDialog({
   onSave: () => void;
 }) {
   const products =
-    (useQuery(api.products.list, { limit: 200 }) as
+    (useQuery(api.products.listV2, { limit: 200 }) as
       | { data: { _id: string; name: string }[] }
       | undefined)?.data ?? [];
   const categories =

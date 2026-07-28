@@ -6,6 +6,7 @@ import {
   deletePricesActiveForSku,
   recomputeProductListSummary,
 } from "./lib/productListSummaries";
+import { deletePriceTransitionJournal } from "./prices";
 import type { InventoryDoc, PriceDoc, SkuDoc } from "./model";
 
 const CASCADE_BATCH_LIMIT = 100;
@@ -222,6 +223,19 @@ export const update = mutation({
         priceSummaryVersion: 1,
       });
     }
+    if (nextProductId !== sku.product_id) {
+      // A SKU move must keep the active-price mirrors pointing at the new
+      // product so transition drains recompute the right summaries.
+      const mirrors = await ctx.db
+        .query("pricesActive")
+        .withIndex("by_sku", (q) => q.eq("sku_id", id))
+        .collect();
+      for (const mirror of mirrors) {
+        if (mirror.product_id !== nextProductId) {
+          await ctx.db.patch(mirror._id, { product_id: nextProductId });
+        }
+      }
+    }
     const inventory = await ctx.db
       .query("inventory")
       .withIndex("by_sku", (q) => q.eq("sku_id", id))
@@ -296,6 +310,7 @@ export const continueSkuDelete = internalMutation({
       .take(CASCADE_BATCH_LIMIT);
     for (const p of prices) {
       await ctx.db.delete(p._id);
+      await deletePriceTransitionJournal(ctx, p._id);
       operations += 1;
     }
     // Mirror cleanup: pricesActive rows for this SKU go with its prices.

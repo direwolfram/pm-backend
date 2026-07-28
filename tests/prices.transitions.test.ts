@@ -83,6 +83,181 @@ async function mirrorRows(t: ReturnType<typeof convexTest>, skuId: Id<"skus">) {
   );
 }
 
+/**
+ * Prices inserted directly (bypassing prices.upsert) are legacy rows: the
+ * migration backfill syncs their mirrors and writes their journal records,
+ * exactly as it would on a real deployment.
+ */
+async function backfillTransitions(t: ReturnType<typeof convexTest>) {
+  await t.mutation(internal.prices.backfillPriceTransitions, {});
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
+}
+
+describe("due-time activation journal", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("activates a price created months before its starts_at", async () => {
+    const t = convexTest({ schema, modules });
+    const { productId, skuId } = await seedProductWithSku(t);
+    const startsAt = Date.now() + 90 * 24 * 3_600_000;
+    await t.mutation(api.prices.upsert, {
+      sku_id: skuId,
+      sale_price: 42,
+      starts_at: startsAt,
+    });
+
+    // Many drains pass before the activation is due; none may strand it.
+    for (let week = 0; week < 12; week += 1) {
+      vi.setSystemTime(Date.now() + 7 * 24 * 3_600_000);
+      const run = await t.mutation(internal.prices.scheduleTransition, {});
+      expect(run.drained).toBe(true);
+      await t.finishAllScheduledFunctions(vi.runAllTimers);
+    }
+    expect(await mirrorRows(t, skuId)).toHaveLength(0);
+
+    // Cross into the materialization lookahead: the mirror appears before
+    // starts_at so list reads are correct the instant it activates.
+    vi.setSystemTime(startsAt - 24 * 3_600_000);
+    await t.mutation(internal.prices.scheduleTransition, {});
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
+    expect(await mirrorRows(t, skuId)).toHaveLength(1);
+
+    // At starts_at the stored summary refreshes to the new price.
+    vi.setSystemTime(startsAt + 1);
+    await t.mutation(internal.prices.scheduleTransition, {});
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
+    const product = await t.run(async (ctx) => await ctx.db.get(productId));
+    expect(product?.default_price).toBe(42);
+  });
+
+  it("journals legacy direct-inserted future prices via the backfill", async () => {
+    const t = convexTest({ schema, modules });
+    const { productId, skuId } = await seedProductWithSku(t);
+    const startsAt = Date.now() + 30 * 24 * 3_600_000;
+    await insertPrices(t, skuId, productId, 3, {
+      startsAt: () => startsAt,
+      price: () => 11,
+    });
+
+    let result = await t.mutation(internal.prices.backfillPriceTransitions, {
+      limit: 2,
+    });
+    expect(result.done).toBe(false);
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
+    // Re-running the whole backfill is a no-op (idempotent).
+    result = await t.mutation(internal.prices.backfillPriceTransitions, {});
+    expect(result).toMatchObject({ done: true, synced: 0, journaled: 0 });
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+    vi.setSystemTime(startsAt + 1);
+    await t.mutation(internal.prices.scheduleTransition, {});
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
+    const mirrors = await mirrorRows(t, skuId);
+    expect(mirrors).toHaveLength(3);
+    expect(new Set(mirrors.map((m) => m.price_id)).size).toBe(3);
+    const product = await t.run(async (ctx) => await ctx.db.get(productId));
+    expect(product?.default_price).toBe(11);
+  });
+
+  it("moves the activation when starts_at is edited", async () => {
+    const t = convexTest({ schema, modules });
+    const { skuId } = await seedProductWithSku(t);
+    const priceId = await t.mutation(api.prices.upsert, {
+      sku_id: skuId,
+      sale_price: 30,
+      starts_at: Date.now() + 3_600_000,
+    });
+    // Push the activation two days out.
+    await t.mutation(api.prices.upsert, {
+      id: priceId,
+      sku_id: skuId,
+      sale_price: 30,
+      starts_at: Date.now() + 2 * 24 * 3_600_000,
+    });
+
+    vi.setSystemTime(Date.now() + 3_600_000 + 1);
+    await t.mutation(internal.prices.scheduleTransition, {});
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
+    // Not active at the original time (mirror may be pre-materialized inside
+    // the lookahead window, but the price itself is not yet time-active).
+    const early = await t.run(async (ctx) => ctx.db.get(priceId));
+    expect(early?.starts_at).toBeGreaterThan(Date.now());
+
+    vi.setSystemTime(Date.now() + 2 * 24 * 3_600_000 + 1);
+    await t.mutation(internal.prices.scheduleTransition, {});
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
+    const mirrors = await mirrorRows(t, skuId);
+    expect(mirrors).toHaveLength(1);
+    expect(mirrors[0].sale_price).toBe(30);
+    // No journal rows remain for the processed price.
+    const pending = await t.run(async (ctx) =>
+      ctx.db
+        .query("priceTransitions")
+        .withIndex("by_price", (q) => q.eq("price_id", priceId))
+        .collect(),
+    );
+    expect(pending).toHaveLength(0);
+  });
+
+  it("cancels the activation when the price is removed before starts_at", async () => {
+    const t = convexTest({ schema, modules });
+    const { skuId } = await seedProductWithSku(t);
+    const priceId = await t.mutation(api.prices.upsert, {
+      sku_id: skuId,
+      sale_price: 30,
+      starts_at: Date.now() + 3_600_000,
+    });
+    await t.mutation(api.prices.remove, { id: priceId });
+
+    vi.setSystemTime(Date.now() + 4_000_000);
+    const run = await t.mutation(internal.prices.scheduleTransition, {});
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
+    expect(run).toMatchObject({ expired: 0, drained: true });
+    expect(await mirrorRows(t, skuId)).toHaveLength(0);
+  });
+
+  it("handles >200 activations at exactly the same starts_at without duplicates", async () => {
+    const t = convexTest({ schema, modules });
+    const { skuId } = await seedProductWithSku(t);
+    const startsAt = Date.now() + 3_600_000;
+    for (let index = 0; index < 210; index += 1) {
+      await t.mutation(api.prices.upsert, {
+        sku_id: skuId,
+        sale_price: 7,
+        starts_at: startsAt,
+      });
+    }
+    vi.setSystemTime(startsAt + 1);
+    // Overlapping runs: process the same due set concurrently.
+    const a = await t.mutation(internal.prices.scheduleTransition, {});
+    const b = await t.mutation(internal.prices.scheduleTransition, {});
+    expect(a.drained).toBe(false);
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
+    void b;
+
+    const mirrors = await mirrorRows(t, skuId);
+    expect(mirrors).toHaveLength(210);
+    expect(new Set(mirrors.map((m) => m.price_id)).size).toBe(210);
+    // Repeated runs afterwards are fully idempotent: no mirror changes, no
+    // summary recomputes, no rewrites.
+    const again = await t.mutation(internal.prices.scheduleTransition, {});
+    expect(again).toMatchObject({
+      expired: 0,
+      activated: 0,
+      refreshed: 0,
+      drained: true,
+    });
+    expect(await mirrorRows(t, skuId)).toHaveLength(210);
+  });
+});
+
 describe("price transition drain", () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -106,6 +281,7 @@ describe("price transition drain", () => {
       startsAt: () => startsAt + 1_000,
       price: () => 77,
     });
+    await backfillTransitions(t);
 
     vi.setSystemTime(Date.now() + 7_200_000);
     const first = await t.mutation(internal.prices.scheduleTransition, {});
@@ -140,6 +316,7 @@ describe("price transition drain", () => {
       startsAt: () => Date.now() - 10_000,
       price: () => 9,
     });
+    await backfillTransitions(t);
     await t.mutation(internal.prices.scheduleTransition, {});
     await t.finishAllScheduledFunctions(vi.runAllTimers);
     expect(await mirrorRows(t, skuId)).toHaveLength(231);
@@ -161,18 +338,22 @@ describe("price transition drain", () => {
     const t = convexTest({ schema, modules });
     const { productId, skuId } = await seedProductWithSku(t);
     await insertPrices(t, skuId, productId, 450, {
-      startsAt: () => Date.now() - 1_000,
+      startsAt: () => Date.now() + 3_600_000,
       price: () => 3,
     });
+    await backfillTransitions(t);
+    vi.setSystemTime(Date.now() + 7_200_000);
 
-    // Overlapping root runs before draining share one logical chain.
+    // Overlapping root runs each drain a disjoint due batch; nothing is
+    // processed twice because journal rows are deleted transactionally.
+    // (Mirrors already exist — starts_at was inside the materialization
+    // lookahead at backfill time — so `activated` stays 0 and progress is
+    // measured by the drain flags.)
     const a = await t.mutation(internal.prices.scheduleTransition, {});
     const b = await t.mutation(internal.prices.scheduleTransition, {});
     expect(a.drained).toBe(false);
+    expect(a.remainingMayExist).toBe(true);
     expect(b.drained).toBe(false);
-    const syncedTotal = a.activated + b.activated;
-    expect(syncedTotal).toBeGreaterThan(200);
-    expect(syncedTotal).toBeLessThanOrEqual(450);
 
     await t.finishAllScheduledFunctions(vi.runAllTimers);
     const mirrors = await mirrorRows(t, skuId);
@@ -184,9 +365,11 @@ describe("price transition drain", () => {
     const t = convexTest({ schema, modules });
     const { productId, skuId, storeId } = await seedProductWithSku(t);
     await insertPrices(t, skuId, productId, 250, {
-      startsAt: () => Date.now() - 1_000,
+      startsAt: () => Date.now() + 1_000,
       price: () => 3,
     });
+    await backfillTransitions(t);
+    vi.setSystemTime(Date.now() + 2_000);
 
     const first = await t.mutation(internal.prices.scheduleTransition, {});
     expect(first.drained).toBe(false);
@@ -221,6 +404,7 @@ describe("price transition drain", () => {
       storeId,
       price: () => 5,
     });
+    await backfillTransitions(t);
     await t.mutation(internal.prices.scheduleTransition, {});
     await t.finishAllScheduledFunctions(vi.runAllTimers);
     let product = await t.run(async (ctx) => await ctx.db.get(productId));
@@ -230,6 +414,7 @@ describe("price transition drain", () => {
       startsAt: () => Date.now() - 900,
       price: () => 8,
     });
+    await backfillTransitions(t);
     await t.mutation(internal.prices.scheduleTransition, {});
     await t.finishAllScheduledFunctions(vi.runAllTimers);
     product = await t.run(async (ctx) => await ctx.db.get(productId));

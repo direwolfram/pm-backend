@@ -111,7 +111,7 @@ export default function Products() {
   const [categoryId, setCategoryId] = useState<string>("all");
   const [brandId, setBrandId] = useState<string>("all");
 
-  const result = useQuery(api.products.list, {
+  const result = useQuery(api.products.listV2, {
     search: search || undefined,
     status: status === "all" ? undefined : status,
     category_id: categoryId === "all" ? undefined : categoryId,

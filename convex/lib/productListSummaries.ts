@@ -79,8 +79,12 @@ export function priceIsActiveMaterializable(
 }
 
 /**
- * Exact active price for one SKU via the bounded pricesActive mirror
- * (one SKU can only have a handful of concurrent active prices).
+ * Exact active price for one SKU. Primary source is the bounded pricesActive
+ * mirror; when no mirror rows exist yet (legacy rows written before the
+ * mirror/journal rollout, or seeds), fall back to the authoritative prices
+ * table via the indexed by_sku read so list reads stay correct while the
+ * migration is incomplete. Both reads are bounded; an over-cap price history
+ * is rejected explicitly, never silently truncated.
  */
 export async function activePriceForSku(
   ctx: { db: any },
@@ -91,7 +95,19 @@ export async function activePriceForSku(
     .query("pricesActive")
     .withIndex("by_sku", (q: any) => q.eq("sku_id", skuId))
     .collect()) as ActivePriceRow[];
-  return activePriceFromRows(rows, t);
+  if (rows.length > 0) return activePriceFromRows(rows, t);
+  const prices = (await ctx.db
+    .query("prices")
+    .withIndex("by_sku", (q: any) => q.eq("sku_id", skuId))
+    .take(MAX_ACTIVE_MIRROR_ROWS_PER_SKU + 1)) as PriceDoc[];
+  if (prices.length > MAX_ACTIVE_MIRROR_ROWS_PER_SKU) {
+    throw new Error(
+      `SKU ${skuId} has more than ${MAX_ACTIVE_MIRROR_ROWS_PER_SKU} prices; reconcile with a dedicated workflow`,
+    );
+  }
+  if (prices.length === 0) return undefined;
+  const winner = activePrice(prices, t);
+  return winner ? { sale_price: winner.sale_price } : undefined;
 }
 
 function inventoryQuantity(row: InventoryDoc) {
@@ -154,6 +170,26 @@ export async function recomputeProductListSummary(
 ) {
   const patch = await computeProductListSummary(ctx, productId);
   if (!patch) return null;
+  const current = (await ctx.db.get(productId)) as {
+    sku_count?: number;
+    default_sku_id?: string;
+    default_price?: number;
+    total_stock?: number;
+    productListSummaryVersion?: number;
+  } | null;
+  if (!current) return null;
+  // Skip the write when nothing changed: transition drains and cascades call
+  // this on every touched product, and unchanged-record rewrites would
+  // amplify into pointless reactive invalidations.
+  if (
+    current.sku_count === patch.sku_count &&
+    current.default_sku_id === patch.default_sku_id &&
+    current.default_price === patch.default_price &&
+    current.total_stock === patch.total_stock &&
+    current.productListSummaryVersion === patch.productListSummaryVersion
+  ) {
+    return patch;
+  }
   await ctx.db.patch(productId, patch);
   return patch;
 }

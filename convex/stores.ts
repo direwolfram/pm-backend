@@ -7,6 +7,7 @@ import {
   deletePricesActiveForSku,
   refreshProductDefaultPrice,
 } from "./lib/productListSummaries";
+import { deletePriceTransitionJournal } from "./prices";
 import type { DeliveryZoneDoc, InventoryDoc, PriceDoc, StoreDoc } from "./model";
 
 const CASCADE_BATCH_LIMIT = 100;
@@ -197,6 +198,7 @@ export const continueStoreDelete = internalMutation({
     const priceProducts = new Set<string>();
     for (const p of prices) {
       await ctx.db.delete(p._id);
+      await deletePriceTransitionJournal(ctx, p._id);
       priceSkus.add(p.sku_id);
       if (p.product_id) priceProducts.add(p.product_id);
       operations += 1;
