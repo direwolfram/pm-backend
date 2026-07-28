@@ -36,6 +36,11 @@ export type HomeSectionResponse = {
   tab: string;
   sortOrder: number;
   layoutVariant?: string;
+  backgroundColor?: string;
+  textColor?: string;
+  imageUrl?: string;
+  iconEmoji?: string;
+  maxItems?: number;
   config: Record<string, unknown>;
   resolvedData: {
     products?: Array<Product | Record<string, unknown>>;

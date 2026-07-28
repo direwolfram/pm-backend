@@ -516,6 +516,13 @@ export default defineSchema({
     .index("by_key", ["key"])
     .index("by_tab", ["tab", "sortOrder"]),
 
+  home_tab_layouts: defineTable({
+    tab: v.string(),
+    overrideEnabled: v.boolean(),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  }).index("by_tab", ["tab"]),
+
   home_section_items: defineTable({
     section_id: v.id("home_sections"),
     product_id: v.optional(v.id("products")),

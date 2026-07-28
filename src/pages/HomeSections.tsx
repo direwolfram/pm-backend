@@ -2,8 +2,12 @@ import { useMemo, useState, type ReactNode } from "react";
 import { useMutation, useQuery } from "convex/react";
 import {
   Archive,
+  Clipboard,
+  ClipboardPaste,
   Copy,
   Eye,
+  FolderPlus,
+  GripVertical,
   Pencil,
   Plus,
   RotateCcw,
@@ -41,6 +45,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import type {
   HomeSectionDoc,
@@ -50,6 +55,7 @@ import type {
 
 type AdminSection = HomeSectionDoc & { preview: HomeSectionResponse };
 type ListResult = { data: AdminSection[]; total: number; limit: number; offset: number };
+type TabLayout = { id: string; tab: string; overrideEnabled: boolean; updatedAt: number };
 
 type ConfigFieldType = "string" | "number" | "boolean" | "string[]";
 type ConfigField = { key: string; label: string; type: ConfigFieldType };
@@ -89,6 +95,24 @@ type FormState = {
   config: Record<string, unknown>;
 };
 
+type CategoryFormState = {
+  name: string;
+  slug: string;
+  sectionName: string;
+  iconEmoji: string;
+  backgroundColor: string;
+  sortOrder: string;
+};
+
+const EMPTY_CATEGORY_FORM: CategoryFormState = {
+  name: "",
+  slug: "",
+  sectionName: "",
+  iconEmoji: "",
+  backgroundColor: "",
+  sortOrder: "0",
+};
+
 const KINDS: { value: HomeSectionKind; label: string }[] = [
   { value: "header", label: "Header" },
   { value: "search_bar", label: "Search bar" },
@@ -112,6 +136,7 @@ const CONFIG_FIELDS: Record<HomeSectionKind, ConfigField[]> = {
     { key: "showLocation", label: "Show location", type: "boolean" },
     { key: "showProfile", label: "Show profile", type: "boolean" },
     { key: "showCart", label: "Show cart", type: "boolean" },
+    { key: "backgroundColor", label: "Background color", type: "string" },
     { key: "backgroundImageUrl", label: "Background image URL", type: "string" },
     { key: "variant", label: "Variant", type: "string" },
   ],
@@ -368,16 +393,29 @@ function isWireframeSection(section: AdminSection) {
   return /^wirefram/i.test(section.tab) || section.key?.startsWith("wireframe_") === true;
 }
 
+function sortSections(sections: AdminSection[]) {
+  return [...sections].sort((a, b) => (a.sortOrder ?? a.sort_order ?? 0) - (b.sortOrder ?? b.sort_order ?? 0));
+}
+
+function sortTabs(tabs: string[]) {
+  return Array.from(new Set(["All", ...tabs.filter(Boolean)])).sort((a, b) => {
+    if (a === "All") return -1;
+    if (b === "All") return 1;
+    return a.localeCompare(b);
+  });
+}
+
 export default function HomeSections() {
-  const [tabFilter, setTabFilter] = useState("all");
+  const [activeTab, setActiveTab] = useState("All");
   const [kindFilter, setKindFilter] = useState("all");
   const [stateFilter, setStateFilter] = useState("all");
   const result = useQuery(api.homeSections.adminList, {
-    tab: tabFilter === "all" ? undefined : tabFilter,
     kind: kindFilter === "all" ? undefined : kindFilter,
     state: stateFilter,
     limit: 300,
   }) as ListResult | undefined;
+  const adminTabs = useQuery(api.homeSections.adminTabs, {}) as string[] | undefined;
+  const tabLayouts = useQuery(api.homeSections.tabLayouts, {}) as TabLayout[] | undefined;
 
   const createSection = useMutation(api.homeSections.createSection);
   const updateSection = useMutation(api.homeSections.updateSection);
@@ -386,39 +424,59 @@ export default function HomeSections() {
   const archiveSection = useMutation(api.homeSections.archiveSection);
   const restoreSection = useMutation(api.homeSections.restoreSection);
   const reorderSections = useMutation(api.homeSections.reorderSections);
+  const setTabOverride = useMutation(api.homeSections.setTabOverride);
+  const copySectionsFromTab = useMutation(api.homeSections.copySectionsFromTab);
+  const pasteSectionToTab = useMutation(api.homeSections.pasteSectionToTab);
+  const createHomeCategory = useMutation(api.homeSections.createHomeCategory);
   const seedDefaults = useMutation(api.homeSections.seedDefaults);
 
   const [editing, setEditing] = useState<AdminSection | null>(null);
   const [editorOpen, setEditorOpen] = useState(false);
   const [form, setForm] = useState<FormState>(EMPTY_FORM);
   const [preview, setPreview] = useState<HomeSectionResponse | null>(null);
+  const [copySourceTab, setCopySourceTab] = useState("");
+  const [copiedSection, setCopiedSection] = useState<AdminSection | null>(null);
+  const [categoryOpen, setCategoryOpen] = useState(false);
+  const [categoryForm, setCategoryForm] = useState<CategoryFormState>(EMPTY_CATEGORY_FORM);
 
   const rows = useMemo(
     () => result?.data.filter((section) => !isWireframeSection(section)),
     [result?.data],
   );
   const tabs = useMemo(
-    () => Array.from(new Set((rows ?? []).map((section) => section.tab))).sort(),
+    () => sortTabs(adminTabs ?? (rows ?? []).map((section) => section.tab)),
+    [adminTabs, rows],
+  );
+  const selectedTab = tabs.includes(activeTab) ? activeTab : (tabs[0] ?? "All");
+  const currentLayout = useMemo(
+    () => tabLayouts?.find((layout) => layout.tab === selectedTab),
+    [selectedTab, tabLayouts],
+  );
+  const allRows = useMemo(
+    () => sortSections((rows ?? []).filter((section) => section.tab === "All")),
     [rows],
   );
-  const groups = useMemo(() => {
-    const grouped = new Map<string, AdminSection[]>();
-    for (const section of rows ?? []) {
-      const list = grouped.get(section.tab) ?? [];
-      list.push(section);
-      grouped.set(section.tab, list);
-    }
-    return Array.from(grouped.entries()).map(([tab, sections]) => ({
-      tab,
-      sections: sections.sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0)),
-    }));
-  }, [rows]);
+  const customRows = useMemo(
+    () => sortSections((rows ?? []).filter((section) => section.tab === selectedTab)),
+    [rows, selectedTab],
+  );
+  const overrideEnabled =
+    selectedTab === "All" ? true : (currentLayout?.overrideEnabled ?? customRows.length > 0);
+  const isInherited = selectedTab !== "All" && !overrideEnabled;
+  const visibleRows = isInherited ? allRows : customRows;
+  const copySourceOptions = tabs.filter((tab) => tab !== selectedTab);
+  const selectedCopySource = copySourceOptions.includes(copySourceTab)
+    ? copySourceTab
+    : (copySourceOptions[0] ?? "");
+  const [draggingId, setDraggingId] = useState<string | null>(null);
 
   const openCreate = () => {
+    if (isInherited) return;
     setEditing(null);
     setForm({
       ...EMPTY_FORM,
-      sortOrder: String((rows?.length ?? 0) * 10),
+      tab: selectedTab,
+      sortOrder: String((visibleRows.length ? Math.max(...visibleRows.map((section) => section.sortOrder ?? section.sort_order ?? 0)) + 10 : 0)),
     });
     setEditorOpen(true);
   };
@@ -444,19 +502,80 @@ export default function HomeSections() {
     }
   };
 
-  const reorderWithinTab = async (tab: string, sectionId: string, direction: -1 | 1) => {
-    const tabRows = (rows ?? [])
-      .filter((section) => section.tab === tab)
-      .sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0));
-    const index = tabRows.findIndex((section) => section._id === sectionId);
+  const reorderVisibleRows = async (sectionId: string, direction: -1 | 1) => {
+    if (isInherited) return;
+    const index = visibleRows.findIndex((section) => section._id === sectionId);
     const target = index + direction;
-    if (target < 0 || target >= tabRows.length) return;
-    const next = [...tabRows];
+    if (target < 0 || target >= visibleRows.length) return;
+    const next = [...visibleRows];
     [next[index], next[target]] = [next[target], next[index]];
     await runMutation(
       () => reorderSections({ orderedIds: next.map((section) => section._id) }),
       "Order saved",
     );
+  };
+
+  const dropSection = async (targetId: string) => {
+    if (!draggingId || draggingId === targetId || isInherited) return;
+    const next = [...visibleRows];
+    const from = next.findIndex((section) => section._id === draggingId);
+    const to = next.findIndex((section) => section._id === targetId);
+    if (from < 0 || to < 0) return;
+    const [moved] = next.splice(from, 1);
+    next.splice(to, 0, moved);
+    setDraggingId(null);
+    await runMutation(
+      () => reorderSections({ orderedIds: next.map((section) => section._id) }),
+      "Order saved",
+    );
+  };
+
+  const toggleOverride = async (enabled: boolean) => {
+    await runMutation(
+      () => setTabOverride({ tab: selectedTab, overrideEnabled: enabled }),
+      enabled ? "Override enabled" : "Default layout restored",
+    );
+  };
+
+  const copyFromSelectedTab = async () => {
+    if (!selectedCopySource) return;
+    await runMutation(
+      () => copySectionsFromTab({ sourceTab: selectedCopySource, targetTab: selectedTab }),
+      `Copied sections from ${selectedCopySource}`,
+    );
+  };
+
+  const pasteCopiedSection = async () => {
+    if (!copiedSection) return;
+    await runMutation(
+      () => pasteSectionToTab({ sectionId: copiedSection._id, targetTab: selectedTab }),
+      `Pasted "${copiedSection.title || copiedSection.key}" into ${selectedTab}`,
+    );
+  };
+
+  const openCategoryDialog = () => {
+    setCategoryForm(EMPTY_CATEGORY_FORM);
+    setCategoryOpen(true);
+  };
+
+  const saveCategory = async () => {
+    const categoryName = categoryForm.name.trim();
+    const ok = await runMutation(
+      () =>
+        createHomeCategory({
+          name: categoryName,
+          slug: categoryForm.slug.trim() || undefined,
+          section_name: categoryForm.sectionName.trim() || undefined,
+          icon_emoji: categoryForm.iconEmoji.trim() || undefined,
+          background_color: categoryForm.backgroundColor.trim() || undefined,
+          sort_order: categoryForm.sortOrder ? Number(categoryForm.sortOrder) : undefined,
+        }),
+      "Category created",
+    );
+    if (ok) {
+      setCategoryOpen(false);
+      setActiveTab(categoryName);
+    }
   };
 
   return (
@@ -477,23 +596,17 @@ export default function HomeSections() {
             >
               <Save className="mr-2 h-4 w-4" /> Seed defaults
             </Button>
-            <Button onClick={openCreate}>
+            <Button variant="outline" onClick={openCategoryDialog}>
+              <FolderPlus className="mr-2 h-4 w-4" /> New category
+            </Button>
+            <Button onClick={openCreate} disabled={isInherited}>
               <Plus className="mr-2 h-4 w-4" /> New section
             </Button>
           </>
         }
       />
 
-      <div className="mb-4 grid gap-2 md:grid-cols-4">
-        <Select value={tabFilter} onValueChange={setTabFilter}>
-          <SelectTrigger><SelectValue /></SelectTrigger>
-          <SelectContent>
-            <SelectItem value="all">All tabs</SelectItem>
-            {tabs.map((tab) => (
-              <SelectItem key={tab} value={tab}>{tab}</SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
+      <div className="mb-4 grid gap-2 md:grid-cols-2">
         <Select value={kindFilter} onValueChange={setKindFilter}>
           <SelectTrigger><SelectValue /></SelectTrigger>
           <SelectContent>
@@ -513,38 +626,121 @@ export default function HomeSections() {
             <SelectItem value="archived">Archived</SelectItem>
           </SelectContent>
         </Select>
-        <Input
-          placeholder="Filter tab name"
-          value={tabFilter === "all" ? "" : tabFilter}
-          onChange={(event) => setTabFilter(event.target.value || "all")}
-        />
       </div>
 
-      {!rows ? (
+      {!rows || !adminTabs || !tabLayouts ? (
         <Loading />
       ) : rows.length === 0 ? (
         <EmptyState title="No sections match these filters" />
       ) : (
-        <div className="space-y-6">
-          {groups.map((group) => (
-            <section key={group.tab}>
-              <h2 className="mb-2 text-sm font-semibold uppercase text-muted-foreground">
-                {group.tab}
-              </h2>
-              <div className="grid gap-3 xl:grid-cols-2">
-                {group.sections.map((section) => (
-                  <Card key={section._id} className={section.archivedAt ? "opacity-70" : ""}>
+        <Tabs value={selectedTab} onValueChange={setActiveTab} className="space-y-4">
+          <div className="overflow-x-auto">
+            <TabsList className="h-auto w-max justify-start">
+              {tabs.map((tab) => (
+                <TabsTrigger key={tab} value={tab} className="min-w-24">
+                  {tab}
+                </TabsTrigger>
+              ))}
+            </TabsList>
+          </div>
+
+          {selectedTab !== "All" && (
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border bg-card px-4 py-3">
+              <div>
+                <p className="text-sm font-medium">{selectedTab} layout</p>
+                <p className="text-xs text-muted-foreground">
+                  {overrideEnabled
+                    ? "This tab has its own sections. Reordering and edits affect this tab in the app."
+                    : "This tab is inheriting the All layout in the app."}
+                </p>
+              </div>
+              <label className="flex items-center gap-2 text-sm">
+                <Switch checked={overrideEnabled} onCheckedChange={toggleOverride} />
+                Override
+              </label>
+            </div>
+          )}
+
+          <div className="flex flex-wrap items-end justify-between gap-3 rounded-md border bg-card px-4 py-3">
+            <div>
+              <p className="text-sm font-medium">Copy from another tab</p>
+              <p className="text-xs text-muted-foreground">
+                Duplicates the selected tab's visible layout into {selectedTab}.
+                {copiedSection ? ` Clipboard: ${copiedSection.title || copiedSection.key}.` : ""}
+              </p>
+            </div>
+            <div className="flex min-w-64 flex-wrap items-end gap-2">
+              {copySourceOptions.length ? (
+                <div className="min-w-44 flex-1">
+                  <Label>Source tab</Label>
+                  <Select value={selectedCopySource} onValueChange={setCopySourceTab}>
+                    <SelectTrigger><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      {copySourceOptions.map((tab) => (
+                        <SelectItem key={tab} value={tab}>{tab}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              ) : null}
+              <Button
+                variant="outline"
+                onClick={copyFromSelectedTab}
+                disabled={!selectedCopySource}
+              >
+                <Copy className="mr-2 h-4 w-4" /> Copy sections
+              </Button>
+              <Button
+                variant="outline"
+                onClick={pasteCopiedSection}
+                disabled={!copiedSection}
+              >
+                <ClipboardPaste className="mr-2 h-4 w-4" /> Paste section
+              </Button>
+            </div>
+          </div>
+
+          <TabsContent value={selectedTab} className="space-y-3">
+            {visibleRows.length === 0 ? (
+              <EmptyState
+                title="No sections in this tab"
+                hint={isInherited ? "Inherited content is filtered out by the current filters." : undefined}
+              />
+            ) : (
+              visibleRows.map((section, index) => (
+                  <Card
+                    key={section._id}
+                    draggable={!isInherited}
+                    onDragStart={() => setDraggingId(section._id)}
+                    onDragEnd={() => setDraggingId(null)}
+                    onDragOver={(event) => event.preventDefault()}
+                    onDrop={() => dropSection(section._id)}
+                    className={[
+                      section.archivedAt ? "opacity-70" : "",
+                      draggingId === section._id ? "border-primary" : "",
+                    ].filter(Boolean).join(" ")}
+                  >
                     <CardHeader className="pb-3">
                       <div className="flex items-start justify-between gap-3">
-                        <div>
+                        <div className="flex min-w-0 gap-3">
+                          <button
+                            type="button"
+                            aria-label="Drag to reorder"
+                            disabled={isInherited}
+                            className="mt-0.5 rounded-md p-1 text-muted-foreground disabled:cursor-not-allowed disabled:opacity-40"
+                          >
+                            <GripVertical className="h-4 w-4" />
+                          </button>
+                          <div className="min-w-0">
                           <CardTitle className="text-base">
                             <span className="mr-2 font-mono text-xs text-muted-foreground">
-                              #{section.sortOrder ?? section.sort_order ?? 0}
+                              #{index + 1}
                             </span>
                             {section.title || section.key}
                           </CardTitle>
                           <div className="mt-2 flex flex-wrap gap-1">
                             <Badge variant="outline">{kindLabel(section.kind)}</Badge>
+                            {isInherited ? <Badge variant="secondary">Inherited from All</Badge> : null}
                             <StatusBadge
                               value={
                                 section.archivedAt
@@ -558,10 +754,11 @@ export default function HomeSections() {
                               <Badge variant="secondary">scheduled</Badge>
                             ) : null}
                           </div>
+                          </div>
                         </div>
                         <Switch
                           checked={section.isActive ?? section.is_active ?? false}
-                          disabled={!!section.archivedAt}
+                          disabled={!!section.archivedAt || isInherited}
                           onCheckedChange={(isActive) =>
                             runMutation(
                               () => toggleSection({ id: section._id, isActive }),
@@ -593,21 +790,39 @@ export default function HomeSections() {
                         </Badge>
                       </div>
                       <div className="mt-4 flex flex-wrap gap-1">
-                        <Button size="sm" variant="outline" onClick={() => reorderWithinTab(section.tab, section._id, -1)}>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={isInherited || index === 0}
+                          onClick={() => reorderVisibleRows(section._id, -1)}
+                        >
                           ↑
                         </Button>
-                        <Button size="sm" variant="outline" onClick={() => reorderWithinTab(section.tab, section._id, 1)}>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={isInherited || index === visibleRows.length - 1}
+                          onClick={() => reorderVisibleRows(section._id, 1)}
+                        >
                           ↓
                         </Button>
                         <Button size="sm" variant="ghost" onClick={() => setPreview(section.preview)}>
                           <Eye className="mr-1 h-4 w-4" /> Preview
                         </Button>
-                        <Button size="sm" variant="ghost" onClick={() => openEdit(section)}>
+                        <Button size="sm" variant="ghost" disabled={isInherited} onClick={() => openEdit(section)}>
                           <Pencil className="mr-1 h-4 w-4" /> Edit
                         </Button>
                         <Button
                           size="sm"
                           variant="ghost"
+                          onClick={() => setCopiedSection(section)}
+                        >
+                          <Clipboard className="mr-1 h-4 w-4" /> Copy
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          disabled={isInherited}
                           onClick={() =>
                             runMutation(
                               () => duplicateSection({ id: section._id }),
@@ -621,6 +836,7 @@ export default function HomeSections() {
                           <Button
                             size="sm"
                             variant="ghost"
+                            disabled={isInherited}
                             onClick={() =>
                               runMutation(
                                 () => restoreSection({ id: section._id }),
@@ -633,7 +849,7 @@ export default function HomeSections() {
                         ) : (
                           <ConfirmButton
                             trigger={
-                              <Button size="sm" variant="ghost">
+                              <Button size="sm" variant="ghost" disabled={isInherited}>
                                 <Archive className="mr-1 h-4 w-4 text-destructive" /> Archive
                               </Button>
                             }
@@ -650,11 +866,10 @@ export default function HomeSections() {
                       </div>
                     </CardContent>
                   </Card>
-                ))}
-              </div>
-            </section>
-          ))}
-        </div>
+                ))
+            )}
+          </TabsContent>
+        </Tabs>
       )}
 
       {editorOpen && (
@@ -669,6 +884,55 @@ export default function HomeSections() {
           }}
           onSave={save}
         />
+      )}
+
+      {categoryOpen && (
+        <Dialog open onOpenChange={setCategoryOpen}>
+          <DialogContent className="max-w-xl">
+            <DialogHeader>
+              <DialogTitle>New category</DialogTitle>
+            </DialogHeader>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <TextField
+                label="Name *"
+                value={categoryForm.name}
+                onChange={(name) => setCategoryForm({ ...categoryForm, name })}
+              />
+              <TextField
+                label="Slug"
+                value={categoryForm.slug}
+                onChange={(slug) => setCategoryForm({ ...categoryForm, slug })}
+              />
+              <TextField
+                label="Section name"
+                value={categoryForm.sectionName}
+                onChange={(sectionName) => setCategoryForm({ ...categoryForm, sectionName })}
+              />
+              <TextField
+                label="Emoji"
+                value={categoryForm.iconEmoji}
+                onChange={(iconEmoji) => setCategoryForm({ ...categoryForm, iconEmoji })}
+              />
+              <ColorField
+                label="Background color"
+                value={categoryForm.backgroundColor}
+                onChange={(backgroundColor) => setCategoryForm({ ...categoryForm, backgroundColor })}
+              />
+              <TextField
+                label="Sort order"
+                type="number"
+                value={categoryForm.sortOrder}
+                onChange={(sortOrder) => setCategoryForm({ ...categoryForm, sortOrder })}
+              />
+            </div>
+            <DialogFooter>
+              <Button variant="outline" onClick={() => setCategoryOpen(false)}>Cancel</Button>
+              <Button onClick={saveCategory} disabled={!categoryForm.name.trim()}>
+                Create category
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
       )}
 
       {preview && (
@@ -763,8 +1027,8 @@ function SectionDialog({
 
           <EditorGroup title="Design">
             <TextField label="Layout variant" value={form.layoutVariant} onChange={(layoutVariant) => setForm({ ...form, layoutVariant })} />
-            <TextField label="Background color" value={form.backgroundColor} onChange={(backgroundColor) => setForm({ ...form, backgroundColor })} />
-            <TextField label="Text color" value={form.textColor} onChange={(textColor) => setForm({ ...form, textColor })} />
+            <ColorField label="Background color" value={form.backgroundColor} onChange={(backgroundColor) => setForm({ ...form, backgroundColor })} />
+            <ColorField label="Text color" value={form.textColor} onChange={(textColor) => setForm({ ...form, textColor })} />
             <TextField label="Image URL" value={form.imageUrl} onChange={(imageUrl) => setForm({ ...form, imageUrl })} />
             <TextField label="Icon emoji" value={form.iconEmoji} onChange={(iconEmoji) => setForm({ ...form, iconEmoji })} />
           </EditorGroup>
@@ -828,6 +1092,36 @@ function TextField({
     <div>
       <Label>{label}</Label>
       <Input type={type} value={value} onChange={(event) => onChange(event.target.value)} />
+    </div>
+  );
+}
+
+function ColorField({
+  label,
+  value,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+}) {
+  const pickerValue = /^#[0-9a-f]{6}$/i.test(value) ? value : "#ffffff";
+  return (
+    <div>
+      <Label>{label}</Label>
+      <div className="flex gap-2">
+        <Input
+          type="color"
+          value={pickerValue}
+          onChange={(event) => onChange(event.target.value)}
+          className="h-9 w-12 shrink-0 cursor-pointer p-1"
+        />
+        <Input
+          value={value}
+          placeholder="#FFFFFF"
+          onChange={(event) => onChange(event.target.value)}
+        />
+      </div>
     </div>
   );
 }
@@ -908,6 +1202,15 @@ function ConfigFieldInput({
     );
   }
   const displayValue = Array.isArray(value) ? value.join(", ") : value === undefined ? "" : String(value);
+  if (field.key.toLowerCase().includes("color")) {
+    return (
+      <ColorField
+        label={field.label}
+        value={displayValue}
+        onChange={onChange}
+      />
+    );
+  }
   return (
     <TextField
       label={field.label}

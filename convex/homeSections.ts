@@ -1,11 +1,12 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { v } from "convex/values";
 import { mutation, query } from "./functions";
-import { now } from "./helpers";
+import { now, slugify } from "./helpers";
 import type {
   BrandDoc,
   CategoryDoc,
   HomeSectionDoc,
+  HomeTabLayoutDoc,
   InventoryDoc,
   ProductDoc,
   PromotionDoc,
@@ -70,6 +71,15 @@ const sectionFields = {
   resolvedData: v.optional(v.any()),
 };
 
+const homeCategoryFields = {
+  name: v.string(),
+  slug: v.optional(v.string()),
+  section_name: v.optional(v.string()),
+  icon_emoji: v.optional(v.string()),
+  background_color: v.optional(v.string()),
+  sort_order: v.optional(v.number()),
+};
+
 const listArgs = {
   tab: v.optional(v.string()),
   store_id: v.optional(v.id("stores")),
@@ -100,11 +110,31 @@ type ResolvedSectionData = Record<string, unknown> & {
   inventorySummary?: Record<string, unknown>;
 };
 
+type ResolutionDataset =
+  | "products"
+  | "categories"
+  | "promotions"
+  | "stores"
+  | "skus"
+  | "inventory";
+
+type ResolutionContext = {
+  db: any;
+  required: Set<ResolutionDataset>;
+  products?: Promise<ProductDoc[]>;
+  categories?: Promise<CategoryDoc[]>;
+  promotions?: Promise<PromotionDoc[]>;
+  stores?: Promise<StoreDoc[]>;
+  skus?: Promise<SkuDoc[]>;
+  inventory?: Promise<InventoryDoc[]>;
+};
+
 const configRules: Record<string, Record<string, "string" | "number" | "boolean" | "string[]" | "number[]" | "object[]" | "any">> = {
   header: {
     showLocation: "boolean",
     showProfile: "boolean",
     showCart: "boolean",
+    backgroundColor: "string",
     backgroundImageUrl: "string",
     variant: "string",
   },
@@ -234,6 +264,10 @@ function normalizeSection(section: HomeSectionDoc): HomeSectionDoc {
 
 function isWireframeSection(section: HomeSectionDoc): boolean {
   return section.tab === "Wireframes" || section.key?.startsWith("wireframe_") === true;
+}
+
+function isAllTab(tab: string | undefined): boolean {
+  return !tab || tab.toLowerCase() === "all";
 }
 
 function sectionLimit(section: HomeSectionDoc): number | undefined {
@@ -514,38 +548,132 @@ function inventorySummary(rows: InventoryDoc[]) {
   };
 }
 
-async function resolveSection(
+function sectionResolutionDatasets(section: HomeSectionDoc, args: { store_id?: string }): Set<ResolutionDataset> {
+  const datasets = new Set<ResolutionDataset>();
+  const refs = referencedIds(section);
+  const kind = section.kind;
+
+  if (productSectionKinds.has(kind)) {
+    datasets.add("products");
+  }
+  if ((kind === "category_grid" || kind === "category_tabs") && refs.categoryIds.length) {
+    datasets.add("categories");
+  }
+  if ((kind === "promo_banner" || kind === "promo_carousel") && refs.promotionIds.length) {
+    datasets.add("promotions");
+  }
+  if (kind === "store_inventory_section") {
+    if (refs.storeIds.length || args.store_id) datasets.add("stores");
+    if (args.store_id || refs.storeIds.length) datasets.add("inventory");
+  }
+  if (args.store_id && productSectionKinds.has(kind)) {
+    datasets.add("skus");
+    datasets.add("inventory");
+  }
+
+  return datasets;
+}
+
+function buildResolutionContext(
   ctx: { db: any },
+  sections: HomeSectionDoc[],
+  args: { store_id?: string },
+): ResolutionContext {
+  const required = new Set<ResolutionDataset>();
+  for (const section of sections) {
+    for (const dataset of sectionResolutionDatasets(section, args)) {
+      required.add(dataset);
+    }
+  }
+  return { db: ctx.db, required };
+}
+
+function emptyResolvedData(): ResolvedSectionData {
+  return {
+    products: [],
+    categories: [],
+    promotions: [],
+    stores: [],
+    inventorySummary: undefined,
+  };
+}
+
+async function loadProducts(context: ResolutionContext): Promise<ProductDoc[]> {
+  if (!context.required.has("products")) return [];
+  context.products ??= context.db.query("products").collect() as Promise<ProductDoc[]>;
+  return await context.products;
+}
+
+async function loadCategories(context: ResolutionContext): Promise<CategoryDoc[]> {
+  if (!context.required.has("categories")) return [];
+  context.categories ??= context.db.query("categories").collect() as Promise<CategoryDoc[]>;
+  return await context.categories;
+}
+
+async function loadPromotions(context: ResolutionContext): Promise<PromotionDoc[]> {
+  if (!context.required.has("promotions")) return [];
+  context.promotions ??= context.db.query("promotions").collect() as Promise<PromotionDoc[]>;
+  return await context.promotions;
+}
+
+async function loadStores(context: ResolutionContext): Promise<StoreDoc[]> {
+  if (!context.required.has("stores")) return [];
+  context.stores ??= context.db.query("stores").collect() as Promise<StoreDoc[]>;
+  return await context.stores;
+}
+
+async function loadSkus(context: ResolutionContext): Promise<SkuDoc[]> {
+  if (!context.required.has("skus")) return [];
+  context.skus ??= context.db.query("skus").collect() as Promise<SkuDoc[]>;
+  return await context.skus;
+}
+
+async function loadInventory(context: ResolutionContext): Promise<InventoryDoc[]> {
+  if (!context.required.has("inventory")) return [];
+  context.inventory ??= context.db.query("inventory").collect() as Promise<InventoryDoc[]>;
+  return await context.inventory;
+}
+
+async function resolveSection(
+  context: ResolutionContext,
   section: HomeSectionDoc,
   args: { store_id?: string; now?: number },
 ) {
   const refs = referencedIds(section);
   const current = args.now ?? Date.now();
   const maxItems = sectionLimit(section);
+
+  const requiredForSection = sectionResolutionDatasets(section, args);
+  if (requiredForSection.size === 0) {
+    return emptyResolvedData();
+  }
+
   const [products, categories, promotions, stores, skus, inventory] = await Promise.all([
-    ctx.db.query("products").collect() as Promise<ProductDoc[]>,
-    ctx.db.query("categories").collect() as Promise<CategoryDoc[]>,
-    ctx.db.query("promotions").collect() as Promise<PromotionDoc[]>,
-    ctx.db.query("stores").collect() as Promise<StoreDoc[]>,
-    ctx.db.query("skus").collect() as Promise<SkuDoc[]>,
-    ctx.db.query("inventory").collect() as Promise<InventoryDoc[]>,
+    loadProducts(context),
+    loadCategories(context),
+    loadPromotions(context),
+    loadStores(context),
+    loadSkus(context),
+    loadInventory(context),
   ]);
 
   const categoryId = configString(section.config, "categoryId");
   const brandId = configString(section.config, "brandId");
-  let resolvedProducts = products.filter((p) => {
-    if (p.status !== "active") return false;
-    if (refs.productIds.length) return refs.productIds.includes(p._id);
-    if (categoryId && p.primary_category_id !== categoryId) return false;
-    if (brandId && p.brand_id !== brandId) return false;
-    if (refs.categoryIds.length && !refs.categoryIds.includes(p.primary_category_id)) return false;
-    if (refs.brandIds.length && p.brand_id && !refs.brandIds.includes(p.brand_id)) return false;
-    return productSectionKinds.has(section.kind);
-  });
+  let resolvedProducts = requiredForSection.has("products")
+    ? products.filter((p) => {
+        if (p.status !== "active") return false;
+        if (refs.productIds.length) return refs.productIds.includes(p._id);
+        if (categoryId && p.primary_category_id !== categoryId) return false;
+        if (brandId && p.brand_id !== brandId) return false;
+        if (refs.categoryIds.length && !refs.categoryIds.includes(p.primary_category_id)) return false;
+        if (refs.brandIds.length && p.brand_id && !refs.brandIds.includes(p.brand_id)) return false;
+        return productSectionKinds.has(section.kind);
+      })
+    : [];
   if (section.kind === "bestseller_grid" && !refs.productIds.length) {
     resolvedProducts.sort((a, b) => b.rating_count - a.rating_count);
   }
-  if (args.store_id && productSectionKinds.has(section.kind)) {
+  if (args.store_id && requiredForSection.has("skus") && requiredForSection.has("inventory")) {
     const activeSkuIdsByProduct = new Map<string, string[]>();
     for (const sku of skus) {
       if (!sku.is_active) continue;
@@ -570,20 +698,29 @@ async function resolveSection(
   }
   if (maxItems !== undefined) resolvedProducts = resolvedProducts.slice(0, maxItems);
 
-  const resolvedCategories = categories
-    .filter((c) => c.is_active && refs.categoryIds.includes(c._id))
-    .slice(0, maxItems ?? (refs.categoryIds.length || undefined));
-  const resolvedPromotions = promotions.filter(
-    (p) =>
-      p.is_active &&
-      p.starts_at <= current &&
-      p.ends_at > current &&
-      refs.promotionIds.includes(p._id),
-  );
+  const resolvedCategories = requiredForSection.has("categories")
+    ? categories
+        .filter((c) => c.is_active && refs.categoryIds.includes(c._id))
+        .slice(0, maxItems ?? (refs.categoryIds.length || undefined))
+    : [];
+  const resolvedPromotions = requiredForSection.has("promotions")
+    ? promotions.filter(
+        (p) =>
+          p.is_active &&
+          p.starts_at <= current &&
+          p.ends_at > current &&
+          refs.promotionIds.includes(p._id),
+      )
+    : [];
   const effectiveStoreIds = refs.storeIds.length ? refs.storeIds : args.store_id ? [args.store_id] : [];
-  const resolvedStores = stores.filter((s) => s.status === "active" && effectiveStoreIds.includes(s._id));
+  const resolvedStores = requiredForSection.has("stores")
+    ? stores.filter((s) => s.status === "active" && effectiveStoreIds.includes(s._id))
+    : [];
   const summaryStoreId = args.store_id ?? effectiveStoreIds[0];
-  const summaryRows = summaryStoreId ? inventory.filter((row) => row.store_id === summaryStoreId) : [];
+  const summaryRows =
+    summaryStoreId && requiredForSection.has("inventory")
+      ? inventory.filter((row) => row.store_id === summaryStoreId)
+      : [];
 
   return {
     products: resolvedProducts,
@@ -598,12 +735,12 @@ async function resolveSection(
 }
 
 async function responseForSection(
-  ctx: { db: any },
+  context: ResolutionContext,
   section: HomeSectionDoc,
   args: { store_id?: string; now?: number },
 ) {
   const normalized = normalizeSection(section);
-  const resolvedData = (normalized.resolvedData ?? await resolveSection(ctx, normalized, args)) as ResolvedSectionData;
+  const resolvedData = (await resolveSection(context, normalized, args)) as ResolvedSectionData;
   return {
     id: normalized._id,
     key: normalized.key,
@@ -613,9 +750,211 @@ async function responseForSection(
     tab: normalized.tab,
     sortOrder: normalized.sortOrder ?? 0,
     layoutVariant: normalized.layoutVariant,
+    backgroundColor: normalized.backgroundColor,
+    textColor: normalized.textColor,
+    imageUrl: normalized.imageUrl,
+    iconEmoji: normalized.iconEmoji,
+    maxItems: normalized.maxItems,
     config: normalized.config ?? {},
     resolvedData,
   };
+}
+
+function tabNamesFromSections(sections: HomeSectionDoc[]): string[] {
+  const names: string[] = [];
+  for (const section of sections) {
+    if (section.tab) names.push(section.tab);
+    if (section.kind === "category_tabs") {
+      const tabs = (section.config as Record<string, unknown> | undefined)?.tabs;
+      if (Array.isArray(tabs)) {
+        names.push(...tabs.filter((tab): tab is string => typeof tab === "string" && !!tab));
+      }
+    }
+  }
+  return unique(names);
+}
+
+async function layoutForTab(ctx: { db: any }, tab: string): Promise<HomeTabLayoutDoc | null> {
+  return await ctx.db
+    .query("home_tab_layouts")
+    .withIndex("by_tab", (q: any) => q.eq("tab", tab))
+    .first();
+}
+
+async function tabUsesOverride(
+  ctx: { db: any },
+  tab: string,
+  customSections?: HomeSectionDoc[],
+): Promise<boolean> {
+  if (isAllTab(tab)) return true;
+  const layout = await layoutForTab(ctx, tab);
+  if (layout) return layout.overrideEnabled;
+  if (customSections) return customSections.length > 0;
+  const existing = await ctx.db
+    .query("home_sections")
+    .withIndex("by_tab", (q: any) => q.eq("tab", tab))
+    .collect();
+  return existing.some((section: HomeSectionDoc) => !isWireframeSection(section));
+}
+
+function sectionWithDisplayTab(section: HomeSectionDoc, tab: string): HomeSectionDoc {
+  return isAllTab(tab) ? section : { ...section, tab };
+}
+
+function tabKeyPrefix(tab: string) {
+  return tab.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "tab";
+}
+
+async function setLayoutOverride(
+  ctx: { db: any },
+  tab: string,
+  overrideEnabled: boolean,
+  t: number,
+) {
+  const existingLayout = await layoutForTab(ctx, tab);
+  if (existingLayout) {
+    await ctx.db.patch(existingLayout._id as any, {
+      overrideEnabled,
+      updatedAt: t,
+    });
+    return existingLayout._id;
+  }
+  return await ctx.db.insert("home_tab_layouts", {
+    tab,
+    overrideEnabled,
+    createdAt: t,
+    updatedAt: t,
+  });
+}
+
+async function sectionsForCopySource(ctx: { db: any }, sourceTab: string) {
+  const normalizedSourceTab = sourceTab.trim();
+  if (!normalizedSourceTab) throw new Error("sourceTab is required");
+  const sourceUsesOverride = await tabUsesOverride(ctx, normalizedSourceTab);
+  const effectiveSourceTab =
+    !isAllTab(normalizedSourceTab) && !sourceUsesOverride ? "All" : normalizedSourceTab;
+  return ((await ctx.db
+    .query("home_sections")
+    .withIndex("by_tab", (q: any) => q.eq("tab", effectiveSourceTab))
+    .collect()) as HomeSectionDoc[])
+    .map(normalizeSection)
+    .filter((section) => !isWireframeSection(section) && !section.archivedAt)
+    .sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0));
+}
+
+async function duplicateSectionsIntoTab(
+  ctx: { db: any },
+  sourceSections: HomeSectionDoc[],
+  targetTab: string,
+) {
+  const targetSections = ((await ctx.db
+    .query("home_sections")
+    .withIndex("by_tab", (q: any) => q.eq("tab", targetTab))
+    .collect()) as HomeSectionDoc[])
+    .map(normalizeSection)
+    .filter((section) => !isWireframeSection(section) && !section.archivedAt);
+  const targetHasSections = targetSections.length > 0;
+  const baseSortOrder = targetHasSections
+    ? Math.max(...targetSections.map((section) => section.sortOrder ?? 0)) + 1
+    : 0;
+
+  let copied = 0;
+  const t = now();
+  for (const [index, source] of sourceSections.entries()) {
+    const sourceSortOrder = source.sortOrder ?? index;
+    const targetSortOrder = targetHasSections ? baseSortOrder + index : sourceSortOrder;
+    const keyBase = `${tabKeyPrefix(targetTab)}_${source.key}`;
+    let key = keyBase;
+    let suffix = 2;
+    while (await ctx.db.query("home_sections").withIndex("by_key", (q: any) => q.eq("key", key)).first()) {
+      key = `${keyBase}_${suffix}`;
+      suffix += 1;
+    }
+    const config =
+      source.kind === "category_tabs"
+        ? { ...(source.config ?? {}), defaultTab: targetTab }
+        : source.config;
+    const duplicate = {
+      key,
+      kind: source.kind,
+      title: source.title,
+      subtitle: source.subtitle,
+      tab: targetTab,
+      sortOrder: targetSortOrder,
+      sort_order: targetSortOrder,
+      isActive: source.isActive,
+      is_active: source.isActive,
+      allowEmpty: source.allowEmpty,
+      startsAt: source.startsAt,
+      endsAt: source.endsAt,
+      timezone: source.timezone,
+      visibleDaysOfWeek: source.visibleDaysOfWeek,
+      visibleTimeWindows: source.visibleTimeWindows,
+      holidayTags: source.holidayTags,
+      seasonalTags: source.seasonalTags,
+      storeIds: source.storeIds,
+      cityIds: source.cityIds,
+      regionIds: source.regionIds,
+      customerSegments: source.customerSegments,
+      appVersion: source.appVersion,
+      minAppVersion: source.minAppVersion,
+      maxAppVersion: source.maxAppVersion,
+      layoutVariant: source.layoutVariant,
+      backgroundColor: source.backgroundColor,
+      textColor: source.textColor,
+      imageUrl: source.imageUrl,
+      iconEmoji: source.iconEmoji,
+      maxItems: source.maxItems,
+      productIds: source.productIds,
+      categoryIds: source.categoryIds,
+      promotionIds: source.promotionIds,
+      brandIds: source.brandIds,
+      config,
+      resolvedData: source.resolvedData,
+      createdAt: t,
+      updatedAt: t,
+    } as Partial<HomeSectionDoc>;
+    const section = mergeSection(null, duplicate);
+    await validateSection(ctx, section);
+    const id = await ctx.db.insert("home_sections", cleanPatch(section as any) as any);
+    await ctx.db.patch(id, { id, updatedAt: now() });
+    copied += 1;
+  }
+  return copied;
+}
+
+async function duplicateSectionIntoTab(
+  ctx: { db: any },
+  source: HomeSectionDoc,
+  targetTab: string,
+) {
+  return await duplicateSectionsIntoTab(ctx, [normalizeSection(source)], targetTab);
+}
+
+async function appendCategoryToTabSections(
+  ctx: { db: any },
+  category: CategoryDoc,
+  tabName: string,
+) {
+  const sections = ((await ctx.db.query("home_sections").collect()) as HomeSectionDoc[])
+    .map(normalizeSection)
+    .filter((section) => section.kind === "category_tabs" && !isWireframeSection(section));
+  for (const section of sections) {
+    const config = { ...(section.config ?? {}) } as Record<string, unknown>;
+    const configTabs = Array.isArray(config.tabs)
+      ? config.tabs.filter((tab): tab is string => typeof tab === "string")
+      : [];
+    const tabs = unique([...configTabs, tabName]);
+    const categoryIds = unique([...(section.categoryIds ?? []), category._id]);
+    await ctx.db.patch(section._id as any, {
+      categoryIds,
+      config: {
+        ...config,
+        tabs,
+      },
+      updatedAt: now(),
+    });
+  }
 }
 
 export const tabs = query({
@@ -627,7 +966,44 @@ export const tabs = query({
       .filter((section) => !isWireframeSection(section))
       .filter((section) => isSectionScheduledNow(section, current))
       .sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0));
-    return unique(sections.map((section) => section.tab));
+    return tabNamesFromSections(sections);
+  },
+});
+
+export const adminTabs = query({
+  args: {},
+  handler: async (ctx) => {
+    const sections = ((await ctx.db.query("home_sections").collect()) as HomeSectionDoc[])
+      .map(normalizeSection)
+      .filter((section) => !isWireframeSection(section))
+      .sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0));
+    const layouts = (await ctx.db.query("home_tab_layouts").collect()) as HomeTabLayoutDoc[];
+    return tabNamesFromSections([
+      ...sections,
+      ...layouts.map(
+        (layout) =>
+          ({
+            _id: layout._id,
+            _creationTime: layout._creationTime,
+            kind: "spacer",
+            tab: layout.tab,
+          }) as HomeSectionDoc,
+      ),
+    ]);
+  },
+});
+
+export const tabLayouts = query({
+  args: {},
+  handler: async (ctx) => {
+    return ((await ctx.db.query("home_tab_layouts").collect()) as HomeTabLayoutDoc[])
+      .sort((a, b) => a.tab.localeCompare(b.tab))
+      .map((layout) => ({
+        id: layout._id,
+        tab: layout.tab,
+        overrideEnabled: layout.overrideEnabled,
+        updatedAt: layout.updatedAt,
+      }));
   },
 });
 
@@ -636,15 +1012,26 @@ export const list = query({
   handler: async (ctx, args) => {
     const limit = Math.max(0, args.limit ?? 50);
     const offset = Math.max(0, args.offset ?? 0);
-    const sections = ((await ctx.db.query("home_sections").collect()) as HomeSectionDoc[])
+    const allSections = ((await ctx.db.query("home_sections").collect()) as HomeSectionDoc[])
       .map(normalizeSection)
       .filter((section) => !isWireframeSection(section))
-      .filter((section) => (!args.tab || section.tab === args.tab) && isSectionVisible(section, args))
       .sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0));
+    const requestedTab = args.tab;
+    const customSections = requestedTab
+      ? allSections.filter((section) => section.tab === requestedTab)
+      : allSections;
+    const effectiveTab =
+      requestedTab && !isAllTab(requestedTab) && !(await tabUsesOverride(ctx, requestedTab, customSections))
+        ? "All"
+        : requestedTab;
+    const sections = allSections
+      .filter((section) => (!effectiveTab || section.tab === effectiveTab) && isSectionVisible(section, args))
+      .map((section) => (requestedTab && effectiveTab === "All" ? sectionWithDisplayTab(section, requestedTab) : section));
 
+    const resolutionContext = buildResolutionContext(ctx, sections, args);
     const visibleResponses = [];
     for (const section of sections) {
-      const response = await responseForSection(ctx, section, args);
+      const response = await responseForSection(resolutionContext, section, args);
       if (
         productSectionKinds.has(section.kind) &&
         !section.allowEmpty &&
@@ -684,7 +1071,9 @@ export const get = query({
   handler: async (ctx, args) => {
     const section = (await ctx.db.get(args.id)) as HomeSectionDoc | null;
     if (!section) throw new Error("Home section not found");
-    return await responseForSection(ctx, normalizeSection(section), {});
+    const normalized = normalizeSection(section);
+    const resolutionContext = buildResolutionContext(ctx, [normalized], {});
+    return await responseForSection(resolutionContext, normalized, {});
   },
 });
 
@@ -722,10 +1111,12 @@ export const adminList = query({
     if (!args.state || args.state === "all") rows = rows.filter((s) => !s.archivedAt);
     rows.sort((a, b) => a.tab.localeCompare(b.tab) || (a.sortOrder ?? 0) - (b.sortOrder ?? 0));
     const data = [];
-    for (const section of rows.slice(offset, offset + limit)) {
+    const page = rows.slice(offset, offset + limit);
+    const resolutionContext = buildResolutionContext(ctx, page, {});
+    for (const section of page) {
       data.push({
         ...section,
-        preview: await responseForSection(ctx, section, {}),
+        preview: await responseForSection(resolutionContext, section, {}),
       });
     }
     return { data, total: rows.length, limit, offset };
@@ -792,6 +1183,107 @@ export const reorderSections = mutation({
       await ctx.db.patch(id, { sortOrder, sort_order: sortOrder, updatedAt: now() });
     }
     return args.orderedIds;
+  },
+});
+
+export const setTabOverride = mutation({
+  args: { tab: v.string(), overrideEnabled: v.boolean() },
+  handler: async (ctx, args) => {
+    const tab = args.tab.trim();
+    if (!tab) throw new Error("tab is required");
+    if (isAllTab(tab)) throw new Error("The All tab always owns the default layout");
+
+    const t = now();
+    await setLayoutOverride(ctx, tab, args.overrideEnabled, t);
+
+    if (!args.overrideEnabled) return { tab, overrideEnabled: false, copied: 0 };
+
+    const existingSections = ((await ctx.db
+      .query("home_sections")
+      .withIndex("by_tab", (q: any) => q.eq("tab", tab))
+      .collect()) as HomeSectionDoc[]).filter((section) => !isWireframeSection(section));
+    if (existingSections.length) return { tab, overrideEnabled: true, copied: 0 };
+
+    const sourceSections = ((await ctx.db
+      .query("home_sections")
+      .withIndex("by_tab", (q: any) => q.eq("tab", "All"))
+      .collect()) as HomeSectionDoc[])
+      .map(normalizeSection)
+      .filter((section) => !isWireframeSection(section) && !section.archivedAt)
+      .sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0));
+
+    const copied = await duplicateSectionsIntoTab(ctx, sourceSections, tab);
+    return { tab, overrideEnabled: true, copied };
+  },
+});
+
+export const copySectionsFromTab = mutation({
+  args: { sourceTab: v.string(), targetTab: v.string() },
+  handler: async (ctx, args) => {
+    const sourceTab = args.sourceTab.trim();
+    const targetTab = args.targetTab.trim();
+    if (!sourceTab) throw new Error("sourceTab is required");
+    if (!targetTab) throw new Error("targetTab is required");
+    if (sourceTab === targetTab) throw new Error("Choose a different source tab");
+
+    const sourceSections = await sectionsForCopySource(ctx, sourceTab);
+    if (!sourceSections.length) throw new Error(`No sections found in "${sourceTab}"`);
+
+    const copied = await duplicateSectionsIntoTab(ctx, sourceSections, targetTab);
+    if (!isAllTab(targetTab)) {
+      await setLayoutOverride(ctx, targetTab, true, now());
+    }
+    return { sourceTab, targetTab, copied };
+  },
+});
+
+export const pasteSectionToTab = mutation({
+  args: { sectionId: v.id("home_sections"), targetTab: v.string() },
+  handler: async (ctx, args) => {
+    const targetTab = args.targetTab.trim();
+    if (!targetTab) throw new Error("targetTab is required");
+    const source = (await ctx.db.get(args.sectionId)) as HomeSectionDoc | null;
+    if (!source || isWireframeSection(source)) throw new Error("Section not found");
+    if (source.archivedAt) throw new Error("Archived sections cannot be pasted");
+
+    const copied = await duplicateSectionIntoTab(ctx, source, targetTab);
+    if (!isAllTab(targetTab)) {
+      await setLayoutOverride(ctx, targetTab, true, now());
+    }
+    return { sectionId: args.sectionId, targetTab, copied };
+  },
+});
+
+export const createHomeCategory = mutation({
+  args: homeCategoryFields,
+  handler: async (ctx, args) => {
+    const name = args.name.trim();
+    if (!name) throw new Error("name is required");
+    const slug = args.slug?.trim() || slugify(name);
+    if (!slug) throw new Error("Category needs a name or slug");
+    const duplicate = await ctx.db
+      .query("categories")
+      .withIndex("by_slug", (q: any) => q.eq("slug", slug))
+      .first();
+    if (duplicate) throw new Error(`Slug "${slug}" is already used`);
+
+    const categoryId = await ctx.db.insert("categories", {
+      name,
+      slug,
+      section_name: args.section_name?.trim() || undefined,
+      icon_emoji: args.icon_emoji?.trim() || undefined,
+      background_color: args.background_color?.trim() || undefined,
+      sort_order: args.sort_order ?? 0,
+      is_active: true,
+    });
+    const category = (await ctx.db.get(categoryId)) as CategoryDoc | null;
+    if (!category) throw new Error("Category was not created");
+
+    await appendCategoryToTabSections(ctx, category, name);
+    if (!isAllTab(name)) {
+      await setLayoutOverride(ctx, name, false, now());
+    }
+    return { id: categoryId, tab: name };
   },
 });
 

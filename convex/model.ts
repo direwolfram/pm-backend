@@ -308,6 +308,13 @@ export interface HomeSectionDoc extends BaseDoc {
   is_active?: boolean;
 }
 
+export interface HomeTabLayoutDoc extends BaseDoc {
+  tab: string;
+  overrideEnabled: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+
 export interface HomeSectionResponse {
   id: string;
   key: string;
@@ -317,6 +324,11 @@ export interface HomeSectionResponse {
   tab: string;
   sortOrder: number;
   layoutVariant?: string;
+  backgroundColor?: string;
+  textColor?: string;
+  imageUrl?: string;
+  iconEmoji?: string;
+  maxItems?: number;
   config: Record<string, unknown>;
   resolvedData: Record<string, unknown> & {
     products?: Array<ProductDoc | Record<string, unknown>>;
