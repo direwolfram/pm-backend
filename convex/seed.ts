@@ -1,5 +1,13 @@
 import { mutation } from "./functions";
 import { deriveInventoryStatus, now, orderNumber, slugify } from "./helpers";
+import {
+  CUSTOMER_ORDER_STATS_VERSION,
+  customerSearchText,
+  orderCountsForCustomerStats,
+} from "./lib/customerAggregates";
+import { PRODUCT_LIST_SUMMARY_VERSION } from "./lib/productListSummaries";
+import { ORDER_SUMMARY_VERSION, orderSearchText } from "./orders";
+import type { CustomerDoc, OrderDoc } from "./model";
 
 /**
  * Seeds a sample Philippine grocery catalog: stores, zones, brands,
@@ -327,6 +335,9 @@ export const run = mutation({
           sort_order: mediaIndex,
         });
       }
+      let totalStock = 0;
+      let defaultSkuId: string | undefined;
+      let defaultPrice: number | undefined;
       for (const [i, s] of p.skus.entries()) {
         const skuId = (await ctx.db.insert("skus", {
           product_id: pid,
@@ -337,17 +348,31 @@ export const run = mutation({
           is_active: true,
         })) as string;
         if (i === 0) firstSkuByProduct[pid] = skuId;
-        await ctx.db.insert("prices", {
+        const priceId = await ctx.db.insert("prices", {
           sku_id: skuId,
+          product_id: pid,
           currency: "PHP",
           sale_price: s.price,
           compare_at_price: s.compareAt,
           starts_at: t - day,
+          priceSummaryVersion: 2,
         });
+        await ctx.db.insert("pricesActive", {
+          sku_id: skuId,
+          price_id: priceId,
+          product_id: pid,
+          sale_price: s.price,
+          starts_at: t - day,
+        });
+        if (s.isDefault) {
+          defaultSkuId = skuId;
+          defaultPrice = s.price;
+        }
         for (const [storeId, qty] of [
           [storeMakati, s.stockMakati],
           [storeQC, s.stockQC],
         ] as const) {
+          totalStock += qty;
           await ctx.db.insert("inventory", {
             sku_id: skuId,
             store_id: storeId,
@@ -358,10 +383,25 @@ export const run = mutation({
               quantityAvailable: qty,
               lowStockThreshold: 5,
             }),
+            productId: pid,
+            skuCode: s.code,
+            variantLabel: s.label,
+            productName: p.name,
+            storeName: storeId === storeMakati ? "PocketMart Makati Central" : "PocketMart Quezon City",
             updated_at: t,
+            storeInventorySummaryVersion: 1,
           });
         }
       }
+      // Maintain the product list summary inline so seeded rows never need
+      // a backfill pass.
+      await ctx.db.patch(pid as any, {
+        sku_count: p.skus.length,
+        default_sku_id: defaultSkuId,
+        default_price: defaultPrice,
+        total_stock: totalStock,
+        productListSummaryVersion: PRODUCT_LIST_SUMMARY_VERSION,
+      });
     }
 
     // similar products: pair the soft drinks, pair the noodles
@@ -755,6 +795,14 @@ export const run = mutation({
         status: "active",
         referral_code: c.code,
         marketing_opt_in: i !== 2,
+        search_text: customerSearchText({
+          display_name: c.name,
+          phone_country_code: "+63",
+          phone_number: c.phone,
+        }),
+        order_count: 0,
+        total_spend: 0,
+        customerStatsVersion: CUSTOMER_ORDER_STATS_VERSION,
         created_at: t - (30 - i * 5) * day,
         updated_at: t,
       })) as string;
@@ -873,6 +921,18 @@ export const run = mutation({
         });
       }
       const deliveryFee = 29;
+      const customerDoc = {
+        _id: customerIds[o.customer],
+        _creationTime: t,
+        phone_country_code: "+63",
+        phone_number: customerSeed[o.customer]!.phone,
+        display_name: customerSeed[o.customer]!.name,
+        status: "active",
+        marketing_opt_in: true,
+        created_at: t,
+        updated_at: t,
+      } as CustomerDoc;
+      const itemCount = lineItems.reduce((sum, li) => sum + li.qty, 0);
       const oid = (await ctx.db.insert("orders", {
         order_number: orderNumber(1000 + i),
         customer_id: customerIds[o.customer],
@@ -886,10 +946,33 @@ export const run = mutation({
         discount_amount: 0,
         delivery_fee_amount: deliveryFee,
         total_amount: subtotal + deliveryFee,
+        item_count: itemCount,
+        order_search_text: orderSearchText(
+          {
+            order_number: orderNumber(1000 + i),
+          } as OrderDoc,
+          customerDoc,
+        ),
+        orderSummaryVersion: ORDER_SUMMARY_VERSION,
         placed_at: t - o.placedDaysAgo * day - i * 3600_000,
         estimated_delivery_at: t - o.placedDaysAgo * day + 30 * 60_000,
         delivered_at: o.status === "delivered" ? t - o.placedDaysAgo * day + 25 * 60_000 : undefined,
       })) as string;
+      // Maintain customer aggregates inline (seed writes bypass the public
+      // order mutations).
+      const seededOrder = {
+        status: o.status,
+        total_amount: subtotal + deliveryFee,
+      } as OrderDoc;
+      const stats = orderCountsForCustomerStats(seededOrder);
+      const customerRow = (await ctx.db.get(
+        customerIds[o.customer] as any,
+      )) as CustomerDoc | null;
+      await ctx.db.patch(customerIds[o.customer] as any, {
+        order_count: (customerRow?.order_count ?? 0) + stats.order_count,
+        total_spend: (customerRow?.total_spend ?? 0) + stats.total_spend,
+        customerStatsVersion: CUSTOMER_ORDER_STATS_VERSION,
+      });
       for (const li of lineItems) {
         await ctx.db.insert("order_items", {
           order_id: oid,

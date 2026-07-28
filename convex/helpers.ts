@@ -44,6 +44,46 @@ export function paginate<T>(
 export const MAX_PAGE_LIMIT = 200;
 export const MAX_COMPAT_OFFSET = 200;
 
+/**
+ * Cursors are scoped to a query fingerprint (query name + filters + search
+ * term). A continuation cursor is only valid for the exact query that
+ * produced it; reusing it against a different filter set fails with a
+ * predictable error instead of silently continuing a different query.
+ */
+export function cursorFingerprint(scope: Record<string, unknown>) {
+  return JSON.stringify(scope, Object.keys(scope).sort());
+}
+
+export function wrapCursor(scope: Record<string, unknown>, cursor: string) {
+  return JSON.stringify({ f: cursorFingerprint(scope), c: cursor });
+}
+
+export function unwrapCursor(
+  scope: Record<string, unknown>,
+  cursor?: string | null,
+) {
+  if (cursor === undefined || cursor === null) return null;
+  let parsed: { f?: unknown; c?: unknown };
+  try {
+    parsed = JSON.parse(cursor);
+  } catch {
+    throw new Error(
+      "Invalid cursor: request a fresh first page without a cursor",
+    );
+  }
+  if (
+    typeof parsed !== "object" ||
+    parsed === null ||
+    typeof parsed.c !== "string" ||
+    parsed.f !== cursorFingerprint(scope)
+  ) {
+    throw new Error(
+      "Invalid cursor: it does not match this query's filters or search term",
+    );
+  }
+  return parsed.c;
+}
+
 export function boundedPageArgs(opts?: { limit?: number; offset?: number }) {
   const offset = Math.max(opts?.offset ?? 0, 0);
   if (offset > MAX_COMPAT_OFFSET) {
@@ -106,6 +146,12 @@ export function orderNumber(seq: number): string {
 export function assertNonNegative(value: number, field: string) {
   if (!Number.isFinite(value) || value < 0) {
     throw new Error(`${field} must be a non-negative number`);
+  }
+}
+
+export function assertPositiveQuantity(quantity: number) {
+  if (!Number.isFinite(quantity) || quantity <= 0) {
+    throw new Error("quantity must be a positive finite number");
   }
 }
 

@@ -1,7 +1,7 @@
 import { v } from "convex/values";
 import { anyApi } from "convex/server";
 import { query, mutation, internalMutation } from "./functions";
-import { boundedPageArgs, now, pageResponse, slugify } from "./helpers";
+import { boundedPageArgs, now, pageResponse, slugify, unwrapCursor, wrapCursor } from "./helpers";
 import {
   activePriceForSku,
   computeProductListSummary,
@@ -51,6 +51,21 @@ function productListIndex(args: {
   return "by_updated";
 }
 
+function productListScope(args: {
+  search?: string;
+  status?: ProductDoc["status"];
+  category_id?: string;
+  brand_id?: string;
+}) {
+  return {
+    q: "products.list",
+    search: args.search?.trim().toLowerCase() ?? "",
+    status: args.status ?? "",
+    category_id: args.category_id ?? "",
+    brand_id: args.brand_id ?? "",
+  };
+}
+
 async function pageProducts(
   ctx: { db: any },
   args: {
@@ -67,8 +82,11 @@ async function pageProducts(
   const limit = pageArgs.limit;
   const fetchLimit = limit + pageArgs.offset + 1;
   const useOffset = args.offset !== undefined && args.cursor === undefined;
+  const scope = productListScope(args);
+  const cursor = unwrapCursor(scope, args.cursor);
+  const isSearch = !!args.search?.trim();
   let builder;
-  if (args.search?.trim()) {
+  if (isSearch) {
     builder = ctx.db.query("products").withSearchIndex("search_products", (q: any) => {
       let s = q.search("name", args.search!.trim());
       if (args.status) s = s.eq("status", args.status);
@@ -103,13 +121,23 @@ async function pageProducts(
         return q;
       });
   }
-  const ordered = builder.order("desc");
+  // Search indexes are always in relevance order and cannot be re-ordered.
+  const ordered = isSearch ? builder : builder.order("desc");
   if (!useOffset) {
     const result = await ordered.paginate({
       numItems: limit,
-      cursor: args.cursor ?? null,
+      cursor,
     });
-    return { rows: result.page as ProductDoc[], pagination: result };
+    return {
+      rows: result.page as ProductDoc[],
+      pagination: {
+        isDone: result.isDone,
+        nextCursor:
+          result.isDone || !result.continueCursor
+            ? null
+            : wrapCursor(scope, result.continueCursor),
+      },
+    };
   }
   const rows = (await ordered.take(fetchLimit)) as ProductDoc[];
   return {
@@ -440,23 +468,33 @@ export const update = mutation({
 });
 
 export const backfillProductListSummaries = internalMutation({
-  args: { limit: v.optional(v.number()) },
+  args: { limit: v.optional(v.number()), cursor: v.optional(v.string()) },
   handler: async (ctx, args) => {
     const limit = Math.min(Math.max(args.limit ?? 50, 1), 200);
-    const products = (await ctx.db
+    const result = await ctx.db
       .query("products")
       .withIndex("by_product_list_summary_version", (q) =>
-        q.eq("productListSummaryVersion", undefined),
+        // Stale means missing (undefined) OR any version older than current.
+        q.lt("productListSummaryVersion", PRODUCT_LIST_SUMMARY_VERSION),
       )
-      .take(limit)) as ProductDoc[];
+      .order("asc")
+      .paginate({ numItems: limit, cursor: args.cursor ?? null });
     let patched = 0;
-    for (const product of products) {
+    for (const product of result.page as ProductDoc[]) {
       if (await recomputeProductListSummary(ctx, product._id)) patched += 1;
     }
+    if (!result.isDone) {
+      await ctx.scheduler.runAfter(
+        0,
+        anyApi.products.backfillProductListSummaries,
+        { limit, cursor: result.continueCursor },
+      );
+    }
     return {
-      processed: products.length,
+      processed: result.page.length,
       patched,
-      remainingMayExist: products.length >= limit,
+      nextCursor: result.continueCursor,
+      remainingMayExist: !result.isDone,
     };
   },
 });
@@ -466,7 +504,7 @@ export const remove = mutation({
   args: { id: v.id("products") },
   handler: async (ctx, args) => {
     const product = (await ctx.db.get(args.id)) as ProductDoc | null;
-    if (!product) return;
+    if (!product) return { id: args.id, deleting: true };
     const orderItem = await ctx.db
       .query("order_items")
       .withIndex("by_product", (q) => q.eq("product_id", args.id))
@@ -482,7 +520,7 @@ export const remove = mutation({
     await ctx.scheduler.runAfter(0, anyApi.products.continueProductDelete, {
       id: args.id,
     });
-    return args.id;
+    return { id: args.id, deleting: true };
   },
 });
 
@@ -761,15 +799,36 @@ export const setSimilar = mutation({
     const product = (await ctx.db.get(args.product_id)) as ProductDoc | null;
     if (!product) throw new Error("Product not found");
     if (product.deleting_at) throw new Error("Product is being deleted");
-    const existing = await ctx.db
+    // Hard cardinality cap keeps replacement a single bounded transaction
+    // (reads + writes stay <= 2 * SIMILAR_PRODUCT_LIMIT + a constant).
+    if (args.similar_product_ids.length > SIMILAR_PRODUCT_LIMIT) {
+      throw new Error(
+        `A product can have at most ${SIMILAR_PRODUCT_LIMIT} similar products`,
+      );
+    }
+    const targets = new Set(
+      args.similar_product_ids.filter((sid) => sid !== args.product_id),
+    );
+    const existing = (await ctx.db
       .query("product_similar_products")
       .withIndex("by_product", (q) => q.eq("product_id", args.product_id))
-      .collect();
-    for (const p of existing) await ctx.db.delete(p._id);
-    for (const sid of args.similar_product_ids) {
-      if (sid === args.product_id) continue;
+      .take(SIMILAR_PRODUCT_LIMIT + 1)) as {
+      _id: string;
+      similar_product_id: string;
+    }[];
+    const existingTargets = new Set(existing.map((p) => p.similar_product_id));
+    for (const pair of existing) {
+      if (!targets.has(pair.similar_product_id as (typeof args.product_id))) {
+        await ctx.db.delete(pair._id as any);
+      }
+    }
+    for (const sid of targets) {
+      if (existingTargets.has(sid)) continue;
       const similar = (await ctx.db.get(sid)) as ProductDoc | null;
-      if (!similar || similar.deleting_at) continue;
+      if (!similar) throw new Error("Similar product not found");
+      if (similar.deleting_at) {
+        throw new Error("Similar product is being deleted");
+      }
       await ctx.db.insert("product_similar_products", {
         product_id: args.product_id,
         similar_product_id: sid,

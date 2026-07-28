@@ -1,15 +1,10 @@
 import { v } from "convex/values";
-import { query, mutation } from "./functions";
-import { paginate } from "./helpers";
+import { anyApi } from "convex/server";
+import { query, mutation, internalMutation } from "./functions";
+import { now, paginate } from "./helpers";
 import type { BrandDoc } from "./model";
 
 const CASCADE_BATCH_LIMIT = 100;
-
-function assertBoundedCascade(rows: unknown[], label: string) {
-  if (rows.length > CASCADE_BATCH_LIMIT) {
-    throw new Error(`${label} has too many dependents; run a batched cleanup`);
-  }
-}
 
 export const list = query({
   args: {
@@ -86,24 +81,60 @@ export const update = mutation({
   },
 });
 
-/** SQL behavior: products.brand_id references brands on delete set null. */
+/**
+ * SQL behavior: products.brand_id references brands on delete set null;
+ * promotion targets cascade. Bounded, resumable internal continuation.
+ */
 export const remove = mutation({
   args: { id: v.id("brands") },
   handler: async (ctx, args) => {
+    const brand = (await ctx.db.get(args.id)) as BrandDoc | null;
+    if (!brand) return { id: args.id, deleting: true };
+    if (!brand.deleting_at) {
+      await ctx.db.patch(args.id, { deleting_at: now() });
+    }
+    await ctx.scheduler.runAfter(0, anyApi.brands.continueBrandDelete, {
+      id: args.id,
+    });
+    return { id: args.id, deleting: true };
+  },
+});
+
+export const continueBrandDelete = internalMutation({
+  args: { id: v.id("brands") },
+  handler: async (ctx, args) => {
+    const brand = (await ctx.db.get(args.id)) as BrandDoc | null;
+    if (!brand) return { done: true, deleted: true };
+    let operations = 0;
     const products = await ctx.db
       .query("products")
       .withIndex("by_brand", (q) => q.eq("brand_id", args.id))
-      .take(CASCADE_BATCH_LIMIT + 1);
-    assertBoundedCascade(products, "Brand");
+      .take(CASCADE_BATCH_LIMIT);
     for (const p of products) {
       await ctx.db.patch(p._id, { brand_id: undefined });
+      operations += 1;
+    }
+    if (operations >= CASCADE_BATCH_LIMIT) {
+      await ctx.scheduler.runAfter(0, anyApi.brands.continueBrandDelete, {
+        id: args.id,
+      });
+      return { done: false, operations };
     }
     const targets = await ctx.db
       .query("promotion_targets")
       .withIndex("by_brand", (q) => q.eq("brand_id", args.id))
-      .take(CASCADE_BATCH_LIMIT + 1);
-    assertBoundedCascade(targets, "Brand promotion cleanup");
-    for (const t of targets) await ctx.db.delete(t._id);
+      .take(CASCADE_BATCH_LIMIT - operations);
+    for (const t of targets) {
+      await ctx.db.delete(t._id);
+      operations += 1;
+    }
+    if (operations >= CASCADE_BATCH_LIMIT) {
+      await ctx.scheduler.runAfter(0, anyApi.brands.continueBrandDelete, {
+        id: args.id,
+      });
+      return { done: false, operations };
+    }
     await ctx.db.delete(args.id);
+    return { done: true, operations };
   },
 });

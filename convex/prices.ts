@@ -1,10 +1,63 @@
 import { v } from "convex/values";
-import { query, mutation } from "./functions";
+import { anyApi } from "convex/server";
+import { query, mutation, internalMutation } from "./functions";
 import { assertPricePair, now } from "./helpers";
-import { recomputeProductListSummary } from "./lib/productListSummaries";
+import {
+  PRICE_ACTIVE_LOOKAHEAD_MS,
+  priceIsActiveMaterializable,
+  recomputeProductListSummary,
+} from "./lib/productListSummaries";
 import type { PriceDoc } from "./model";
 
-const PRICE_SUMMARY_VERSION = 1;
+const PRICE_SUMMARY_VERSION = 2;
+const PRICE_TRANSITION_BATCH_LIMIT = 200;
+
+/**
+ * Keep the pricesActive mirror row for one price in sync. Returns true when
+ * the mirror was inserted, patched, or deleted.
+ */
+async function syncPriceActiveRow(
+  ctx: { db: any },
+  price: PriceDoc,
+  t: number,
+) {
+  const rows = (await ctx.db
+    .query("pricesActive")
+    .withIndex("by_sku", (q: any) => q.eq("sku_id", price.sku_id))
+    .collect()) as { _id: string; price_id: string }[];
+  const mirror = rows.find((row) => row.price_id === price._id);
+  if (priceIsActiveMaterializable(price, t)) {
+    const payload = {
+      sku_id: price.sku_id,
+      price_id: price._id,
+      product_id: price.product_id,
+      store_id: price.store_id,
+      sale_price: price.sale_price,
+      starts_at: price.starts_at,
+      ends_at: price.ends_at,
+    };
+    if (mirror) {
+      await ctx.db.patch(mirror._id, payload);
+    } else {
+      await ctx.db.insert("pricesActive", payload);
+    }
+    return true;
+  }
+  if (mirror) {
+    await ctx.db.delete(mirror._id);
+    return true;
+  }
+  return false;
+}
+
+async function removePriceActiveRow(ctx: { db: any }, price: PriceDoc) {
+  const rows = (await ctx.db
+    .query("pricesActive")
+    .withIndex("by_sku", (q: any) => q.eq("sku_id", price.sku_id))
+    .collect()) as { _id: string; price_id: string }[];
+  const mirror = rows.find((row) => row.price_id === price._id);
+  if (mirror) await ctx.db.delete(mirror._id);
+}
 
 export async function listBySkuHandler(
   ctx: { db: any },
@@ -83,8 +136,13 @@ export const upsert = mutation({
       throw new Error("Product is being deleted");
     }
     const store = args.store_id
-      ? ((await ctx.db.get(args.store_id)) as { name?: string } | null)
+      ? ((await ctx.db.get(args.store_id)) as {
+          name?: string;
+          deleting_at?: number;
+        } | null)
       : null;
+    if (args.store_id && !store) throw new Error("Store not found");
+    if (store?.deleting_at) throw new Error("Store is being deleted");
     if (args.id) {
       const existing = (await ctx.db.get(args.id)) as PriceDoc | null;
       if (!existing) throw new Error("Price not found");
@@ -103,6 +161,11 @@ export const upsert = mutation({
         ends_at: args.ends_at,
         priceSummaryVersion: PRICE_SUMMARY_VERSION,
       });
+      await syncPriceActiveRow(
+        ctx,
+        { ...existing, ...(await ctx.db.get(args.id)) } as PriceDoc,
+        now(),
+      );
       await recomputeProductListSummary(
         ctx,
         (sku as { product_id: string }).product_id,
@@ -121,6 +184,11 @@ export const upsert = mutation({
       ends_at: args.ends_at,
       priceSummaryVersion: PRICE_SUMMARY_VERSION,
     });
+    await syncPriceActiveRow(
+      ctx,
+      (await ctx.db.get(id)) as PriceDoc,
+      now(),
+    );
     await recomputeProductListSummary(ctx, (sku as { product_id: string }).product_id);
     return id;
   },
@@ -131,31 +199,84 @@ export const remove = mutation({
   handler: async (ctx, args) => {
     const price = (await ctx.db.get(args.id)) as PriceDoc | null;
     await ctx.db.delete(args.id);
+    if (price) {
+      await removePriceActiveRow(ctx, price);
+    }
     if (price?.product_id) {
       await recomputeProductListSummary(ctx, price.product_id);
     }
   },
 });
 
-export const backfillPriceSummaries = mutation({
+/**
+ * Rolls price transitions forward in two bounded phases:
+ * 1. Drop pricesActive mirror rows whose ends_at has passed (indexed).
+ * 2. Materialize the rolling activation window: the 200 most recently
+ *    started (or starting) prices within the lookahead window are synced
+ *    into pricesActive.
+ * Both phases are idempotent; affected product summaries are recomputed.
+ */
+export const scheduleTransition = internalMutation({
+  args: { now: v.optional(v.number()) },
+  handler: async (ctx, args) => {
+    const t = args.now ?? now();
+    const touchedProducts = new Set<string>();
+    let expired = 0;
+    const expiredMirrors = (await ctx.db
+      .query("pricesActive")
+      .withIndex("by_ends_at", (q: any) =>
+        q.gte("ends_at", 0).lte("ends_at", t),
+      )
+      .take(PRICE_TRANSITION_BATCH_LIMIT)) as {
+      _id: string;
+      product_id?: string;
+    }[];
+    for (const mirror of expiredMirrors) {
+      await ctx.db.delete(mirror._id);
+      expired += 1;
+      if (mirror.product_id) touchedProducts.add(mirror.product_id);
+    }
+    let activated = 0;
+    const candidates = (await ctx.db
+      .query("prices")
+      .withIndex("by_starts_at", (q: any) =>
+        q.lte("starts_at", t + PRICE_ACTIVE_LOOKAHEAD_MS),
+      )
+      .order("desc")
+      .take(PRICE_TRANSITION_BATCH_LIMIT)) as PriceDoc[];
+    for (const price of candidates) {
+      if (await syncPriceActiveRow(ctx, price, t)) {
+        activated += 1;
+        if (price.product_id) touchedProducts.add(price.product_id);
+      }
+    }
+    for (const productId of touchedProducts) {
+      await recomputeProductListSummary(ctx, productId);
+    }
+    return {
+      expired,
+      activated,
+      refreshed: touchedProducts.size,
+      remainingMayExist: expiredMirrors.length >= PRICE_TRANSITION_BATCH_LIMIT,
+    };
+  },
+});
+
+export const backfillPriceSummaries = internalMutation({
   args: { limit: v.optional(v.number()), cursor: v.optional(v.string()) },
   handler: async (ctx, args) => {
     const limit = Math.min(Math.max(args.limit ?? 50, 1), 200);
-    const candidateLimit = args.cursor ? Math.min(limit * 2, 400) : limit;
-    const candidates = (await ctx.db
+    const result = await ctx.db
       .query("prices")
       .withIndex("by_price_summary_version", (q: any) =>
-        q.eq("priceSummaryVersion", undefined),
+        // Stale means missing (undefined) OR any version older than current.
+        q.lt("priceSummaryVersion", PRICE_SUMMARY_VERSION),
       )
-      .take(candidateLimit)) as PriceDoc[];
-    const cursorIndex = args.cursor
-      ? candidates.findIndex((row) => row._id === args.cursor)
-      : -1;
-    const rows = candidates
-      .slice(cursorIndex >= 0 ? cursorIndex + 1 : 0)
-      .slice(0, limit);
+      .order("asc")
+      .paginate({ numItems: limit, cursor: args.cursor ?? null });
     let patched = 0;
-    for (const price of rows) {
+    const t = now();
+    for (const price of result.page as PriceDoc[]) {
       const sku = (await ctx.db.get(price.sku_id as any)) as
         | { product_id: string }
         | null;
@@ -167,16 +288,31 @@ export const backfillPriceSummaries = mutation({
         storeName: store?.name,
         priceSummaryVersion: PRICE_SUMMARY_VERSION,
       };
-      if (price.product_id !== patch.product_id || price.storeName !== patch.storeName) {
+      if (
+        price.product_id !== patch.product_id ||
+        price.storeName !== patch.storeName ||
+        price.priceSummaryVersion !== patch.priceSummaryVersion
+      ) {
         await ctx.db.patch(price._id as any, patch);
         patched += 1;
       }
+      await syncPriceActiveRow(
+        ctx,
+        { ...price, ...patch } as PriceDoc,
+        t,
+      );
+    }
+    if (!result.isDone) {
+      await ctx.scheduler.runAfter(0, anyApi.prices.backfillPriceSummaries, {
+        limit,
+        cursor: result.continueCursor,
+      });
     }
     return {
-      processed: rows.length,
+      processed: result.page.length,
       patched,
-      nextCursor: rows.at(-1)?._id,
-      remainingMayExist: candidates.length >= candidateLimit,
+      nextCursor: result.continueCursor,
+      remainingMayExist: !result.isDone,
     };
   },
 });

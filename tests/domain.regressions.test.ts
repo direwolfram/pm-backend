@@ -133,6 +133,7 @@ describe("domain regressions", () => {
     ).resolves.toMatchObject({ is_default: true });
 
     await t.mutation(api.skus.remove, { id: second });
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
     await expect(
       t.run(async (ctx) => await ctx.db.get(first)),
     ).resolves.toMatchObject({ is_default: true });

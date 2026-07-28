@@ -49,6 +49,10 @@ export default defineSchema({
     order_count: v.optional(v.number()),
     total_spend: v.optional(v.number()),
     customerStatsVersion: v.optional(v.number()),
+    reconcile_cursor: v.optional(v.union(v.string(), v.null())),
+    reconcile_totals: v.optional(
+      v.object({ order_count: v.number(), total_spend: v.number() }),
+    ),
     created_at: v.number(),
     updated_at: v.number(),
   })
@@ -304,7 +308,27 @@ export default defineSchema({
     .index("by_sku_starts", ["sku_id", "starts_at"])
     .index("by_sku_store", ["sku_id", "store_id"])
     .index("by_store", ["store_id"])
+    .index("by_starts_at", ["starts_at"])
     .index("by_price_summary_version", ["priceSummaryVersion"]),
+
+  /**
+   * Persisted materialization of the price set that is currently active or
+   * scheduled to activate within PRICE_ACTIVE_LOOKAHEAD_MS, per SKU. Lets the
+   * product list select the correct active price with a bounded read instead
+   * of scanning unbounded historical prices. Maintained transactionally by
+   * prices.upsert / prices.remove / prices.scheduleTransition.
+   */
+  pricesActive: defineTable({
+    sku_id: v.id("skus"),
+    price_id: v.id("prices"),
+    product_id: v.optional(v.id("products")),
+    store_id: v.optional(v.id("stores")),
+    sale_price: v.number(),
+    starts_at: v.number(),
+    ends_at: v.optional(v.number()),
+  })
+    .index("by_sku", ["sku_id"])
+    .index("by_ends_at", ["ends_at"]),
 
   inventory: defineTable({
     sku_id: v.optional(v.id("skus")),

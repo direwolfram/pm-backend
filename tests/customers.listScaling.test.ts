@@ -91,4 +91,123 @@ describe("customers.list cursor pagination", () => {
     expect(ids).toHaveLength(5);
     expect(new Set(ids).size).toBe(5);
   });
+
+  it("paginates search results without duplicates and rejects stale cursors", async () => {
+    const t = convexTest({ schema, modules });
+    await t.run(async (ctx) => {
+      for (let index = 0; index < 7; index += 1) {
+        await ctx.db.insert("customers", {
+          phone_country_code: "+63",
+          phone_number: `902${index}`,
+          display_name: index < 6 ? `Maria ${index}` : `Juan ${index}`,
+          status: index % 2 === 0 ? "active" : "blocked",
+          marketing_opt_in: false,
+          search_text: index < 6 ? `maria ${index}` : `juan ${index}`,
+          order_count: 0,
+          total_spend: 0,
+          customerStatsVersion: 2,
+          created_at: 1_000 + index,
+          updated_at: 1_000 + index,
+        });
+      }
+    });
+
+    const seen: string[] = [];
+    let cursor: string | null = null;
+    let pages = 0;
+    do {
+      const page: any = await t.query(api.customers.list, {
+        search: "maria",
+        limit: 2,
+        cursor,
+      } as any);
+      seen.push(...page.data.map((row: any) => row.display_name as string));
+      cursor = page.nextCursor;
+      pages += 1;
+      expect(pages).toBeLessThan(10);
+    } while (cursor !== null);
+
+    expect(pages).toBeGreaterThanOrEqual(3);
+    expect(seen).toHaveLength(6);
+    expect(new Set(seen).size).toBe(6);
+
+    // defined outcome for cross-query cursor reuse
+    const first = await t.query(api.customers.list, {
+      search: "maria",
+      limit: 1,
+    });
+    await expect(
+      t.query(api.customers.list, {
+        search: "juan",
+        limit: 1,
+        cursor: first.nextCursor,
+      }),
+    ).rejects.toThrow(/cursor/i);
+    await expect(
+      t.query(api.customers.list, {
+        search: "maria",
+        status: "active",
+        limit: 1,
+        cursor: first.nextCursor,
+      }),
+    ).rejects.toThrow(/cursor/i);
+    await expect(
+      t.query(api.customers.list, { limit: 1, cursor: "garbage" }),
+    ).rejects.toThrow(/cursor/i);
+  });
+
+  it("supports capped offset compatibility and rejects deep offsets", async () => {
+    const t = convexTest({ schema, modules });
+    await t.run(async (ctx) => {
+      for (let index = 0; index < 205; index += 1) {
+        await ctx.db.insert("customers", {
+          phone_country_code: "+63",
+          phone_number: `9${String(index).padStart(5, "0")}`,
+          status: "active",
+          marketing_opt_in: false,
+          created_at: index,
+          updated_at: index,
+        });
+      }
+    });
+
+    const first = await t.query(api.customers.list, { limit: 2, offset: 0 });
+    expect(first.data).toHaveLength(2);
+    expect(first.total).toBeUndefined();
+    const deep = await t.query(api.customers.list, { limit: 1, offset: 200 });
+    expect(deep.data).toHaveLength(1);
+    await expect(
+      t.query(api.customers.list, { limit: 1, offset: 201 }),
+    ).rejects.toThrow(/offset pagination is only supported up to 200/);
+  });
+
+  it("finds customers by phone after create and phone update", async () => {
+    const t = convexTest({ schema, modules });
+    const customerId = await t.mutation(api.customers.create, {
+      phone_country_code: "+63",
+      phone_number: "9551234",
+      display_name: "Searchable",
+    });
+
+    let found = await t.query(api.customers.list, {
+      search: "+639551234",
+      limit: 5,
+    });
+    expect(found.data).toHaveLength(1);
+
+    await t.mutation(api.customers.updatePhone, {
+      id: customerId,
+      phone_number: "9669876",
+    });
+    found = await t.query(api.customers.list, {
+      search: "9669876",
+      limit: 5,
+    });
+    expect(found.data).toHaveLength(1);
+    found = await t.query(api.customers.list, {
+      search: "9551234",
+      limit: 5,
+    });
+    expect(found.data).toHaveLength(0);
+  });
 });

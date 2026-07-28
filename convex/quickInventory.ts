@@ -4,6 +4,7 @@ import { internalMutation, mutation, query } from "./functions";
 import {
   computeSellable,
   isLowStock,
+  nextShelfLifeRefreshAt,
   pickPriorityScore,
   shelfLifeDaysRemaining,
 } from "./lib/inventoryMath";
@@ -20,6 +21,11 @@ type QuickStatus = "in_stock" | "low_stock" | "out_of_stock" | "unavailable";
 
 const QUICK_INVENTORY_SUMMARY_VERSION = 1;
 const SHELF_LIFE_BATCH_LIMIT = 100;
+/**
+ * Documented hard cap on batches per inventory item for summary
+ * maintenance. Exceeding it throws rather than silently truncating.
+ */
+const MAX_BATCHES_PER_INVENTORY = 1_000;
 
 interface QuickInventoryDoc {
   _id: InventoryId;
@@ -164,16 +170,6 @@ const qualityCheckStatus = v.union(
 
 function now(): number {
   return Date.now();
-}
-
-function nextManilaMidnightAfter(t: number) {
-  const manilaOffset = 8 * 60 * 60 * 1000;
-  const day = 86_400_000;
-  return (Math.floor((t + manilaOffset) / day) + 1) * day - manilaOffset;
-}
-
-function nextShelfLifeRefreshAt(_expiryDate: number, evaluatedAt: number) {
-  return nextManilaMidnightAfter(evaluatedAt);
 }
 
 function assertPositiveQuantity(quantity: number) {
@@ -345,7 +341,12 @@ async function computeBatchSummary(ctx: { db: DbReader }, inventoryId: Inventory
   const batches = (await ctx.db
     .query<BatchDoc>("batches")
     .withIndex("by_inventory_expiry", (q) => q.eq("inventoryId", inventoryId))
-    .collect()) as BatchDoc[];
+    .take(MAX_BATCHES_PER_INVENTORY + 1)) as BatchDoc[];
+  if (batches.length > MAX_BATCHES_PER_INVENTORY) {
+    throw new Error(
+      `Inventory ${inventoryId} has more than ${MAX_BATCHES_PER_INVENTORY} batches; summary maintenance is capped`,
+    );
+  }
   return batchSummaryFromBatches(batches);
 }
 
@@ -958,33 +959,61 @@ export const createBatch = mutation({
   },
 });
 
+/**
+ * Single invariant-preserving expiration path shared by markBatchExpired and
+ * the shelf-life scheduler. Exactly-once under retries: a batch with
+ * expiredAt set (or zero quantity) is a no-op, so the inventory decrement
+ * can never be applied twice. Also clears the refresh marker so expired rows
+ * fall out of the by_unexpired_shelf_life_due index.
+ */
+async function expireBatch(
+  ctx: {
+    db: DbReader & {
+      patch(id: string, patch: Record<string, unknown>): Promise<void>;
+    };
+  },
+  batch: BatchDoc,
+  t: number,
+  opts?: { refreshSummary?: boolean },
+) {
+  if (batch.expiredAt !== undefined || batch.quantity <= 0) {
+    return { success: true, alreadyExpired: true, decrementedQuantity: 0 };
+  }
+  const row = requireQuickInventory(
+    (await ctx.db.get(batch.inventoryId)) as QuickInventoryDoc | null,
+  );
+  const decrement = Math.min(batch.quantity, row.availableQuantity!);
+  await ctx.db.patch(batch.inventoryId, {
+    ...quickInventoryPatch(
+      row.availableQuantity! - decrement,
+      row.reservedQuantity!,
+      row.replenishmentThreshold!,
+      row.isActive,
+    ),
+  });
+  await ctx.db.patch(batch._id, {
+    quantity: 0,
+    qualityCheckStatus: "failed",
+    expiredAt: t,
+    nextShelfLifeRefreshAt: undefined,
+  });
+  if (opts?.refreshSummary !== false) {
+    await ctx.db.patch(
+      batch.inventoryId,
+      await computeBatchSummary(ctx, batch.inventoryId),
+    );
+  }
+  return { success: true, alreadyExpired: false, decrementedQuantity: decrement };
+}
+
 export const markBatchExpired = mutation({
   args: { batchId: v.id("batches") },
   handler: async (ctx, args) => {
     const batch = (await ctx.db.get(args.batchId)) as BatchDoc | null;
     if (!batch) throw new Error("Batch not found");
-    if (batch.expiredAt !== undefined || batch.quantity <= 0) {
-      return { success: true, alreadyExpired: true };
-    }
-    const row = requireQuickInventory(
-      (await ctx.db.get(batch.inventoryId)) as QuickInventoryDoc | null,
-    );
-    const decrement = Math.min(batch.quantity, row.availableQuantity!);
-    await ctx.db.patch(batch.inventoryId, {
-      ...quickInventoryPatch(
-        row.availableQuantity! - decrement,
-        row.reservedQuantity!,
-        row.replenishmentThreshold!,
-        row.isActive,
-      ),
-    });
-    await ctx.db.patch(args.batchId, {
-      quantity: 0,
-      qualityCheckStatus: "failed",
-      expiredAt: now(),
-    });
-    await ctx.db.patch(batch.inventoryId, await computeBatchSummary(ctx, batch.inventoryId));
-    return { success: true, decrementedQuantity: decrement };
+    const result = await expireBatch(ctx, batch, now());
+    if (result.alreadyExpired) return { success: true, alreadyExpired: true };
+    return { success: true, decrementedQuantity: result.decrementedQuantity };
   },
 });
 
@@ -1085,6 +1114,17 @@ export const expireCartReservations = internalMutation({
   },
 });
 
+/**
+ * Daily shelf-life refresh (Asia/Manila day boundaries). All continuations
+ * share one `evaluatedAt` snapshot and one due query, so equal
+ * (nextShelfLifeRefreshAt, expiryDate) keys can never be skipped.
+ *
+ * Expiration semantics: a batch with shelfLifeDaysRemaining < 0 (its Manila
+ * expiry day has fully passed) is expired through the same helper as
+ * markBatchExpired — quantity zeroed, quality check failed, expiredAt set,
+ * sellable inventory decremented exactly once, marker cleared. Batches on
+ * their expiry day (daysRemaining === 0) stay sellable until the day ends.
+ */
 export const updateShelfLife = internalMutation({
   args: {
     cursor: v.optional(v.string()),
@@ -1107,8 +1147,11 @@ export const updateShelfLife = internalMutation({
     const page = result.page as BatchDoc[];
     const touchedInventoryIds = new Set<InventoryId>();
     let patched = 0;
+    let expired = 0;
     for (const batch of page) {
       if (batch.expiredAt !== undefined) {
+        // Should be unreachable given the index predicate; clear the marker
+        // defensively so the row can never wedge the due queue.
         await ctx.db.patch(batch._id, {
           nextShelfLifeRefreshAt: undefined,
         });
@@ -1116,6 +1159,18 @@ export const updateShelfLife = internalMutation({
         continue;
       }
       const daysRemaining = shelfLifeDaysRemaining(batch.expiryDate, t);
+      if (daysRemaining < 0) {
+        // Past-due: expire exactly once via the shared invariant helper.
+        const outcome = await expireBatch(ctx, batch, t, {
+          refreshSummary: false,
+        });
+        if (!outcome.alreadyExpired) {
+          touchedInventoryIds.add(batch.inventoryId);
+          expired += 1;
+          patched += 1;
+        }
+        continue;
+      }
       const next = {
         shelfLifeDaysRemaining: daysRemaining,
         isNearExpiry: daysRemaining <= 2,
@@ -1146,6 +1201,7 @@ export const updateShelfLife = internalMutation({
     return {
       processed: page.length,
       patched,
+      expired,
       touchedInventory: touchedInventoryIds.size,
       nextCursor: result.continueCursor,
       remainingMayExist: !result.isDone,
@@ -1155,9 +1211,14 @@ export const updateShelfLife = internalMutation({
 });
 
 export const backfillShelfLifeRefreshMarkers = internalMutation({
-  args: { limit: v.optional(v.number()), cursor: v.optional(v.string()) },
+  args: {
+    limit: v.optional(v.number()),
+    cursor: v.optional(v.string()),
+    evaluatedAt: v.optional(v.number()),
+  },
   handler: async (ctx, args) => {
-    const t = now();
+    // One evaluation timestamp across every page of the backfill.
+    const t = args.evaluatedAt ?? now();
     const limit = Math.min(
       Math.max(args.limit ?? SHELF_LIFE_BATCH_LIMIT, 1),
       SHELF_LIFE_BATCH_LIMIT,
@@ -1182,7 +1243,7 @@ export const backfillShelfLifeRefreshMarkers = internalMutation({
       await ctx.scheduler.runAfter(
         0,
         anyApi.quickInventory.backfillShelfLifeRefreshMarkers,
-        { limit, cursor: result.continueCursor },
+        { limit, cursor: result.continueCursor, evaluatedAt: t },
       );
     }
     return {
@@ -1211,30 +1272,32 @@ export const flagNearExpiry = internalMutation({
   },
 });
 
-export const backfillInventorySummaries = mutation({
+export const backfillInventorySummaries = internalMutation({
   args: { limit: v.optional(v.number()), cursor: v.optional(v.string()) },
   handler: async (ctx, args) => {
     const limit = Math.min(Math.max(args.limit ?? 50, 1), 200);
-    const candidateLimit = args.cursor ? Math.min(limit * 2, 400) : limit;
-    const candidates = (await ctx.db
+    const result = await ctx.db
       .query("inventory")
       .withIndex("by_summary_version", (q) =>
-        q.eq("quickInventorySummaryVersion", undefined),
+        // Stale means missing (undefined) OR any version older than current.
+        q.lt("quickInventorySummaryVersion", QUICK_INVENTORY_SUMMARY_VERSION),
       )
-      .take(candidateLimit)) as QuickInventoryDoc[];
-    const cursorIndex = args.cursor
-      ? candidates.findIndex((row) => row._id === args.cursor)
-      : -1;
-    const rows = candidates
-      .slice(cursorIndex >= 0 ? cursorIndex + 1 : 0)
-      .slice(0, limit);
-    for (const row of rows) {
+      .order("asc")
+      .paginate({ numItems: limit, cursor: args.cursor ?? null });
+    for (const row of result.page as QuickInventoryDoc[]) {
       await patchInventorySummaries(ctx, row);
     }
+    if (!result.isDone) {
+      await ctx.scheduler.runAfter(
+        0,
+        anyApi.quickInventory.backfillInventorySummaries,
+        { limit, cursor: result.continueCursor },
+      );
+    }
     return {
-      processed: rows.length,
-      nextCursor: rows.at(-1)?._id,
-      remainingMayExist: candidates.length >= candidateLimit,
+      processed: result.page.length,
+      nextCursor: result.continueCursor,
+      remainingMayExist: !result.isDone,
     };
   },
 });

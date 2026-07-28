@@ -45,7 +45,13 @@ import type {
   ProductListRow,
 } from "../../convex/model";
 
-type ListResult = { data: ProductListRow[]; total: number };
+type ListResult = {
+  data: ProductListRow[];
+  total?: number;
+  totalIsExact: boolean;
+  nextCursor: string | null;
+  hasMore: boolean;
+};
 
 const EMPTY_FORM = {
   name: "",

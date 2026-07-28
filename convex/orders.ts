@@ -1,7 +1,15 @@
 import { v } from "convex/values";
 import { anyApi } from "convex/server";
 import { query, mutation, internalMutation } from "./functions";
-import { boundedPageArgs, now, pageResponse } from "./helpers";
+import {
+  assertNonNegative,
+  assertPositiveQuantity,
+  boundedPageArgs,
+  now,
+  pageResponse,
+  unwrapCursor,
+  wrapCursor,
+} from "./helpers";
 import { applyOrderStatsChange } from "./lib/customerAggregates";
 import type {
   AddressDoc,
@@ -14,8 +22,13 @@ import type {
   StoreDoc,
 } from "./model";
 
-const ORDER_SUMMARY_VERSION = 2;
+export const ORDER_SUMMARY_VERSION = 2;
 const ORDER_SUMMARY_BATCH_LIMIT = 100;
+/**
+ * Documented hard cap on line items per order, enforced at insert time and
+ * validated during summary recomputation (never silently truncated).
+ */
+export const MAX_ORDER_ITEMS = 1_000;
 
 const orderStatus = v.union(
   v.literal("pending_payment"),
@@ -51,7 +64,12 @@ async function computeOrderItemCount(ctx: { db: any }, orderId: string) {
   const items = (await ctx.db
     .query("order_items")
     .withIndex("by_order", (q: any) => q.eq("order_id", orderId))
-    .collect()) as OrderItemDoc[];
+    .take(MAX_ORDER_ITEMS + 1)) as OrderItemDoc[];
+  if (items.length > MAX_ORDER_ITEMS) {
+    throw new Error(
+      `Order ${orderId} exceeds the ${MAX_ORDER_ITEMS} line-item cap`,
+    );
+  }
   return items.reduce((sum, item) => sum + item.quantity, 0);
 }
 
@@ -60,11 +78,20 @@ async function patchOrderSummary(ctx: { db: any }, order: OrderDoc) {
     ctx.db.get(order.customer_id as any),
     computeOrderItemCount(ctx, order._id),
   ]);
-  await ctx.db.patch(order._id as any, {
+  const next = {
     item_count: itemCount,
     order_search_text: orderSearchText(order, customer as CustomerDoc | null),
     orderSummaryVersion: ORDER_SUMMARY_VERSION,
-  });
+  };
+  if (
+    order.item_count === next.item_count &&
+    order.order_search_text === next.order_search_text &&
+    order.orderSummaryVersion === next.orderSummaryVersion
+  ) {
+    return false;
+  }
+  await ctx.db.patch(order._id as any, next);
+  return true;
 }
 
 function orderIndex(args: {
@@ -77,6 +104,23 @@ function orderIndex(args: {
   if (args.store_id) return "by_store_placed";
   if (args.status) return "by_status_placed";
   return "by_placed";
+}
+
+function orderListScope(args: {
+  status?: OrderStatus;
+  store_id?: string;
+  search?: string;
+  placed_from?: number;
+  placed_to?: number;
+}) {
+  return {
+    q: "orders.list",
+    search: args.search?.trim().toLowerCase() ?? "",
+    status: args.status ?? "",
+    store_id: args.store_id ?? "",
+    placed_from: args.placed_from ?? "",
+    placed_to: args.placed_to ?? "",
+  };
 }
 
 async function pageOrders(
@@ -96,8 +140,11 @@ async function pageOrders(
   const limit = pageArgs.limit;
   const fetchLimit = limit + pageArgs.offset + 1;
   const useOffset = args.offset !== undefined && args.cursor === undefined;
+  const scope = orderListScope(args);
+  const cursor = unwrapCursor(scope, args.cursor);
+  const isSearch = !!args.search?.trim();
   let queryBuilder;
-  if (args.search?.trim()) {
+  if (isSearch) {
     queryBuilder = ctx.db.query("orders").withSearchIndex("search_orders", (q: any) => {
       let s = q.search("order_search_text", args.search!.trim().toLowerCase());
       if (args.status) s = s.eq("status", args.status);
@@ -123,23 +170,34 @@ async function pageOrders(
       return withBounds(q);
     });
   }
-  const ordered = queryBuilder.order("desc");
+  // Search indexes are always in relevance order and cannot be re-ordered;
+  // database indexes page newest-first.
+  const ordered = isSearch ? queryBuilder : queryBuilder.order("desc");
   if (!useOffset) {
     const result = await ordered.paginate({
       numItems: limit,
-      cursor: args.cursor ?? null,
+      cursor,
     });
     const page = (result.page as OrderDoc[]).filter(
       (order) =>
         (args.placed_from === undefined || order.placed_at >= args.placed_from) &&
         (args.placed_to === undefined || order.placed_at <= args.placed_to),
     );
-    return { rows: page, pagination: result };
+    return {
+      rows: page,
+      pagination: {
+        isDone: result.isDone,
+        nextCursor:
+          result.isDone || !result.continueCursor
+            ? null
+            : wrapCursor(scope, result.continueCursor),
+      },
+    };
   }
   const rows = ((await ordered.take(fetchLimit)) as OrderDoc[]).filter(
     (order) =>
       (args.placed_from === undefined || order.placed_at >= args.placed_from) &&
-      (args.placed_to === undefined || order.placed_at <= args.placed_to),
+      (args.placed_to !== undefined ? order.placed_at <= args.placed_to : true),
   );
   return {
     rows: rows.slice(pageArgs.offset, pageArgs.offset + limit),
@@ -368,11 +426,13 @@ export const remove = mutation({
   handler: async (ctx, args) => {
     const order = (await ctx.db.get(args.id)) as OrderDoc | null;
     if (!order) return;
-    const items = await ctx.db
+    // Restrict semantics: an order with items cannot be deleted. Indexed
+    // existence check with a single read.
+    const item = await ctx.db
       .query("order_items")
       .withIndex("by_order", (q) => q.eq("order_id", args.id))
-      .take(100);
-    if (items.length > 0) {
+      .first();
+    if (item) {
       throw new Error("Delete order items before deleting the order");
     }
     await ctx.db.delete(args.id);
@@ -441,14 +501,33 @@ export const createItem = mutation({
     compare_at_price: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
+    assertPositiveQuantity(args.quantity);
+    assertNonNegative(args.unit_price, "unit_price");
+    if (args.compare_at_price !== undefined) {
+      assertNonNegative(args.compare_at_price, "compare_at_price");
+    }
     const order = (await ctx.db.get(args.order_id)) as OrderDoc | null;
     if (!order) throw new Error("Order not found");
+    // Derive the effective pre-write count BEFORE inserting so a missing
+    // stored count cannot be recomputed with the new item already included
+    // (which would double-count the new quantity).
+    const preCount =
+      order.item_count ?? (await computeOrderItemCount(ctx, args.order_id));
+    const existingItems = await ctx.db
+      .query("order_items")
+      .withIndex("by_order", (q) => q.eq("order_id", args.order_id))
+      .take(MAX_ORDER_ITEMS + 1);
+    if (existingItems.length >= MAX_ORDER_ITEMS) {
+      throw new Error(
+        `An order can have at most ${MAX_ORDER_ITEMS} line items`,
+      );
+    }
     const id = await ctx.db.insert("order_items", {
       ...args,
       line_total: args.quantity * args.unit_price,
     });
     await ctx.db.patch(args.order_id, {
-      item_count: (order.item_count ?? (await computeOrderItemCount(ctx, args.order_id))) + args.quantity,
+      item_count: preCount + args.quantity,
       orderSummaryVersion: ORDER_SUMMARY_VERSION,
     });
     return id;
@@ -466,9 +545,18 @@ export const updateItem = mutation({
   handler: async (ctx, args) => {
     const item = (await ctx.db.get(args.id)) as OrderItemDoc | null;
     if (!item) throw new Error("Order item not found");
+    if (args.quantity !== undefined) assertPositiveQuantity(args.quantity);
+    if (args.unit_price !== undefined) {
+      assertNonNegative(args.unit_price, "unit_price");
+    }
+    if (args.compare_at_price !== undefined) {
+      assertNonNegative(args.compare_at_price, "compare_at_price");
+    }
     const nextOrderId = args.order_id ?? item.order_id;
     const nextQuantity = args.quantity ?? item.quantity;
     const nextUnitPrice = args.unit_price ?? item.unit_price;
+    const nextOrder = (await ctx.db.get(nextOrderId as any)) as OrderDoc | null;
+    if (!nextOrder) throw new Error("Order not found");
     await ctx.db.patch(args.id, {
       order_id: nextOrderId,
       quantity: nextQuantity,
@@ -503,15 +591,17 @@ export const backfillOrderListSummaries = internalMutation({
     const result = await ctx.db
       .query("orders")
       .withIndex("by_order_summary_version", (q) =>
-        q.eq("orderSummaryVersion", undefined),
+        // Stale means missing (undefined) OR any version older than the
+        // current one; the index on (orderSummaryVersion, placed_at) selects
+        // both without scanning current rows.
+        q.lt("orderSummaryVersion", ORDER_SUMMARY_VERSION),
       )
       .order("asc")
       .paginate({ numItems: limit, cursor: args.cursor ?? null });
     const orders = result.page as OrderDoc[];
     let patched = 0;
     for (const order of orders) {
-      await patchOrderSummary(ctx, order);
-      patched += 1;
+      if (await patchOrderSummary(ctx, order)) patched += 1;
     }
     if (!result.isDone) {
       await ctx.scheduler.runAfter(0, anyApi.orders.backfillOrderListSummaries, {

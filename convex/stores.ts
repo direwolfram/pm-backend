@@ -1,15 +1,10 @@
 import { v } from "convex/values";
-import { query, mutation } from "./functions";
+import { anyApi } from "convex/server";
+import { query, mutation, internalMutation } from "./functions";
 import { now, paginate } from "./helpers";
 import type { DeliveryZoneDoc, StoreDoc } from "./model";
 
 const CASCADE_BATCH_LIMIT = 100;
-
-function assertBoundedCascade(rows: unknown[], label: string) {
-  if (rows.length > CASCADE_BATCH_LIMIT) {
-    throw new Error(`${label} has too many dependents; run a batched cleanup`);
-  }
-}
 
 export const list = query({
   args: {
@@ -109,33 +104,85 @@ export const update = mutation({
   },
 });
 
+/**
+ * Cascade: delivery zones, inventory, and prices go with the store; orders
+ * restrict. Bounded, resumable internal continuation.
+ */
 export const remove = mutation({
   args: { id: v.id("stores") },
   handler: async (ctx, args) => {
+    const store = (await ctx.db.get(args.id)) as StoreDoc | null;
+    if (!store) return { id: args.id, deleting: true };
     const order = await ctx.db
       .query("orders")
       .withIndex("by_store", (q) => q.eq("store_id", args.id))
       .first();
     if (order) throw new Error("Cannot delete a store that has orders");
+    if (!store.deleting_at) {
+      await ctx.db.patch(args.id, { deleting_at: now() });
+    }
+    await ctx.scheduler.runAfter(0, anyApi.stores.continueStoreDelete, {
+      id: args.id,
+    });
+    return { id: args.id, deleting: true };
+  },
+});
+
+export const continueStoreDelete = internalMutation({
+  args: { id: v.id("stores") },
+  handler: async (ctx, args) => {
+    const store = (await ctx.db.get(args.id)) as StoreDoc | null;
+    if (!store) return { done: true, deleted: true };
+    const order = await ctx.db
+      .query("orders")
+      .withIndex("by_store", (q) => q.eq("store_id", args.id))
+      .first();
+    if (order) throw new Error("Cannot delete a store that has orders");
+    let operations = 0;
     const zones = await ctx.db
       .query("delivery_zones")
       .withIndex("by_store", (q) => q.eq("store_id", args.id))
-      .take(CASCADE_BATCH_LIMIT + 1);
-    assertBoundedCascade(zones, "Store delivery-zone cleanup");
-    for (const z of zones) await ctx.db.delete(z._id);
+      .take(CASCADE_BATCH_LIMIT);
+    for (const z of zones) {
+      await ctx.db.delete(z._id);
+      operations += 1;
+    }
+    if (operations >= CASCADE_BATCH_LIMIT) {
+      await ctx.scheduler.runAfter(0, anyApi.stores.continueStoreDelete, {
+        id: args.id,
+      });
+      return { done: false, operations };
+    }
     const inv = await ctx.db
       .query("inventory")
       .withIndex("by_store", (q) => q.eq("store_id", args.id))
-      .take(CASCADE_BATCH_LIMIT + 1);
-    assertBoundedCascade(inv, "Store inventory cleanup");
-    for (const row of inv) await ctx.db.delete(row._id);
+      .take(CASCADE_BATCH_LIMIT - operations);
+    for (const row of inv) {
+      await ctx.db.delete(row._id);
+      operations += 1;
+    }
+    if (operations >= CASCADE_BATCH_LIMIT) {
+      await ctx.scheduler.runAfter(0, anyApi.stores.continueStoreDelete, {
+        id: args.id,
+      });
+      return { done: false, operations };
+    }
     const prices = await ctx.db
       .query("prices")
       .withIndex("by_store", (q) => q.eq("store_id", args.id))
-      .take(CASCADE_BATCH_LIMIT + 1);
-    assertBoundedCascade(prices, "Store price cleanup");
-    for (const p of prices) await ctx.db.delete(p._id);
+      .take(CASCADE_BATCH_LIMIT - operations);
+    for (const p of prices) {
+      await ctx.db.delete(p._id);
+      operations += 1;
+    }
+    if (operations >= CASCADE_BATCH_LIMIT) {
+      await ctx.scheduler.runAfter(0, anyApi.stores.continueStoreDelete, {
+        id: args.id,
+      });
+      return { done: false, operations };
+    }
     await ctx.db.delete(args.id);
+    return { done: true, operations };
   },
 });
 
@@ -162,6 +209,11 @@ export const createZone = mutation({
   handler: async (ctx, args) => {
     if (args.estimated_minutes_max < args.estimated_minutes_min) {
       throw new Error("Max ETA must be >= min ETA");
+    }
+    const store = await ctx.db.get(args.store_id);
+    if (!store) throw new Error("Store not found");
+    if ((store as { deleting_at?: number }).deleting_at) {
+      throw new Error("Store is being deleted");
     }
     return await ctx.db.insert("delivery_zones", {
       store_id: args.store_id,

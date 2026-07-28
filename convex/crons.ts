@@ -20,4 +20,10 @@ crons.daily(
   anyApi.quickInventory.flagNearExpiry,
 );
 
+crons.interval(
+  "Roll price activation/expiration transitions",
+  { hours: 12 },
+  anyApi.prices.scheduleTransition,
+);
+
 export default crons;

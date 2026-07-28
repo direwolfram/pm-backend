@@ -1,15 +1,10 @@
 import { v } from "convex/values";
-import { query, mutation } from "./functions";
-import { paginate } from "./helpers";
+import { anyApi } from "convex/server";
+import { query, mutation, internalMutation } from "./functions";
+import { now, paginate } from "./helpers";
 import type { PromotionDoc, PromotionTargetDoc } from "./model";
 
 const CASCADE_BATCH_LIMIT = 100;
-
-function assertBoundedCascade(rows: unknown[], label: string) {
-  if (rows.length > CASCADE_BATCH_LIMIT) {
-    throw new Error(`${label} has too many dependents; run a batched cleanup`);
-  }
-}
 
 const promotionKind = v.union(
   v.literal("banner"),
@@ -210,11 +205,21 @@ export const setTargets = mutation({
     ),
   },
   handler: async (ctx, args) => {
+    // Hard cardinality cap keeps replacement a single bounded transaction.
+    if (args.targets.length > CASCADE_BATCH_LIMIT) {
+      throw new Error(
+        `A promotion can have at most ${CASCADE_BATCH_LIMIT} targets per update`,
+      );
+    }
     const existing = await ctx.db
       .query("promotion_targets")
       .withIndex("by_promotion", (q) => q.eq("promotion_id", args.promotion_id))
       .take(CASCADE_BATCH_LIMIT + 1);
-    assertBoundedCascade(existing, "Promotion target replacement");
+    if (existing.length > CASCADE_BATCH_LIMIT) {
+      throw new Error(
+        "Promotion has too many existing targets; remove them first",
+      );
+    }
     for (const t of existing) await ctx.db.delete(t._id);
     for (const t of args.targets) {
       if (!t.product_id && !t.sku_id && !t.category_id && !t.brand_id) {
@@ -229,21 +234,60 @@ export const setTargets = mutation({
   },
 });
 
+/**
+ * Cascade: promotion targets and home-section items go with the promotion.
+ * Bounded, resumable internal continuation.
+ */
 export const remove = mutation({
   args: { id: v.id("promotions") },
   handler: async (ctx, args) => {
+    const promotion = (await ctx.db.get(args.id)) as PromotionDoc | null;
+    if (!promotion) return { id: args.id, deleting: true };
+    if (!promotion.deleting_at) {
+      await ctx.db.patch(args.id, { deleting_at: now() });
+    }
+    await ctx.scheduler.runAfter(0, anyApi.promotions.continuePromotionDelete, {
+      id: args.id,
+    });
+    return { id: args.id, deleting: true };
+  },
+});
+
+export const continuePromotionDelete = internalMutation({
+  args: { id: v.id("promotions") },
+  handler: async (ctx, args) => {
+    const promotion = (await ctx.db.get(args.id)) as PromotionDoc | null;
+    if (!promotion) return { done: true, deleted: true };
+    let operations = 0;
     const targets = await ctx.db
       .query("promotion_targets")
       .withIndex("by_promotion", (q) => q.eq("promotion_id", args.id))
-      .take(CASCADE_BATCH_LIMIT + 1);
-    assertBoundedCascade(targets, "Promotion target cleanup");
-    for (const t of targets) await ctx.db.delete(t._id);
+      .take(CASCADE_BATCH_LIMIT);
+    for (const t of targets) {
+      await ctx.db.delete(t._id);
+      operations += 1;
+    }
+    if (operations >= CASCADE_BATCH_LIMIT) {
+      await ctx.scheduler.runAfter(0, anyApi.promotions.continuePromotionDelete, {
+        id: args.id,
+      });
+      return { done: false, operations };
+    }
     const items = await ctx.db
       .query("home_section_items")
       .withIndex("by_promotion", (q) => q.eq("promotion_id", args.id))
-      .take(CASCADE_BATCH_LIMIT + 1);
-    assertBoundedCascade(items, "Promotion home-section cleanup");
-    for (const item of items) await ctx.db.delete(item._id);
+      .take(CASCADE_BATCH_LIMIT - operations);
+    for (const item of items) {
+      await ctx.db.delete(item._id);
+      operations += 1;
+    }
+    if (operations >= CASCADE_BATCH_LIMIT) {
+      await ctx.scheduler.runAfter(0, anyApi.promotions.continuePromotionDelete, {
+        id: args.id,
+      });
+      return { done: false, operations };
+    }
     await ctx.db.delete(args.id);
+    return { done: true, operations };
   },
 });

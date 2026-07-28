@@ -222,10 +222,10 @@ describe("quick inventory low-stock invariant", () => {
     });
 
     await expect(
-      t.mutation(api.quickInventory.backfillInventorySummaries, {
+      t.mutation(internal.quickInventory.backfillInventorySummaries, {
         limit: 1,
       }),
-    ).resolves.toMatchObject({ processed: 1, remainingMayExist: true });
+    ).resolves.toMatchObject({ processed: 1, remainingMayExist: false });
     await expect(readInventory(t, inventoryId)).resolves.toMatchObject({
       pricingSummary: { dynamicPrice: 123, isSurgeActive: true },
       batchCount: 1,
@@ -234,7 +234,7 @@ describe("quick inventory low-stock invariant", () => {
       quickInventorySummaryVersion: 1,
     });
     await expect(
-      t.mutation(api.quickInventory.backfillInventorySummaries, {
+      t.mutation(internal.quickInventory.backfillInventorySummaries, {
         limit: 1,
       }),
     ).resolves.toMatchObject({ processed: 0, remainingMayExist: false });

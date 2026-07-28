@@ -1,15 +1,11 @@
 import { v } from "convex/values";
-import { query, mutation } from "./functions";
+import { anyApi } from "convex/server";
+import { query, mutation, internalMutation } from "./functions";
+import { now } from "./helpers";
 import { recomputeProductListSummary } from "./lib/productListSummaries";
 import type { InventoryDoc, PriceDoc, SkuDoc } from "./model";
 
 const CASCADE_BATCH_LIMIT = 100;
-
-function assertBoundedCascade(rows: unknown[], label: string) {
-  if (rows.length > CASCADE_BATCH_LIMIT) {
-    throw new Error(`${label} has too many dependents; run a batched cleanup`);
-  }
-}
 
 export const listAll = query({
   args: { search: v.optional(v.string()) },
@@ -247,12 +243,18 @@ export const update = mutation({
   },
 });
 
-/** SQL cascade: prices and inventory rows go with the SKU. */
+/**
+ * SQL cascade: prices and inventory rows go with the SKU. Deletion is a
+ * bounded, resumable workflow: the public mutation validates restrict rules
+ * (order items), marks the SKU as deleting, and schedules internal cleanup
+ * that drains prices and inventory in fixed-size batches before removing
+ * the SKU root.
+ */
 export const remove = mutation({
   args: { id: v.id("skus") },
   handler: async (ctx, args) => {
     const sku = (await ctx.db.get(args.id)) as SkuDoc | null;
-    if (!sku) throw new Error("SKU not found");
+    if (!sku) return { id: args.id, deleting: true };
     const orderItem = await ctx.db
       .query("order_items")
       .withIndex("by_sku", (q) => q.eq("sku_id", args.id))
@@ -262,18 +264,57 @@ export const remove = mutation({
         "Cannot delete: this SKU appears in orders. Deactivate it instead.",
       );
     }
+    if (!sku.deleting_at) {
+      await ctx.db.patch(args.id, { deleting_at: now() });
+    }
+    await ctx.scheduler.runAfter(0, anyApi.skus.continueSkuDelete, {
+      id: args.id,
+    });
+    return { id: args.id, deleting: true };
+  },
+});
+
+export const continueSkuDelete = internalMutation({
+  args: { id: v.id("skus") },
+  handler: async (ctx, args) => {
+    const sku = (await ctx.db.get(args.id)) as SkuDoc | null;
+    if (!sku) return { done: true, deleted: true };
+    const orderItem = await ctx.db
+      .query("order_items")
+      .withIndex("by_sku", (q) => q.eq("sku_id", args.id))
+      .first();
+    if (orderItem) {
+      throw new Error("Cannot delete: this SKU appears in orders");
+    }
+    let operations = 0;
     const prices = await ctx.db
       .query("prices")
       .withIndex("by_sku", (q) => q.eq("sku_id", args.id))
-      .take(CASCADE_BATCH_LIMIT + 1);
-    assertBoundedCascade(prices, "SKU price cleanup");
-    for (const p of prices) await ctx.db.delete(p._id);
+      .take(CASCADE_BATCH_LIMIT);
+    for (const p of prices) {
+      await ctx.db.delete(p._id);
+      operations += 1;
+    }
+    if (operations >= CASCADE_BATCH_LIMIT) {
+      await ctx.scheduler.runAfter(0, anyApi.skus.continueSkuDelete, {
+        id: args.id,
+      });
+      return { done: false, operations };
+    }
     const inv = await ctx.db
       .query("inventory")
       .withIndex("by_sku", (q) => q.eq("sku_id", args.id))
-      .take(CASCADE_BATCH_LIMIT + 1);
-    assertBoundedCascade(inv, "SKU inventory cleanup");
-    for (const i of inv) await ctx.db.delete(i._id);
+      .take(CASCADE_BATCH_LIMIT - operations);
+    for (const i of inv) {
+      await ctx.db.delete(i._id);
+      operations += 1;
+    }
+    if (operations >= CASCADE_BATCH_LIMIT) {
+      await ctx.scheduler.runAfter(0, anyApi.skus.continueSkuDelete, {
+        id: args.id,
+      });
+      return { done: false, operations };
+    }
     await ctx.db.delete(args.id);
     // ensure a remaining SKU becomes default if we deleted the default
     if (sku.is_default) {
@@ -286,5 +327,6 @@ export const remove = mutation({
       }
     }
     await recomputeProductListSummary(ctx, sku.product_id);
+    return { done: true, operations };
   },
 });

@@ -1,12 +1,33 @@
 import { money } from "../helpers";
-import type { CustomerDoc, OrderDoc } from "../model";
+import type { CustomerDoc, OrderDoc, OrderStatus } from "../model";
 
-export const CUSTOMER_ORDER_STATS_VERSION = 1;
+/**
+ * Aggregate semantics (version 2):
+ * - `order_count` counts an order while its status is one of
+ *   confirmed/picking/packed/out_for_delivery/delivered.
+ * - `total_spend` sums `total_amount` over the same statuses.
+ * - `pending_payment` orders count toward neither until confirmed.
+ * - Cancelling an order removes both its count and its full total.
+ * - Refunding (only reachable from `delivered`) removes both as well;
+ *   partial refunds are not supported by the schema.
+ * - Deleting an order removes its contribution exactly as a cancellation.
+ * Version 1 counted pending_payment orders; the v2 backfill reconciles rows
+ * written under the old rule.
+ */
+export const CUSTOMER_ORDER_STATS_VERSION = 2;
 
-const excludedStatuses = new Set(["cancelled", "refunded"]);
+export const CUSTOMER_STATS_INCLUDED_STATUSES: readonly OrderStatus[] = [
+  "confirmed",
+  "picking",
+  "packed",
+  "out_for_delivery",
+  "delivered",
+];
+
+const includedStatuses = new Set<OrderStatus>(CUSTOMER_STATS_INCLUDED_STATUSES);
 
 export function orderCountsForCustomerStats(order: OrderDoc | null) {
-  if (!order || excludedStatuses.has(order.status)) {
+  if (!order || !includedStatuses.has(order.status)) {
     return { order_count: 0, total_spend: 0 };
   }
   return { order_count: 1, total_spend: order.total_amount };
