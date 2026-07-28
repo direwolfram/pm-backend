@@ -32,6 +32,15 @@ npx convex run quickInventory:convertReservation '{"reservationId":"<reservation
 
 Stale active reservations are released by `convex/crons.ts` every minute.
 
+## Low-stock consistency
+
+`isLowStock` is maintained transactionally by quick inventory mutations that
+change available or reserved quantities: reserve, release, conversion,
+reservation expiry, manual adjustments, batch creation/expiry, and
+replenishment. There is no periodic full-table replenishment refresh; callers
+should mutate inventory through these functions so the stored flag remains
+consistent with `availableQuantity - reservedQuantity <= replenishmentThreshold`.
+
 ## Assumptions
 
 - External auth can map to the new `users` table or adapt calls to existing `customers`.

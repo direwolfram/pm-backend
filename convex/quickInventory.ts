@@ -1009,30 +1009,3 @@ export const flagNearExpiry = internalMutation({
     return { discounted };
   },
 });
-
-export const replenishmentAlert = internalMutation({
-  args: {},
-  handler: async (ctx) => {
-    const rows = (await ctx.db.query("inventory").collect()) as QuickInventoryDoc[];
-    let alerts = 0;
-    for (const row of rows) {
-      if (
-        row.availableQuantity === undefined ||
-        row.reservedQuantity === undefined ||
-        row.replenishmentThreshold === undefined
-      ) {
-        continue;
-      }
-      const sellable = computeSellable(row.availableQuantity, row.reservedQuantity);
-      const low = isLowStock(sellable, row.replenishmentThreshold);
-      if (low) alerts += 1;
-      if (row.isLowStock !== low) {
-        await ctx.db.patch(row._id, {
-          isLowStock: low,
-          lastUpdatedAt: now(),
-        });
-      }
-    }
-    return { lowStockRows: alerts };
-  },
-});
