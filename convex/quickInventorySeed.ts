@@ -103,6 +103,7 @@ export const run = mutation({
     ];
 
     const centerIds: ConvexId<"fulfillmentCenters">[] = [];
+    const centerNames = new Map<ConvexId<"fulfillmentCenters">, string>();
     for (const center of centers) {
       const centerId = await ctx.db.insert("fulfillmentCenters", {
         ...center,
@@ -135,6 +136,7 @@ export const run = mutation({
       }
       await ctx.db.patch(centerId, { zoneIds });
       centerIds.push(centerId);
+      centerNames.set(centerId, center.name);
     }
 
     const products: SeedProduct[] = Array.from({ length: 20 }).map((_, index) => {
@@ -237,6 +239,9 @@ export const run = mutation({
           lastUpdatedAt: t,
           isActive: true,
           isLowStock: isLowStock(sellable, replenishmentThreshold),
+          productName: product.name,
+          productBrand: product.brand,
+          fulfillmentCenterName: centerNames.get(centerId),
         });
         inventoryIds.push(inventoryId);
         inventoryCount += 1;

@@ -283,6 +283,9 @@ export default defineSchema({
     lastUpdatedAt: v.optional(v.number()),
     isActive: v.optional(v.boolean()),
     isLowStock: v.optional(v.boolean()),
+    productName: v.optional(v.string()),
+    productBrand: v.optional(v.string()),
+    fulfillmentCenterName: v.optional(v.string()),
   })
     .index("by_sku_store", ["sku_id", "store_id"])
     .index("by_store_status", ["store_id", "status"])

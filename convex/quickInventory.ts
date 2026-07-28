@@ -30,6 +30,9 @@ interface QuickInventoryDoc {
   lastUpdatedAt?: number;
   isActive?: boolean;
   isLowStock?: boolean;
+  productName?: string;
+  productBrand?: string;
+  fulfillmentCenterName?: string;
 }
 
 interface ProductDoc {
@@ -113,6 +116,31 @@ interface InventoryPricingDoc {
   isSurgeActive: boolean;
 }
 
+interface ListByCenterArgs {
+  fulfillmentCenterId?: CenterId;
+  status?: "in_stock" | "low_stock" | "out_of_stock" | "unavailable";
+  search?: string;
+  limit?: number;
+}
+
+interface IndexRangeBuilder {
+  eq(fieldName: string, value: unknown): IndexRangeBuilder;
+}
+
+interface QueryBuilder<T> {
+  withIndex(
+    indexName: string,
+    indexRange?: (q: IndexRangeBuilder) => IndexRangeBuilder,
+  ): QueryBuilder<T>;
+  collect(): Promise<T[]>;
+  first(): Promise<T | null>;
+}
+
+interface DbReader {
+  get(id: string): Promise<unknown | null>;
+  query<T = unknown>(tableName: string): QueryBuilder<T>;
+}
+
 const qualityCheckStatus = v.union(
   v.literal("pending"),
   v.literal("passed"),
@@ -178,6 +206,211 @@ function quickInventoryPatch(
     isLowStock: isLowStock(sellable, replenishmentThreshold),
     lastUpdatedAt: now(),
   };
+}
+
+function quickInventoryLimit(limit?: number): number {
+  return Math.min(Math.max(limit ?? 300, 1), 500);
+}
+
+function isQuickInventoryRow(row: QuickInventoryDoc): boolean {
+  return !!(row.sku && row.productId && row.fulfillmentCenterId);
+}
+
+function rowSearchText(
+  row: QuickInventoryDoc,
+  product?: ProductDoc | null,
+  center?: FulfillmentCenterDoc | null,
+): string {
+  return `${row.sku ?? ""} ${row.productName ?? product?.name ?? ""} ${row.productBrand ?? product?.brand ?? ""} ${row.fulfillmentCenterName ?? center?.name ?? ""}`.toLowerCase();
+}
+
+function rowSortName(row: QuickInventoryDoc, product?: ProductDoc | null): string {
+  return row.productName ?? product?.name ?? row.sku ?? "";
+}
+
+async function fetchProductsById(
+  ctx: { db: DbReader },
+  productIds: ProductId[],
+): Promise<Map<ProductId, ProductDoc | null>> {
+  const products = new Map<ProductId, ProductDoc | null>();
+  await Promise.all(
+    Array.from(new Set(productIds)).map(async (productId) => {
+      products.set(productId, (await ctx.db.get(productId)) as ProductDoc | null);
+    }),
+  );
+  return products;
+}
+
+async function fetchCentersById(
+  ctx: { db: DbReader },
+  centerIds: CenterId[],
+): Promise<Map<CenterId, FulfillmentCenterDoc | null>> {
+  const centers = new Map<CenterId, FulfillmentCenterDoc | null>();
+  await Promise.all(
+    Array.from(new Set(centerIds)).map(async (centerId) => {
+      centers.set(
+        centerId,
+        (await ctx.db.get(centerId)) as FulfillmentCenterDoc | null,
+      );
+    }),
+  );
+  return centers;
+}
+
+async function fetchPricingByInventoryId(
+  ctx: { db: DbReader },
+  inventoryIds: InventoryId[],
+): Promise<Map<InventoryId, InventoryPricingDoc | null>> {
+  const pricing = new Map<InventoryId, InventoryPricingDoc | null>();
+  await Promise.all(
+    inventoryIds.map(async (inventoryId) => {
+      pricing.set(
+        inventoryId,
+        (await ctx.db
+          .query<InventoryPricingDoc>("inventoryPricing")
+          .withIndex("by_inventory", (q) => q.eq("inventoryId", inventoryId))
+          .first()) as InventoryPricingDoc | null,
+      );
+    }),
+  );
+  return pricing;
+}
+
+async function fetchBatchStatsByInventoryId(
+  ctx: { db: DbReader },
+  inventoryIds: InventoryId[],
+): Promise<
+  Map<
+    InventoryId,
+    {
+      batchCount: number;
+      nearExpiryBatchCount: number;
+      earliestExpiryDate?: number;
+    }
+  >
+> {
+  const stats = new Map<
+    InventoryId,
+    {
+      batchCount: number;
+      nearExpiryBatchCount: number;
+      earliestExpiryDate?: number;
+    }
+  >();
+  await Promise.all(
+    inventoryIds.map(async (inventoryId) => {
+      const batches = (await ctx.db
+        .query<BatchDoc>("batches")
+        .withIndex("by_inventory_expiry", (q) =>
+          q.eq("inventoryId", inventoryId),
+        )
+        .collect()) as BatchDoc[];
+      stats.set(inventoryId, {
+        batchCount: batches.length,
+        nearExpiryBatchCount: batches.filter((batch) => batch.isNearExpiry).length,
+        earliestExpiryDate: batches[0]?.expiryDate,
+      });
+    }),
+  );
+  return stats;
+}
+
+export async function listByCenterHandler(
+  ctx: { db: DbReader },
+  args: ListByCenterArgs,
+) {
+  const limit = quickInventoryLimit(args.limit);
+  const rawRows = args.fulfillmentCenterId
+    ? ((await ctx.db
+        .query("inventory")
+        .withIndex("by_center_active", (q) =>
+          q.eq("fulfillmentCenterId", args.fulfillmentCenterId!),
+        )
+        .collect()) as QuickInventoryDoc[])
+    : ((await ctx.db.query("inventory").collect()) as QuickInventoryDoc[]);
+  let rows = rawRows.filter(isQuickInventoryRow);
+  if (args.status) {
+    rows = rows.filter((row) => stockStatus(row) === args.status);
+  }
+
+  const needsProductLookup = rows.filter((row) => row.productName === undefined);
+  const productLookup = await fetchProductsById(
+    ctx,
+    needsProductLookup.map((row) => row.productId!),
+  );
+
+  const needsCenterLookup = rows.filter(
+    (row) => row.fulfillmentCenterName === undefined,
+  );
+  const centerLookup = await fetchCentersById(
+    ctx,
+    needsCenterLookup.map((row) => row.fulfillmentCenterId!),
+  );
+
+  if (args.search) {
+    const search = args.search.toLowerCase();
+    rows = rows.filter((row) =>
+      rowSearchText(
+        row,
+        productLookup.get(row.productId!),
+        centerLookup.get(row.fulfillmentCenterId!),
+      ).includes(search),
+    );
+  }
+
+  rows.sort((a, b) => {
+    const aStatus = stockStatus(a);
+    const bStatus = stockStatus(b);
+    if (aStatus !== bStatus) return aStatus.localeCompare(bStatus);
+    return rowSortName(a, productLookup.get(a.productId!)).localeCompare(
+      rowSortName(b, productLookup.get(b.productId!)),
+    );
+  });
+
+  const pageRows = rows.slice(0, limit);
+  const missingPageProducts = pageRows.filter(
+    (row) => !productLookup.has(row.productId!),
+  );
+  const missingPageCenters = pageRows.filter(
+    (row) => !centerLookup.has(row.fulfillmentCenterId!),
+  );
+  const [pageProducts, pageCenters, pricing, batchStats] = await Promise.all([
+    fetchProductsById(
+      ctx,
+      missingPageProducts.map((row) => row.productId!),
+    ),
+    fetchCentersById(
+      ctx,
+      missingPageCenters.map((row) => row.fulfillmentCenterId!),
+    ),
+    fetchPricingByInventoryId(
+      ctx,
+      pageRows.map((row) => row._id),
+    ),
+    fetchBatchStatsByInventoryId(
+      ctx,
+      pageRows.map((row) => row._id),
+    ),
+  ]);
+  for (const [id, product] of pageProducts) productLookup.set(id, product);
+  for (const [id, center] of pageCenters) centerLookup.set(id, center);
+
+  return pageRows.map((row) => {
+    const computed = withComputed(row);
+    const stats = batchStats.get(row._id) ?? {
+      batchCount: 0,
+      nearExpiryBatchCount: 0,
+      earliestExpiryDate: undefined,
+    };
+    return {
+      ...computed,
+      status: stockStatus(row),
+      product: productLookup.get(row.productId!) ?? null,
+      fulfillmentCenter: centerLookup.get(row.fulfillmentCenterId!) ?? null,
+      pricing: pricing.get(row._id) ?? null,
+      ...stats,
+    };
+  });
 }
 
 export const getInventoryBySkuAndCenter = query({
@@ -262,55 +495,7 @@ export const listByCenter = query({
     limit: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
-    const rawRows = args.fulfillmentCenterId
-      ? ((await ctx.db
-          .query("inventory")
-          .withIndex("by_center_active", (q) =>
-            q.eq("fulfillmentCenterId", args.fulfillmentCenterId!),
-          )
-          .collect()) as QuickInventoryDoc[])
-      : ((await ctx.db.query("inventory").collect()) as QuickInventoryDoc[]);
-    const rows = rawRows.filter((row) => row.sku && row.productId && row.fulfillmentCenterId);
-    const centerIds = Array.from(new Set(rows.map((row) => row.fulfillmentCenterId!)));
-    const centers = new Map<CenterId, FulfillmentCenterDoc>();
-    for (const centerId of centerIds) {
-      const center = (await ctx.db.get(centerId)) as FulfillmentCenterDoc | null;
-      if (center) centers.set(centerId, center);
-    }
-
-    const out = [];
-    for (const row of rows) {
-      const product = (await ctx.db.get(row.productId!)) as ProductDoc | null;
-      const center = centers.get(row.fulfillmentCenterId!);
-      const pricing = (await ctx.db
-        .query("inventoryPricing")
-        .withIndex("by_inventory", (q) => q.eq("inventoryId", row._id))
-        .first()) as InventoryPricingDoc | null;
-      const batches = (await ctx.db
-        .query("batches")
-        .withIndex("by_inventory_expiry", (q) => q.eq("inventoryId", row._id))
-        .collect()) as BatchDoc[];
-      const computed = withComputed(row);
-      const statusValue = stockStatus(row);
-      if (args.status && statusValue !== args.status) continue;
-      const searchable = `${row.sku ?? ""} ${product?.name ?? ""} ${product?.brand ?? ""} ${center?.name ?? ""}`.toLowerCase();
-      if (args.search && !searchable.includes(args.search.toLowerCase())) continue;
-      out.push({
-        ...computed,
-        status: statusValue,
-        product,
-        fulfillmentCenter: center,
-        pricing,
-        batchCount: batches.length,
-        nearExpiryBatchCount: batches.filter((batch) => batch.isNearExpiry).length,
-        earliestExpiryDate: batches[0]?.expiryDate,
-      });
-    }
-    out.sort((a, b) => {
-      if (a.status !== b.status) return a.status.localeCompare(b.status);
-      return (a.product?.name ?? a.sku ?? "").localeCompare(b.product?.name ?? b.sku ?? "");
-    });
-    return out.slice(0, Math.min(Math.max(args.limit ?? 300, 1), 500));
+    return listByCenterHandler(ctx, args);
   },
 });
 
