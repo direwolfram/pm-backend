@@ -336,6 +336,24 @@ async function enrichOrders(ctx: { db: any }, orders: OrderDoc[]) {
   });
 }
 
+/**
+ * Orders returned by the list endpoints must carry current summaries
+ * (item_count + order_search_text). A stale or missing version means legacy
+ * data has not been repaired yet; refuse to serve instead of returning
+ * incomplete search results or wrong item counts. See
+ * docs/orders-list-rollout.md for the rollout sequence.
+ */
+function assertOrderSummariesCurrent(orders: OrderDoc[]) {
+  const stale = orders.find(
+    (order) => (order.orderSummaryVersion ?? 0) < ORDER_SUMMARY_VERSION,
+  );
+  if (stale) {
+    throw new Error(
+      "Order list summaries are stale or missing; run orders.backfillOrderListSummaries until orders.orderSummaryReadiness reports ready before serving the order list",
+    );
+  }
+}
+
 export async function listHandler(
   ctx: { db: any },
   args: {
@@ -350,6 +368,7 @@ export async function listHandler(
   },
 ) {
   const { rows, pagination } = await pageOrders(ctx, args);
+  assertOrderSummariesCurrent(rows);
   const enriched = await enrichOrders(ctx, rows);
   return pageResponse(enriched, args, pagination);
 }
@@ -367,30 +386,19 @@ const TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
 };
 
 /**
- * orders.list — bounded contract (v2).
+ * orders.list — legacy-compatible endpoint.
  *
- * The pre-v2 endpoint scanned the whole orders/customers/stores/order_items
- * tables per request, which let it offer arbitrary offsets, exact totals for
- * any domain, and naive substring search. Those semantics cannot be
- * preserved with bounded reads, so this endpoint is an explicit v2 contract:
+ * Preserved for existing/legacy callers during the migration to
+ * orders.listV2. Semantics shared with listV2 (see pageOrders):
+ * deterministic newest-first ordering (placed_at desc, _id desc), exact
+ * numeric totals on every path (maintained counters for equality filters,
+ * bounded scans capped by ORDER_LIST_SCAN_CAP for search/date-window/missing
+ * -counter domains, explicit errors beyond the cap), and token-prefix search
+ * over order_search_text.
  *
- * - Ordering: deterministic newest-first (placed_at desc, _id desc) on every
- *   path, with timestamp ties broken by _id so pages never overlap or gap.
- * - Pagination: opaque, filter-fingerprinted cursors are the primary API.
- *   Legacy `offset` is honored up to MAX_COMPAT_OFFSET (200) and rejected
- *   with a documented error beyond that instead of silently truncating.
- * - Totals: exact numeric totals on every path — O(1) maintained counters
- *   for equality filters, a bounded scan (ORDER_LIST_SCAN_CAP) for search,
- *   date-window, and counter-missing domains. Domains above the cap are
- *   rejected with an explicit error, never an estimate or capped value.
- * - Search semantics (deliberate change from v1): token-prefix matching over
- *   the denormalized order_search_text (order number, customer name, phone),
- *   not arbitrary substring matching. A partial token that is not a word
- *   prefix no longer matches; this is what makes search indexed and bounded.
- * - Caller audit: the only in-repo caller (src/pages/Orders.tsx) uses
- *   status/store/search/limit only — no offset, cursor, or date window — and
- *   is fully compatible with this contract. Deep-offset consumers must
- *   migrate to cursor pagination.
+ * Legacy offset pagination is honored up to MAX_COMPAT_OFFSET (200) and
+ * rejected with a documented error beyond it — deep paging requires the
+ * cursor API. New callers must use orders.listV2.
  */
 export const list = query({
   args: {
@@ -399,6 +407,34 @@ export const list = query({
     search: v.optional(v.string()),
     limit: v.optional(v.number()),
     offset: v.optional(v.number()),
+    cursor: v.optional(v.union(v.string(), v.null())),
+    placed_from: v.optional(v.number()),
+    placed_to: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    return await listHandler(ctx, args);
+  },
+});
+
+/**
+ * orders.listV2 — explicitly versioned, cursor-first endpoint.
+ *
+ * Same bounded contract as orders.list minus legacy offset support:
+ * - Pagination: opaque cursors fingerprinted to search/status/store/date
+ *   filters; reuse with different filters fails predictably. No `offset`
+ *   argument — deep paging is cursor-only.
+ * - Ordering: newest-first (placed_at desc, _id desc) on every path.
+ * - Totals: exact numeric totals; search and date-window domains larger
+ *   than ORDER_LIST_SCAN_CAP are rejected explicitly, never estimated.
+ * - Reads: one capped page plus bounded metadata; enrichment fetches only
+ *   the customers/stores referenced by the returned page, deduplicated.
+ */
+export const listV2 = query({
+  args: {
+    status: v.optional(orderStatus),
+    store_id: v.optional(v.id("stores")),
+    search: v.optional(v.string()),
+    limit: v.optional(v.number()),
     cursor: v.optional(v.union(v.string(), v.null())),
     placed_from: v.optional(v.number()),
     placed_to: v.optional(v.number()),

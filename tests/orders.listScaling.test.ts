@@ -24,6 +24,8 @@ function order(id: string, storeId: string, customerId: string, placedAt: number
     delivery_fee_amount: 0,
     total_amount: 100,
     item_count: 2,
+    order_search_text: `pm-${id}`.toLowerCase(),
+    orderSummaryVersion: 2,
     placed_at: placedAt,
   });
 }
