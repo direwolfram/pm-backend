@@ -503,10 +503,12 @@ export const run = mutation({
       title: "Header",
       tab: "All",
       sortOrder: 0,
+      backgroundColor: "#FFFFFF",
       config: {
         showLocation: true,
         showProfile: true,
         showCart: true,
+        backgroundColor: "#FFFFFF",
         variant: "default",
       },
     });

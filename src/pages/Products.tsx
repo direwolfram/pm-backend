@@ -5,6 +5,13 @@ import { Pencil, Plus, Search, Trash2 } from "lucide-react";
 import { api } from "@/lib/convexClient";
 import { formatMoney } from "@/lib/format";
 import {
+  accumulatedRows,
+  applyPage,
+  emptyAccumulator,
+  requestNextPage,
+  type PageAccumulator,
+} from "@/lib/productPages";
+import {
   ConfirmButton,
   EmptyState,
   Loading,
@@ -51,7 +58,10 @@ type ListResult = {
   totalIsExact: boolean;
   nextCursor: string | null;
   hasMore: boolean;
+  summariesPending?: number;
 };
+
+const PAGE_LIMIT = 100;
 
 const EMPTY_FORM = {
   name: "",
@@ -111,13 +121,30 @@ export default function Products() {
   const [categoryId, setCategoryId] = useState<string>("all");
   const [brandId, setBrandId] = useState<string>("all");
 
+  const filtersKey = `${search}|${status}|${categoryId}|${brandId}`;
+  const [pagination, setPagination] = useState<PageAccumulator<ProductListRow>>(
+    emptyAccumulator,
+  );
+  const [appliedFiltersKey, setAppliedFiltersKey] = useState(filtersKey);
+  if (appliedFiltersKey !== filtersKey) {
+    setAppliedFiltersKey(filtersKey);
+    setPagination(emptyAccumulator());
+  }
+
   const result = useQuery(api.products.listV2, {
     search: search || undefined,
     status: status === "all" ? undefined : status,
     category_id: categoryId === "all" ? undefined : categoryId,
     brand_id: brandId === "all" ? undefined : brandId,
-    limit: 200,
+    limit: PAGE_LIMIT,
+    cursor: pagination.activeCursor,
   }) as ListResult | undefined;
+
+  const [appliedResult, setAppliedResult] = useState<ListResult | null>(null);
+  if (result && result !== appliedResult) {
+    setAppliedResult(result);
+    setPagination((current) => applyPage(current, current.activeCursor, result.data));
+  }
   const categories =
     (useQuery(api.categories.list, { includeInactive: true, limit: 200 }) as
       | { data: CategoryDoc[] }
@@ -258,12 +285,17 @@ export default function Products() {
     if (ok) setDialogOpen(false);
   };
 
-  const rows = useMemo(() => result?.data ?? [], [result]);
+  const rows = useMemo(() => accumulatedRows(pagination), [pagination]);
   const activeCount = rows.filter((p) => p.status === "active").length;
   const draftCount = rows.filter((p) => p.status === "draft").length;
   const discontinuedCount = rows.filter((p) => p.status === "discontinued").length;
   const totalSkus = rows.reduce((sum, p) => sum + p.sku_count, 0);
   const totalStock = rows.reduce((sum, p) => sum + p.total_stock, 0);
+  const catalogTotal = result
+    ? result.totalIsExact
+      ? result.total
+      : `${rows.length}+`
+    : rows.length;
 
   return (
     <div>
@@ -279,7 +311,7 @@ export default function Products() {
 
       <div className="mb-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
         {[
-          ["Catalog items", result?.total ?? rows.length],
+          ["Catalog items", catalogTotal],
           ["Active products", activeCount],
           ["SKUs", totalSkus],
           ["Units in stock", totalStock],
@@ -352,7 +384,7 @@ export default function Products() {
         </div>
       </div>
 
-      {!result ? (
+      {!result && rows.length === 0 ? (
         <Loading />
       ) : rows.length === 0 ? (
         <EmptyState title="No products found" hint="Adjust filters or create a new product." />
@@ -425,6 +457,22 @@ export default function Products() {
               ))}
             </TableBody>
           </Table>
+        </div>
+      )}
+
+      {rows.length > 0 && (result?.hasMore || !result) && (
+        <div className="mb-4 flex justify-center">
+          <Button
+            variant="outline"
+            disabled={!result?.hasMore}
+            onClick={() =>
+              setPagination((current) => requestNextPage(current, result?.nextCursor ?? null))
+            }
+          >
+            {!result
+              ? "Loading…"
+              : `Load more (showing ${rows.length}${result.totalIsExact ? ` of ${result.total}` : ""})`}
+          </Button>
         </div>
       )}
 

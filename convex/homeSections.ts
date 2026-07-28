@@ -58,14 +58,19 @@ const sectionFields = {
   maxAppVersion: v.optional(v.string()),
   layoutVariant: v.optional(v.string()),
   backgroundColor: v.optional(v.string()),
+  backgroundImage: v.optional(v.string()),
+  backgroundImageStorageId: v.optional(v.id("_storage")),
   textColor: v.optional(v.string()),
   imageUrl: v.optional(v.string()),
+  imageStorageId: v.optional(v.id("_storage")),
+  storageId: v.optional(v.id("_storage")),
   iconEmoji: v.optional(v.string()),
   maxItems: v.optional(v.number()),
   productIds: v.optional(v.array(v.id("products"))),
   categoryIds: v.optional(v.array(v.id("categories"))),
   promotionIds: v.optional(v.array(v.id("promotions"))),
   brandIds: v.optional(v.array(v.id("brands"))),
+  allowDuplicateTopChrome: v.optional(v.boolean()),
   config: v.optional(v.any()),
   resolvedData: v.optional(v.any()),
 };
@@ -101,6 +106,104 @@ const productSectionKinds = new Set([
   "store_inventory_section",
 ]);
 
+const TOP_CHROME_KINDS = ["header", "search_bar", "category_tabs"] as const;
+type TopChromeKind = (typeof TOP_CHROME_KINDS)[number];
+
+const TOP_CHROME_SORT_ORDER: Record<TopChromeKind, number> = {
+  header: 0,
+  search_bar: 10,
+  category_tabs: 20,
+};
+
+const BODY_SECTION_MIN_SORT_ORDER = 30;
+
+const topChromeKindSet: ReadonlySet<string> = new Set(TOP_CHROME_KINDS);
+
+function isTopChromeKind(kind: string | undefined): kind is TopChromeKind {
+  return !!kind && topChromeKindSet.has(kind);
+}
+
+function topChromeRank(kind: string | undefined): number {
+  const index = TOP_CHROME_KINDS.indexOf(kind as TopChromeKind);
+  return index === -1 ? TOP_CHROME_KINDS.length : index;
+}
+
+function compareSectionsForDisplay(a: HomeSectionDoc, b: HomeSectionDoc): number {
+  const rankDiff = topChromeRank(a.kind) - topChromeRank(b.kind);
+  if (rankDiff !== 0) return rankDiff;
+  const sortDiff = (a.sortOrder ?? 0) - (b.sortOrder ?? 0);
+  if (sortDiff !== 0) return sortDiff;
+  return (a.key ?? a._id).localeCompare(b.key ?? b._id);
+}
+
+function enforceTopChromeConfig(
+  kind: string,
+  config: Record<string, unknown> | undefined,
+): Record<string, unknown> {
+  const next = { ...(config ?? {}) };
+  if (kind === "search_bar" || kind === "category_tabs") next.stickyOnScroll = true;
+  if (kind === "header") next.stickyOnScroll = false;
+  return next;
+}
+
+async function resolveStorageUrl(
+  context: Pick<ResolutionContext, "storage">,
+  storageId: unknown,
+): Promise<string | undefined> {
+  if (!context.storage || typeof storageId !== "string" || !storageId) return undefined;
+  return (await context.storage.getUrl(storageId as any)) ?? undefined;
+}
+
+async function responseImagesForSection(
+  context: ResolutionContext,
+  section: HomeSectionDoc,
+  config: Record<string, unknown>,
+) {
+  const imageUrl =
+    (await resolveStorageUrl(context, section.imageStorageId ?? section.storageId)) ??
+    section.imageUrl;
+  const backgroundImage =
+    (await resolveStorageUrl(context, section.backgroundImageStorageId)) ??
+    section.backgroundImage ??
+    (typeof config.backgroundImage === "string" ? config.backgroundImage : undefined) ??
+    (typeof config.backgroundImageUrl === "string" ? config.backgroundImageUrl : undefined);
+
+  const configImageUrl =
+    (await resolveStorageUrl(context, config.imageStorageId ?? config.storageId)) ??
+    (typeof config.imageUrl === "string" ? config.imageUrl : undefined);
+  const configBackgroundImage =
+    (await resolveStorageUrl(context, config.backgroundImageStorageId)) ??
+    (typeof config.backgroundImage === "string" ? config.backgroundImage : undefined) ??
+    (typeof config.backgroundImageUrl === "string" ? config.backgroundImageUrl : undefined) ??
+    backgroundImage;
+
+  return {
+    imageUrl,
+    backgroundImage,
+    config: {
+      ...config,
+      ...(configImageUrl ? { imageUrl: configImageUrl } : {}),
+      ...(configBackgroundImage ? { backgroundImage: configBackgroundImage } : {}),
+    },
+  };
+}
+
+function healBodySortOrder(section: HomeSectionDoc): number | undefined {
+  if (isTopChromeKind(section.kind)) return undefined;
+  if ((section.sortOrder ?? 0) < BODY_SECTION_MIN_SORT_ORDER) return BODY_SECTION_MIN_SORT_ORDER;
+  return undefined;
+}
+
+function orderSectionsForDisplay(sections: HomeSectionDoc[]): HomeSectionDoc[] {
+  const seenChromeKinds = new Set<string>();
+  return [...sections].sort(compareSectionsForDisplay).filter((section) => {
+    if (!isTopChromeKind(section.kind)) return true;
+    if (seenChromeKinds.has(section.kind)) return false;
+    seenChromeKinds.add(section.kind);
+    return true;
+  });
+}
+
 type ResolvedSectionData = Record<string, unknown> & {
   products?: unknown[];
   categories?: unknown[];
@@ -119,6 +222,7 @@ type ResolutionDataset =
 
 type ResolutionContext = {
   db: any;
+  storage?: { getUrl(id: any): Promise<string | null> };
   required: Set<ResolutionDataset>;
   products?: Promise<ProductDoc[]>;
   categories?: Promise<CategoryDoc[]>;
@@ -134,7 +238,13 @@ const configRules: Record<string, Record<string, "string" | "number" | "boolean"
     showProfile: "boolean",
     showCart: "boolean",
     backgroundColor: "string",
+    backgroundColorDark: "string",
+    backgroundImage: "string",
+    backgroundImageDark: "string",
     backgroundImageUrl: "string",
+    backgroundImageStorageId: "string",
+    imageStorageId: "string",
+    storageId: "string",
     variant: "string",
   },
   search_bar: {
@@ -502,12 +612,18 @@ async function validateSection(
   ctx: { db: any },
   section: HomeSectionDoc,
   existingId?: string,
+  opts?: { allowDuplicateTopChrome?: boolean },
 ) {
   if (!section.kind) throw new Error("kind is required");
   if (!section.key?.trim()) throw new Error("key is required");
   if (!section.tab?.trim()) throw new Error("tab is required");
   if (typeof section.sortOrder !== "number") throw new Error("sortOrder is required");
   if (section.sortOrder < 0) throw new Error("sortOrder cannot be negative");
+  if (!isTopChromeKind(section.kind) && section.sortOrder < BODY_SECTION_MIN_SORT_ORDER) {
+    throw new Error(
+      `Body section sortOrder must be >= ${BODY_SECTION_MIN_SORT_ORDER}; 0-${BODY_SECTION_MIN_SORT_ORDER - 1} is reserved for top chrome (header, search_bar, category_tabs)`,
+    );
+  }
   if (section.startsAt && section.endsAt && section.startsAt >= section.endsAt) {
     throw new Error("startsAt must be before endsAt");
   }
@@ -531,6 +647,24 @@ async function validateSection(
     .withIndex("by_key", (q: any) => q.eq("key", section.key))
     .first();
   if (duplicate && duplicate._id !== existingId) throw new Error(`Section key "${section.key}" is already used`);
+  if (isTopChromeKind(section.kind) && !opts?.allowDuplicateTopChrome && !section.archivedAt) {
+    const tabSections = (await ctx.db
+      .query("home_sections")
+      .withIndex("by_tab", (q: any) => q.eq("tab", section.tab))
+      .collect()) as HomeSectionDoc[];
+    const conflict = tabSections.find(
+      (other) =>
+        other._id !== existingId &&
+        other.kind === section.kind &&
+        !other.archivedAt &&
+        !isWireframeSection(other),
+    );
+    if (conflict) {
+      throw new Error(
+        `Tab "${section.tab}" already has a ${section.kind} section ("${conflict.key ?? conflict._id}"). Archive it first or pass allowDuplicateTopChrome.`,
+      );
+    }
+  }
   await ensureReferences(ctx, section);
 }
 
@@ -584,7 +718,7 @@ function sectionResolutionDatasets(section: HomeSectionDoc, args: { store_id?: s
 }
 
 function buildResolutionContext(
-  ctx: { db: any },
+  ctx: { db: any; storage?: { getUrl(id: any): Promise<string | null> } },
   sections: HomeSectionDoc[],
   args: { store_id?: string },
 ): ResolutionContext {
@@ -594,7 +728,7 @@ function buildResolutionContext(
       required.add(dataset);
     }
   }
-  return { db: ctx.db, required };
+  return { db: ctx.db, storage: ctx.storage, required };
 }
 
 function emptyResolvedData(): ResolvedSectionData {
@@ -750,6 +884,8 @@ async function responseForSection(
 ) {
   const normalized = normalizeSection(section);
   const resolvedData = (await resolveSection(context, normalized, args)) as ResolvedSectionData;
+  const enforcedConfig = enforceTopChromeConfig(normalized.kind, normalized.config);
+  const images = await responseImagesForSection(context, normalized, enforcedConfig);
   return {
     id: normalized._id,
     key: normalized.key,
@@ -760,11 +896,12 @@ async function responseForSection(
     sortOrder: normalized.sortOrder ?? 0,
     layoutVariant: normalized.layoutVariant,
     backgroundColor: normalized.backgroundColor,
+    backgroundImage: images.backgroundImage,
     textColor: normalized.textColor,
-    imageUrl: normalized.imageUrl,
+    imageUrl: images.imageUrl,
     iconEmoji: normalized.iconEmoji,
     maxItems: normalized.maxItems,
-    config: normalized.config ?? {},
+    config: images.config,
     resolvedData,
   };
 }
@@ -863,6 +1000,9 @@ async function duplicateSectionsIntoTab(
     .map(normalizeSection)
     .filter((section) => !isWireframeSection(section) && !section.archivedAt);
   const targetHasSections = targetSections.length > 0;
+  const targetChromeKinds = new Set(
+    targetSections.filter((section) => isTopChromeKind(section.kind)).map((section) => section.kind),
+  );
   const baseSortOrder = targetHasSections
     ? Math.max(...targetSections.map((section) => section.sortOrder ?? 0)) + 1
     : 0;
@@ -870,8 +1010,12 @@ async function duplicateSectionsIntoTab(
   let copied = 0;
   const t = now();
   for (const [index, source] of sourceSections.entries()) {
+    if (isTopChromeKind(source.kind) && targetChromeKinds.has(source.kind)) continue;
     const sourceSortOrder = source.sortOrder ?? index;
-    const targetSortOrder = targetHasSections ? baseSortOrder + index : sourceSortOrder;
+    let targetSortOrder = targetHasSections ? baseSortOrder + index : sourceSortOrder;
+    if (!isTopChromeKind(source.kind) && targetSortOrder < BODY_SECTION_MIN_SORT_ORDER) {
+      targetSortOrder = BODY_SECTION_MIN_SORT_ORDER + index * 10;
+    }
     const keyBase = `${tabKeyPrefix(targetTab)}_${source.key}`;
     let key = keyBase;
     let suffix = 2;
@@ -1033,9 +1177,29 @@ export const list = query({
       requestedTab && !isAllTab(requestedTab) && !(await tabUsesOverride(ctx, requestedTab, customSections))
         ? "All"
         : requestedTab;
-    const sections = allSections
+    let sections = allSections
       .filter((section) => (!effectiveTab || section.tab === effectiveTab) && isSectionVisible(section, args))
       .map((section) => (requestedTab && effectiveTab === "All" ? sectionWithDisplayTab(section, requestedTab) : section));
+
+    if (effectiveTab && !isAllTab(effectiveTab)) {
+      const presentChrome = new Set(
+        sections.filter((section) => isTopChromeKind(section.kind)).map((section) => section.kind),
+      );
+      const missingChrome = TOP_CHROME_KINDS.filter((kind) => !presentChrome.has(kind));
+      if (missingChrome.length) {
+        const fallbackChrome = allSections
+          .filter(
+            (section) =>
+              section.tab === "All" &&
+              isTopChromeKind(section.kind) &&
+              missingChrome.includes(section.kind as TopChromeKind) &&
+              isSectionVisible(section, args),
+          )
+          .map((section) => sectionWithDisplayTab(section, effectiveTab));
+        sections = [...sections, ...fallbackChrome];
+      }
+    }
+    sections = orderSectionsForDisplay(sections);
 
     const resolutionContext = buildResolutionContext(ctx, sections, args);
     const resolvedResponses = await Promise.all(
@@ -1124,7 +1288,7 @@ export const adminList = query({
     }
     if (args.state === "archived") rows = rows.filter((s) => !!s.archivedAt);
     if (!args.state || args.state === "all") rows = rows.filter((s) => !s.archivedAt);
-    rows.sort((a, b) => a.tab.localeCompare(b.tab) || (a.sortOrder ?? 0) - (b.sortOrder ?? 0));
+    rows.sort((a, b) => a.tab.localeCompare(b.tab) || compareSectionsForDisplay(a, b));
     const page = rows.slice(offset, offset + limit);
     const resolutionContext = buildResolutionContext(ctx, page, {});
     const data = await Promise.all(
@@ -1140,16 +1304,17 @@ export const adminList = query({
 export const createSection = mutation({
   args: sectionFields,
   handler: async (ctx, args) => {
+    const { allowDuplicateTopChrome, ...fields } = args;
     const t = now();
     const section = mergeSection(null, {
-      ...args,
+      ...fields,
       isActive: args.isActive ?? true,
       allowEmpty: args.allowEmpty ?? false,
       timezone: args.timezone ?? "Asia/Manila",
       createdAt: t,
       updatedAt: t,
     } as Partial<HomeSectionDoc>);
-    await validateSection(ctx, section);
+    await validateSection(ctx, section, undefined, { allowDuplicateTopChrome });
     const id = await ctx.db.insert("home_sections", cleanPatch(section as any) as any);
     await ctx.db.patch(id, { id, updatedAt: now() });
     return id;
@@ -1159,13 +1324,14 @@ export const createSection = mutation({
 async function updateSectionDocument(
   ctx: { db: any },
   id: string,
-  patch: Partial<HomeSectionDoc>,
+  patch: Partial<HomeSectionDoc> & { allowDuplicateTopChrome?: boolean },
 ) {
+  const { allowDuplicateTopChrome, ...fields } = patch;
   const existing = (await ctx.db.get(id as any)) as HomeSectionDoc | null;
   if (!existing) throw new Error("Home section not found");
-  const next = mergeSection(existing, { ...patch, updatedAt: now() });
-  await validateSection(ctx, next, id);
-  await ctx.db.patch(id as any, cleanPatch({ ...patch, updatedAt: now() }));
+  const next = mergeSection(existing, { ...fields, updatedAt: now() });
+  await validateSection(ctx, next, id, { allowDuplicateTopChrome });
+  await ctx.db.patch(id as any, cleanPatch({ ...fields, updatedAt: now() }));
   return id;
 }
 
@@ -1181,9 +1347,19 @@ export const toggleSection = mutation({
   handler: async (ctx, args) => {
     const existing = (await ctx.db.get(args.id)) as HomeSectionDoc | null;
     if (!existing) throw new Error("Home section not found");
-    const next = mergeSection(existing, { isActive: args.isActive, updatedAt: now() });
+    const healedSortOrder = healBodySortOrder(normalizeSection(existing));
+    const next = mergeSection(existing, {
+      isActive: args.isActive,
+      sortOrder: healedSortOrder,
+      updatedAt: now(),
+    });
     await validateSection(ctx, next, args.id);
-    await ctx.db.patch(args.id, { isActive: args.isActive, is_active: args.isActive, updatedAt: now() });
+    await ctx.db.patch(args.id, {
+      isActive: args.isActive,
+      is_active: args.isActive,
+      ...(healedSortOrder !== undefined ? { sortOrder: healedSortOrder, sort_order: healedSortOrder } : {}),
+      updatedAt: now(),
+    });
     return args.id;
   },
 });
@@ -1191,10 +1367,37 @@ export const toggleSection = mutation({
 export const reorderSections = mutation({
   args: { orderedIds: v.array(v.id("home_sections")) },
   handler: async (ctx, args) => {
-    for (const [sortOrder, id] of args.orderedIds.entries()) {
-      const existing = await ctx.db.get(id);
+    const sections: HomeSectionDoc[] = [];
+    for (const id of args.orderedIds) {
+      const existing = (await ctx.db.get(id)) as HomeSectionDoc | null;
       if (!existing) throw new Error(`Home section not found: ${id}`);
-      await ctx.db.patch(id, { sortOrder, sort_order: sortOrder, updatedAt: now() });
+      sections.push(normalizeSection(existing));
+    }
+    const bodySeenTabs = new Set<string>();
+    const chromeSeen = new Set<string>();
+    const bodyCountByTab = new Map<string, number>();
+    for (const section of sections) {
+      const tab = section.tab ?? "All";
+      let sortOrder: number;
+      if (isTopChromeKind(section.kind)) {
+        if (bodySeenTabs.has(tab)) {
+          throw new Error(
+            `Top-chrome section "${section.key}" must be ordered before all body sections in tab "${tab}"`,
+          );
+        }
+        const chromeKey = `${tab}:${section.kind}`;
+        if (chromeSeen.has(chromeKey)) {
+          throw new Error(`Duplicate ${section.kind} section in reorder list for tab "${tab}"`);
+        }
+        chromeSeen.add(chromeKey);
+        sortOrder = TOP_CHROME_SORT_ORDER[section.kind];
+      } else {
+        bodySeenTabs.add(tab);
+        const index = bodyCountByTab.get(tab) ?? 0;
+        bodyCountByTab.set(tab, index + 1);
+        sortOrder = BODY_SECTION_MIN_SORT_ORDER + index * 10;
+      }
+      await ctx.db.patch(section._id as any, { sortOrder, sort_order: sortOrder, updatedAt: now() });
     }
     return args.orderedIds;
   },
@@ -1314,21 +1517,25 @@ export const duplicateSection = mutation({
       suffix += 1;
     }
     const t = now();
+    const sourceSortOrder = source.sortOrder ?? 0;
+    const duplicateSortOrder = isTopChromeKind(source.kind)
+      ? sourceSortOrder
+      : Math.max(sourceSortOrder + 1, BODY_SECTION_MIN_SORT_ORDER);
     const duplicate = {
       ...source,
       id: undefined,
       key,
       title: source.title ? `${source.title} copy` : "Untitled copy",
-      sortOrder: (source.sortOrder ?? 0) + 1,
+      sortOrder: duplicateSortOrder,
       createdAt: t,
       updatedAt: t,
       archivedAt: undefined,
-      sort_order: (source.sortOrder ?? 0) + 1,
+      sort_order: duplicateSortOrder,
       is_active: source.isActive,
     } as HomeSectionDoc;
     delete (duplicate as any)._id;
     delete (duplicate as any)._creationTime;
-    await validateSection(ctx, duplicate);
+    await validateSection(ctx, duplicate, undefined, { allowDuplicateTopChrome: true });
     const id = await ctx.db.insert("home_sections", cleanPatch(duplicate as any) as any);
     await ctx.db.patch(id, { id, updatedAt: now() });
     return id;
@@ -1350,9 +1557,20 @@ export const restoreSection = mutation({
   handler: async (ctx, args) => {
     const existing = (await ctx.db.get(args.id)) as HomeSectionDoc | null;
     if (!existing) throw new Error("Home section not found");
-    const next = mergeSection(existing, { archivedAt: undefined, updatedAt: now() });
+    const healedSortOrder = healBodySortOrder(normalizeSection(existing));
+    const next = {
+      ...mergeSection(existing, {
+        sortOrder: healedSortOrder,
+        updatedAt: now(),
+      }),
+      archivedAt: undefined,
+    };
     await validateSection(ctx, next, args.id);
-    await ctx.db.patch(args.id, { archivedAt: undefined, updatedAt: now() });
+    await ctx.db.patch(args.id, {
+      archivedAt: undefined,
+      ...(healedSortOrder !== undefined ? { sortOrder: healedSortOrder, sort_order: healedSortOrder } : {}),
+      updatedAt: now(),
+    });
     return args.id;
   },
 });
@@ -1386,7 +1604,7 @@ export const seedDefaults = mutation({
     const pickCategories = (names: string[]) =>
       names.map((name) => categoryByName.get(name)).filter(Boolean) as any[];
     const defs: Partial<HomeSectionDoc>[] = [
-      { key: "header_default", kind: "header", title: "Header", tab: "All", sortOrder: 0, config: { showLocation: true, showProfile: true, showCart: true, variant: "default" } },
+      { key: "header_default", kind: "header", title: "Header", tab: "All", sortOrder: 0, backgroundColor: "#FFFFFF", config: { showLocation: true, showProfile: true, showCart: true, backgroundColor: "#FFFFFF", variant: "default" } },
       { key: "search_bar_default", kind: "search_bar", title: "Search", tab: "All", sortOrder: 10, config: { placeholder: "Search for groceries", showMic: true, showScanner: true, stickyOnScroll: true, variant: "rounded" } },
       { key: "category_tabs_default", kind: "category_tabs", title: "Tabs", tab: "All", sortOrder: 20, categoryIds: pickCategories(["Beverages", "Pantry", "Snacks", "Personal Care", "Household"]), config: { tabs: ["All", "Grocery", "Snacks", "Beauty"], defaultTab: "All", stickyOnScroll: true, variant: "pill" } },
       { key: "hero_default", kind: "hero_banner", title: "Fresh groceries in minutes", subtitle: "Daily essentials delivered fast.", tab: "All", sortOrder: 30, imageUrl: "https://images.unsplash.com/photo-1542838132-92c53300491e", layoutVariant: "wide", config: { title: "Fresh groceries in minutes", subtitle: "Daily essentials delivered fast.", imageUrl: "https://images.unsplash.com/photo-1542838132-92c53300491e", ctaLabel: "Shop now", ctaRoute: "/categories", variant: "wide" } },
@@ -1453,12 +1671,15 @@ export const create = mutation({
       .replace(/[^a-z0-9]+/g, "_")
       .replace(/^_+|_+$/g, "");
     const t = now();
+    const defaultSortOrder = isTopChromeKind(args.kind)
+      ? TOP_CHROME_SORT_ORDER[args.kind]
+      : BODY_SECTION_MIN_SORT_ORDER;
     const section = mergeSection(null, {
       key,
       title: args.title,
       kind: args.kind,
       tab: args.tab ?? "All",
-      sortOrder: args.sort_order ?? 0,
+      sortOrder: args.sort_order ?? defaultSortOrder,
       isActive: args.is_active ?? true,
       allowEmpty: false,
       timezone: "Asia/Manila",

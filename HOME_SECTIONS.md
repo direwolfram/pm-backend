@@ -88,3 +88,18 @@ true })` after catalog data is present, or create/edit sections from the admin
 Home sections screen. New mutations enforce unique `key`, valid references,
 valid dates, valid time windows, non-negative `sortOrder`, app-version ranges,
 and per-kind config fields.
+
+## Top-chrome ordering contract
+
+`homeSections.list` always returns top chrome first, in this order, per tab:
+
+1. `header` (sortOrder 0, never sticky)
+2. `search_bar` (sortOrder 10, `config.stickyOnScroll: true`)
+3. `category_tabs` (sortOrder 20, `config.stickyOnScroll: true`)
+4. Body sections (sortOrder 30+), in stable `sortOrder` order
+
+Sort orders 0-29 are reserved for top chrome; create/update/reorder mutations
+reject body sections saved inside that band. Only one section per top-chrome
+kind is allowed per tab (pass `allowDuplicateTopChrome` to override), and the
+list query dedupes duplicates defensively. Tabs with their own override layout
+but no top chrome inherit the missing chrome sections from the `All` tab.

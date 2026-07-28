@@ -1,4 +1,4 @@
-import { useMemo, useState, type ReactNode } from "react";
+import { useMemo, useRef, useState, type ChangeEvent, type ReactNode } from "react";
 import { useMutation, useQuery } from "convex/react";
 import {
   Archive,
@@ -9,11 +9,14 @@ import {
   FolderPlus,
   GripVertical,
   Pencil,
+  Pin,
   Plus,
   RotateCcw,
   Save,
   ToggleLeft,
   ToggleRight,
+  Upload,
+  X,
 } from "lucide-react";
 import { api } from "@/lib/convexClient";
 import { formatDateTime, fromLocalInput, toLocalInput } from "@/lib/format";
@@ -84,6 +87,8 @@ type FormState = {
   maxAppVersion: string;
   layoutVariant: string;
   backgroundColor: string;
+  backgroundImage: string;
+  backgroundImageStorageId: string;
   textColor: string;
   imageUrl: string;
   iconEmoji: string;
@@ -263,6 +268,8 @@ const EMPTY_FORM: FormState = {
   maxAppVersion: "",
   layoutVariant: "",
   backgroundColor: "",
+  backgroundImage: "",
+  backgroundImageStorageId: "",
   textColor: "",
   imageUrl: "",
   iconEmoji: "",
@@ -328,6 +335,8 @@ function sectionToForm(section: AdminSection): FormState {
     maxAppVersion: section.maxAppVersion ?? "",
     layoutVariant: section.layoutVariant ?? "",
     backgroundColor: section.backgroundColor ?? "",
+    backgroundImage: section.backgroundImage ?? "",
+    backgroundImageStorageId: section.backgroundImageStorageId ?? "",
     textColor: section.textColor ?? "",
     imageUrl: section.imageUrl ?? "",
     iconEmoji: section.iconEmoji ?? "",
@@ -365,6 +374,8 @@ function cleanPayload(form: FormState) {
     maxAppVersion: form.maxAppVersion.trim() || undefined,
     layoutVariant: form.layoutVariant.trim() || undefined,
     backgroundColor: form.backgroundColor.trim() || undefined,
+    backgroundImage: form.backgroundImage.trim() || undefined,
+    backgroundImageStorageId: form.backgroundImageStorageId || undefined,
     textColor: form.textColor.trim() || undefined,
     imageUrl: form.imageUrl.trim() || undefined,
     iconEmoji: form.iconEmoji.trim() || undefined,
@@ -391,6 +402,12 @@ function kindLabel(kind: HomeSectionKind) {
 
 function isWireframeSection(section: AdminSection) {
   return /^wirefram/i.test(section.tab) || section.key?.startsWith("wireframe_") === true;
+}
+
+const CHROME_KIND_ORDER: HomeSectionKind[] = ["header", "search_bar", "category_tabs"];
+
+function isChromeKind(kind: HomeSectionKind) {
+  return CHROME_KIND_ORDER.includes(kind);
 }
 
 function sortSections(sections: AdminSection[]) {
@@ -464,6 +481,17 @@ export default function HomeSections() {
     selectedTab === "All" ? true : (currentLayout?.overrideEnabled ?? customRows.length > 0);
   const isInherited = selectedTab !== "All" && !overrideEnabled;
   const visibleRows = isInherited ? allRows : customRows;
+  const chromeRows = useMemo(
+    () =>
+      CHROME_KIND_ORDER.map((kind) => visibleRows.find((section) => section.kind === kind)).filter(
+        (section): section is AdminSection => !!section,
+      ),
+    [visibleRows],
+  );
+  const bodyRows = useMemo(
+    () => visibleRows.filter((section) => !isChromeKind(section.kind)),
+    [visibleRows],
+  );
   const copySourceOptions = tabs.filter((tab) => tab !== selectedTab);
   const selectedCopySource = copySourceOptions.includes(copySourceTab)
     ? copySourceTab
@@ -504,10 +532,10 @@ export default function HomeSections() {
 
   const reorderVisibleRows = async (sectionId: string, direction: -1 | 1) => {
     if (isInherited) return;
-    const index = visibleRows.findIndex((section) => section._id === sectionId);
+    const index = bodyRows.findIndex((section) => section._id === sectionId);
     const target = index + direction;
-    if (target < 0 || target >= visibleRows.length) return;
-    const next = [...visibleRows];
+    if (target < 0 || target >= bodyRows.length) return;
+    const next = [...bodyRows];
     [next[index], next[target]] = [next[target], next[index]];
     await runMutation(
       () => reorderSections({ orderedIds: next.map((section) => section._id) }),
@@ -517,7 +545,7 @@ export default function HomeSections() {
 
   const dropSection = async (targetId: string) => {
     if (!draggingId || draggingId === targetId || isInherited) return;
-    const next = [...visibleRows];
+    const next = [...bodyRows];
     const from = next.findIndex((section) => section._id === draggingId);
     const to = next.findIndex((section) => section._id === targetId);
     if (from < 0 || to < 0) return;
@@ -707,7 +735,16 @@ export default function HomeSections() {
                 hint={isInherited ? "Inherited content is filtered out by the current filters." : undefined}
               />
             ) : (
-              visibleRows.map((section, index) => (
+              <>
+                {chromeRows.length > 0 && (
+                  <TopChromeGroup
+                    sections={chromeRows}
+                    disabled={isInherited}
+                    onEdit={openEdit}
+                    onPreview={setPreview}
+                  />
+                )}
+                {bodyRows.map((section, index) => (
                   <Card
                     key={section._id}
                     draggable={!isInherited}
@@ -866,7 +903,8 @@ export default function HomeSections() {
                       </div>
                     </CardContent>
                   </Card>
-                ))
+                ))}
+              </>
             )}
           </TabsContent>
         </Tabs>
@@ -951,6 +989,195 @@ export default function HomeSections() {
   );
 }
 
+function TopChromeGroup({
+  sections,
+  disabled,
+  onEdit,
+  onPreview,
+}: {
+  sections: AdminSection[];
+  disabled: boolean;
+  onEdit: (section: AdminSection) => void;
+  onPreview: (preview: HomeSectionResponse) => void;
+}) {
+  const updateSection = useMutation(api.homeSections.updateSection);
+  const toggleSection = useMutation(api.homeSections.toggleSection);
+  const generateUploadUrl = useMutation(api.products.generateUploadUrl);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [uploading, setUploading] = useState(false);
+  const groupColor = sections[0]?.backgroundColor ?? "";
+  const groupImage = sections[0]?.preview.backgroundImage;
+  const [color, setColor] = useState(groupColor);
+  const [syncedColor, setSyncedColor] = useState(groupColor);
+  if (groupColor !== syncedColor) {
+    setSyncedColor(groupColor);
+    setColor(groupColor);
+  }
+
+  const applyToAll = async (patch: Record<string, unknown>, message: string) => {
+    await runMutation(async () => {
+      for (const section of sections) {
+        await updateSection({ id: section._id, patch });
+      }
+    }, message);
+  };
+
+  const onFileChange = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file || !file.type.startsWith("image/")) return;
+    setUploading(true);
+    await runMutation(async () => {
+      const uploadUrl = await generateUploadUrl({});
+      const response = await fetch(uploadUrl, {
+        method: "POST",
+        headers: { "Content-Type": file.type || "application/octet-stream" },
+        body: file,
+      });
+      if (!response.ok) throw new Error(`Upload failed for ${file.name}`);
+      const { storageId } = (await response.json()) as { storageId: string };
+      for (const section of sections) {
+        await updateSection({ id: section._id, patch: { backgroundImageStorageId: storageId } });
+      }
+    }, "Background image applied to header, search and tabs");
+    setUploading(false);
+  };
+
+  return (
+    <Card className="border-primary/40">
+      <CardHeader className="pb-3">
+        <CardTitle className="flex items-center gap-2 text-base">
+          <Pin className="h-4 w-4 text-muted-foreground" /> Top chrome
+        </CardTitle>
+        <div className="mt-2 flex flex-wrap gap-1">
+          <Badge variant="secondary">Pinned</Badge>
+          <Badge variant="secondary">Required</Badge>
+          {disabled ? <Badge variant="secondary">Inherited from All</Badge> : null}
+        </div>
+        <p className="mt-2 text-xs text-muted-foreground">
+          Header, search bar and category tabs are pinned first in the app and share one background
+          area. Set it for all three here, or edit each section individually.
+        </p>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="flex flex-wrap items-end gap-3 rounded-md border bg-muted/40 p-3">
+          <div>
+            <Label>Group background color</Label>
+            <div className="flex gap-2">
+              <Input
+                type="color"
+                value={/^#[0-9a-f]{6}$/i.test(color) ? color : "#ffffff"}
+                onChange={(event) => setColor(event.target.value)}
+                disabled={disabled}
+                className="h-9 w-12 shrink-0 cursor-pointer p-1"
+              />
+              <Input
+                value={color}
+                placeholder="#FFFFFF"
+                onChange={(event) => setColor(event.target.value)}
+                disabled={disabled}
+                className="w-28"
+              />
+            </div>
+          </div>
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={disabled}
+            onClick={() =>
+              applyToAll({ backgroundColor: color.trim() || undefined }, "Group background color applied")
+            }
+          >
+            Apply to all
+          </Button>
+          <div>
+            <Label>Group background image</Label>
+            <div className="flex items-center gap-2">
+              {groupImage ? (
+                <img
+                  src={groupImage}
+                  alt="Group background"
+                  className="h-9 w-16 rounded-md border object-cover"
+                />
+              ) : (
+                <div className="flex h-9 w-16 items-center justify-center rounded-md border border-dashed text-[10px] text-muted-foreground">
+                  None
+                </div>
+              )}
+              <input ref={inputRef} type="file" accept="image/*" className="hidden" onChange={onFileChange} />
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={disabled || uploading}
+                onClick={() => inputRef.current?.click()}
+              >
+                <Upload className="mr-2 h-4 w-4" />
+                {uploading ? "Uploading…" : "Upload for all"}
+              </Button>
+            </div>
+          </div>
+        </div>
+
+        <div className="space-y-2">
+          {sections.map((section) => (
+            <div
+              key={section._id}
+              className="flex flex-wrap items-center justify-between gap-3 rounded-md border px-3 py-2"
+            >
+              <div className="flex min-w-0 items-center gap-3">
+                <span
+                  className="h-8 w-12 shrink-0 rounded-md border bg-muted"
+                  style={{
+                    backgroundColor: section.backgroundColor || undefined,
+                    backgroundImage: section.preview.backgroundImage
+                      ? `url(${section.preview.backgroundImage})`
+                      : undefined,
+                    backgroundSize: "cover",
+                    backgroundPosition: "center",
+                  }}
+                />
+                <div className="min-w-0">
+                  <p className="text-sm font-medium">{kindLabel(section.kind)}</p>
+                  <p className="truncate text-xs text-muted-foreground">
+                    {section.title || section.key}
+                  </p>
+                </div>
+                <StatusBadge
+                  value={
+                    section.archivedAt
+                      ? "hidden"
+                      : section.isActive || section.is_active
+                        ? "active"
+                        : "inactive"
+                  }
+                />
+              </div>
+              <div className="flex items-center gap-2">
+                <Switch
+                  checked={section.isActive ?? section.is_active ?? false}
+                  disabled={disabled || !!section.archivedAt}
+                  onCheckedChange={(isActive) =>
+                    runMutation(
+                      () => toggleSection({ id: section._id, isActive }),
+                      isActive ? "Section enabled" : "Section disabled",
+                    )
+                  }
+                />
+                <Button size="sm" variant="ghost" onClick={() => onPreview(section.preview)}>
+                  <Eye className="mr-1 h-4 w-4" /> Preview
+                </Button>
+                <Button size="sm" variant="ghost" disabled={disabled} onClick={() => onEdit(section)}>
+                  <Pencil className="mr-1 h-4 w-4" /> Edit
+                </Button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
 function SectionDialog({
   editing,
   form,
@@ -1028,6 +1255,13 @@ function SectionDialog({
           <EditorGroup title="Design">
             <TextField label="Layout variant" value={form.layoutVariant} onChange={(layoutVariant) => setForm({ ...form, layoutVariant })} />
             <ColorField label="Background color" value={form.backgroundColor} onChange={(backgroundColor) => setForm({ ...form, backgroundColor })} />
+            <TextField label="Background image URL" value={form.backgroundImage} onChange={(backgroundImage) => setForm({ ...form, backgroundImage })} />
+            <BackgroundImageField
+              storageId={form.backgroundImageStorageId}
+              url={form.backgroundImage}
+              existingUrl={editing?.preview.backgroundImage}
+              onChange={(backgroundImageStorageId) => setForm({ ...form, backgroundImageStorageId })}
+            />
             <ColorField label="Text color" value={form.textColor} onChange={(textColor) => setForm({ ...form, textColor })} />
             <TextField label="Image URL" value={form.imageUrl} onChange={(imageUrl) => setForm({ ...form, imageUrl })} />
             <TextField label="Icon emoji" value={form.iconEmoji} onChange={(iconEmoji) => setForm({ ...form, iconEmoji })} />
@@ -1074,6 +1308,85 @@ function EditorGroup({ title, children }: { title: string; children: ReactNode }
       <h3 className="mb-3 text-sm font-semibold">{title}</h3>
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">{children}</div>
     </section>
+  );
+}
+
+function BackgroundImageField({
+  storageId,
+  url,
+  existingUrl,
+  onChange,
+}: {
+  storageId: string;
+  url: string;
+  existingUrl?: string;
+  onChange: (storageId: string) => void;
+}) {
+  const generateUploadUrl = useMutation(api.products.generateUploadUrl);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [uploading, setUploading] = useState(false);
+  const [localPreview, setLocalPreview] = useState<string | null>(null);
+  const [cleared, setCleared] = useState(false);
+  const preview = cleared
+    ? undefined
+    : (localPreview ?? (storageId ? existingUrl : undefined) ?? (url.trim() || undefined));
+
+  const onFileChange = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file || !file.type.startsWith("image/")) return;
+    setUploading(true);
+    await runMutation(async () => {
+      const uploadUrl = await generateUploadUrl({});
+      const response = await fetch(uploadUrl, {
+        method: "POST",
+        headers: { "Content-Type": file.type || "application/octet-stream" },
+        body: file,
+      });
+      if (!response.ok) throw new Error(`Upload failed for ${file.name}`);
+      const { storageId: id } = (await response.json()) as { storageId: string };
+      onChange(id);
+      setLocalPreview(URL.createObjectURL(file));
+      setCleared(false);
+    }, "Background image uploaded");
+    setUploading(false);
+  };
+
+  const clear = () => {
+    onChange("");
+    setLocalPreview(null);
+    setCleared(true);
+  };
+
+  return (
+    <div className="sm:col-span-2">
+      <Label>Background image</Label>
+      <div className="mt-1 flex items-center gap-2">
+        {preview ? (
+          <img src={preview} alt="Background" className="h-9 w-16 rounded-md border object-cover" />
+        ) : (
+          <div className="flex h-9 w-16 items-center justify-center rounded-md border border-dashed text-[10px] text-muted-foreground">
+            None
+          </div>
+        )}
+        <input ref={inputRef} type="file" accept="image/*" className="hidden" onChange={onFileChange} />
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          disabled={uploading}
+          onClick={() => inputRef.current?.click()}
+        >
+          <Upload className="mr-2 h-4 w-4" />
+          {uploading ? "Uploading…" : preview ? "Replace" : "Upload"}
+        </Button>
+        {preview && (
+          <Button type="button" variant="ghost" size="sm" onClick={clear}>
+            <X className="h-4 w-4" />
+          </Button>
+        )}
+      </div>
+    </div>
   );
 }
 

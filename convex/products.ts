@@ -3,12 +3,20 @@ import { anyApi } from "convex/server";
 import { query, mutation, internalMutation } from "./functions";
 import { boundedPageArgs, now, pageResponse, slugify, unwrapCursor, wrapCursor } from "./helpers";
 import {
-  activePriceForSku,
-  computeProductListSummary,
   deletePricesActiveForSku,
   PRODUCT_LIST_SUMMARY_VERSION,
   recomputeProductListSummary,
 } from "./lib/productListSummaries";
+import {
+  deleteProductSearchTokens,
+  markProductSearchMigrationComplete,
+  PRODUCT_SEARCH_TOKENS_VERSION,
+  productSearchMigrationComplete,
+  SEARCH_TOTAL_UNKNOWN,
+  searchProductsPage,
+  searchTokensForQuery,
+  syncProductSearchTokens,
+} from "./lib/productSearchTokens";
 import { deletePriceTransitionJournal } from "./prices";
 import {
   applyListCountChange,
@@ -33,10 +41,10 @@ const productStatus = v.union(
 
 /**
  * Hard cap on documents a single list request may scan outside its returned
- * page (search match sets and counter-missing totals). Convex search queries
- * cannot be paginated and index ranges cannot be counted without reading
- * them, so these domains are read with take(CAP + 1) and rejected explicitly
- * when larger — never silently truncated and never an unbounded collect.
+ * page (counter-missing totals and the legacy pre-migration search fallback).
+ * Index ranges cannot be counted without reading them, so these domains are
+ * read with take(CAP + 1) and rejected explicitly when larger — never
+ * silently truncated and never an unbounded collect.
  */
 export const PRODUCT_LIST_SCAN_CAP = 512;
 
@@ -122,11 +130,54 @@ async function pageProducts(
   const cursor = unwrapCursor(scope, args.cursor);
   const isSearch = !!args.search?.trim();
   if (isSearch) {
-    // Search domain: exact total = size of the filtered match set. Convex
+    const tokens = searchTokensForQuery(args.search!.trim());
+    if (tokens.length === 0) {
+      return {
+        rows: [],
+        pagination: {
+          isDone: true,
+          nextCursor: null,
+          total: SEARCH_TOTAL_UNKNOWN,
+          totalIsExact: false,
+        },
+      };
+    }
+    if (await productSearchMigrationComplete(ctx)) {
+      // Versioned search semantics (post-migration): genuine cursor pagination
+      // over the productSearchTokens stream. Per-request work is one
+      // page-sized paginated token-index read plus at most `limit` product
+      // gets — independent of the match count. Totals for arbitrary search
+      // are explicitly non-exact (counting matches requires reading them):
+      // total is the SEARCH_TOTAL_UNKNOWN sentinel with totalIsExact false.
+      const page = await searchProductsPage(ctx, {
+        tokens,
+        status: args.status,
+        category_id: args.category_id,
+        brand_id: args.brand_id,
+        limit,
+        cursor,
+      });
+      return {
+        rows: page.rows,
+        pagination: {
+          isDone: page.isDone,
+          nextCursor:
+            page.isDone || !page.continueCursor
+              ? null
+              : wrapCursor(scope, page.continueCursor),
+          total: SEARCH_TOTAL_UNKNOWN,
+          totalIsExact: false,
+        },
+      };
+    }
+    // Legacy pre-migration fallback (explicit migration state): the
+    // productSearchTokens backfill has not completed, so search runs against
+    // the unpaginatable Convex search index with a hard domain cap. Convex
     // search queries cannot be paginated, so the match set is read with a
     // hard cap and sorted deterministically (newest-first, _id tie-break);
     // an over-cap match domain is rejected explicitly instead of being
-    // collected unboundedly or silently truncated.
+    // collected unboundedly or silently truncated. Run
+    // products.backfillProductSearchTokens to switch to the paginated path.
     const matches = (await ctx.db
       .query("products")
       .withSearchIndex("search_products", (q: any) => {
@@ -139,7 +190,7 @@ async function pageProducts(
       .take(PRODUCT_LIST_SCAN_CAP + 1)) as ProductDoc[];
     if (matches.length > PRODUCT_LIST_SCAN_CAP) {
       throw new Error(
-        `Search matched more than ${PRODUCT_LIST_SCAN_CAP} products; narrow the search term or filters`,
+        `Search matched more than ${PRODUCT_LIST_SCAN_CAP} products; narrow the search term or filters, or complete products.backfillProductSearchTokens for cursor-paginated search`,
       );
     }
     matches.sort(compareProductsNewestFirst);
@@ -231,8 +282,20 @@ async function pageProducts(
   };
 }
 
+/**
+ * Page-bounded enrichment: resolves brand/category display names (one get per
+ * distinct id referenced by the page) and serves the stored list-summary
+ * fields maintained by writers and products.backfillProductListSummaries.
+ *
+ * Request-time legacy summary scans were removed deliberately: a list query
+ * must never inspect thousands of SKUs, prices, or inventory rows for an
+ * unsummarized product. Rows whose productListSummaryVersion is stale are
+ * served from their stored fields (zeros when absent) and counted in
+ * `summariesPending` — the explicit migration-state signal telling callers a
+ * backfill is still required. The query path performs no writes.
+ */
 async function enrichProductPage(ctx: { db: any }, rows: ProductDoc[]) {
-  const [brands, categories, missingSummaries, activePrices] = await Promise.all([
+  const [brands, categories] = await Promise.all([
     Promise.all(
       Array.from(
         new Set(rows.map((product) => product.brand_id).filter(Boolean)),
@@ -247,50 +310,26 @@ async function enrichProductPage(ctx: { db: any }, rows: ProductDoc[]) {
           [id, (await ctx.db.get(id as any)) as { name?: string } | null] as const,
       ),
     ),
-    Promise.all(
-      rows
-        .filter(
-          (product) =>
-            product.productListSummaryVersion !== PRODUCT_LIST_SUMMARY_VERSION,
-        )
-        .map(async (product) => {
-          const summary = await computeProductListSummary(ctx, product._id);
-          return [product._id, summary] as const;
-        }),
-    ),
-    Promise.all(
-      rows
-        .map((product) => product.default_sku_id)
-        .filter(Boolean)
-        .map(async (skuId) => {
-          return [
-            skuId,
-            (await activePriceForSku(ctx, skuId, Date.now()))?.sale_price,
-          ] as const;
-        }),
-    ),
   ]);
   const brandName = new Map(brands);
   const catName = new Map(categories);
-  const summaries = new Map(missingSummaries);
-  const activePriceBySku = new Map(activePrices);
-  return rows.map((p): ProductListRow => {
-    const summary = summaries.get(p._id);
-    const defaultSkuId = summary?.default_sku_id ?? p.default_sku_id;
+  let summariesPending = 0;
+  const data = rows.map((p): ProductListRow => {
+    if (p.productListSummaryVersion !== PRODUCT_LIST_SUMMARY_VERSION) {
+      summariesPending += 1;
+    }
     return {
       ...p,
       brand_name: p.brand_id ? brandName.get(p.brand_id)?.name : undefined,
       brand: p.brand,
       category_name: catName.get(p.primary_category_id)?.name,
-      sku_count: summary?.sku_count ?? p.sku_count ?? 0,
-      default_sku_id: defaultSkuId,
-      default_price:
-        (defaultSkuId ? activePriceBySku.get(defaultSkuId) : undefined) ??
-        summary?.default_price ??
-        p.default_price,
-      total_stock: summary?.total_stock ?? p.total_stock ?? 0,
+      sku_count: p.sku_count ?? 0,
+      default_sku_id: p.default_sku_id,
+      default_price: p.default_price,
+      total_stock: p.total_stock ?? 0,
     };
   });
+  return { data, summariesPending };
 }
 
 export async function listHandler(
@@ -306,8 +345,8 @@ export async function listHandler(
   },
 ) {
   const { rows, pagination } = await pageProducts(ctx, args);
-  const enriched = await enrichProductPage(ctx, rows);
-  return pageResponse(enriched, args, pagination);
+  const { data, summariesPending } = await enrichProductPage(ctx, rows);
+  return { ...pageResponse(data, args, pagination), summariesPending };
 }
 
 /**
@@ -315,11 +354,11 @@ export async function listHandler(
  *
  * Preserved for legacy callers during the migration to products.listV2.
  * Semantics shared with listV2 (see pageProducts): deterministic newest-first
- * ordering (updated_at desc, _id desc), exact numeric totals (maintained
- * counters; bounded scans elsewhere), token search over product names with
- * the PRODUCT_LIST_SCAN_CAP domain cap, and legacy offsets honored up to
- * MAX_COMPAT_OFFSET (200) with a documented error beyond. New callers must
- * use products.listV2.
+ * ordering (updated_at desc, _id desc), exact numeric totals for non-search
+ * filters (maintained counters; bounded scans elsewhere), versioned
+ * non-exact search totals over the cursor-paginated token stream, and legacy
+ * offsets honored up to MAX_COMPAT_OFFSET (200) with a documented error
+ * beyond. New callers must use products.listV2.
  */
 export const list = query({
   args: {
@@ -343,11 +382,20 @@ export const list = query({
  *   filters; no `offset` argument — deep paging is cursor-only.
  * - Ordering: newest-first (updated_at desc, _id desc) on every path, so
  *   identical timestamps can never skip or duplicate rows across pages.
- * - Totals: exact numeric totals; search domains larger than
- *   PRODUCT_LIST_SCAN_CAP are rejected explicitly, never estimated.
- * - Reads: one capped page plus bounded metadata; enrichment fetches only
- *   the brands/categories/summaries referenced by the returned page,
- *   deduplicated, and never writes from the query.
+ * - Totals: exact numeric totals for non-search filter combinations via the
+ *   maintained listCounts counters. Search totals are explicitly versioned:
+ *   total is the SEARCH_TOTAL_UNKNOWN sentinel (-1) with totalIsExact false,
+ *   because counting an arbitrary match set requires reading it.
+ * - Search: cursor-paginated over the productSearchTokens stream once
+ *   products.backfillProductSearchTokens has completed (migration state in
+ *   transitionState); per-request work is one page-sized paginated token
+ *   read plus page-sized product gets, independent of the match count.
+ *   Pre-migration, a legacy fallback keeps the PRODUCT_LIST_SCAN_CAP-capped
+ *   search-index behavior.
+ * - Reads: one bounded page plus fixed metadata; enrichment fetches only the
+ *   brands/categories referenced by the returned page, deduplicated, serves
+ *   stored summary fields, reports stale summaries via summariesPending, and
+ *   never writes from the query.
  */
 export const listV2 = query({
   args: {
@@ -526,11 +574,13 @@ export const create = mutation({
       sku_count: 0,
       total_stock: 0,
       productListSummaryVersion: PRODUCT_LIST_SUMMARY_VERSION,
+      productSearchTokensVersion: PRODUCT_SEARCH_TOKENS_VERSION,
       attributes: args.attributes ?? [],
       created_at: now(),
       updated_at: now(),
     };
     const id = await ctx.db.insert("products", doc);
+    await syncProductSearchTokens(ctx, { ...doc, _id: id } as ProductDoc);
     await applyListCountChange(ctx, "products", productCountKeys, null, doc);
     return id;
   },
@@ -576,6 +626,7 @@ export const update = mutation({
     });
     const after = (await ctx.db.get(id)) as ProductDoc | null;
     if (after) {
+      await syncProductSearchTokens(ctx, after);
       await applyListCountChange(
         ctx,
         "products",
@@ -628,6 +679,48 @@ export const backfillProductListSummaries = internalMutation({
       patched,
       nextCursor: result.continueCursor,
       remainingMayExist: !result.isDone,
+    };
+  },
+});
+
+/**
+ * Backfills productSearchTokens rows for products written before the token
+ * stream existed. Drains in bounded batches via the
+ * by_product_search_tokens_version index and records completion in
+ * transitionState ("productSearchTokens"), which flips list queries from the
+ * legacy capped search-index fallback to cursor-paginated token search.
+ */
+export const backfillProductSearchTokens = internalMutation({
+  args: { limit: v.optional(v.number()), cursor: v.optional(v.string()) },
+  handler: async (ctx, args) => {
+    const limit = Math.min(Math.max(args.limit ?? 100, 1), 200);
+    const result = await ctx.db
+      .query("products")
+      .withIndex("by_product_search_tokens_version", (q) =>
+        q.lt("productSearchTokensVersion", PRODUCT_SEARCH_TOKENS_VERSION),
+      )
+      .order("asc")
+      .paginate({ numItems: limit, cursor: args.cursor ?? null });
+    let synced = 0;
+    for (const product of result.page as ProductDoc[]) {
+      await syncProductSearchTokens(ctx, product);
+      synced += 1;
+    }
+    if (!result.isDone) {
+      await ctx.scheduler.runAfter(
+        0,
+        anyApi.products.backfillProductSearchTokens,
+        { limit, cursor: result.continueCursor },
+      );
+    } else {
+      await markProductSearchMigrationComplete(ctx);
+    }
+    return {
+      processed: result.page.length,
+      synced,
+      nextCursor: result.continueCursor,
+      remainingMayExist: !result.isDone,
+      complete: result.isDone,
     };
   },
 });
@@ -782,6 +875,7 @@ export const continueProductDelete = internalMutation({
       });
       return { done: false, operations };
     }
+    await deleteProductSearchTokens(ctx, args.id);
     await applyListCountChange(
       ctx,
       "products",
@@ -878,6 +972,11 @@ export const upsertDummyImages = mutation({
     for (const product of products) {
       const images = dummyImagesForProduct(product.name);
       await ctx.db.patch(product._id as Id<"products">, {
+        images,
+        updated_at: timestamp,
+      });
+      await syncProductSearchTokens(ctx, {
+        ...product,
         images,
         updated_at: timestamp,
       });

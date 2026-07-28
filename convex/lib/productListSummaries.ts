@@ -79,12 +79,14 @@ export function priceIsActiveMaterializable(
 }
 
 /**
- * Exact active price for one SKU. Primary source is the bounded pricesActive
- * mirror; when no mirror rows exist yet (legacy rows written before the
- * mirror/journal rollout, or seeds), fall back to the authoritative prices
- * table via the indexed by_sku read so list reads stay correct while the
- * migration is incomplete. Both reads are bounded; an over-cap price history
- * is rejected explicitly, never silently truncated.
+ * Exact active price for one SKU. Primary source is the pricesActive mirror,
+ * read with the same documented cardinality ceiling as every other mirror
+ * consumer (take of CAP + 1, explicit rejection when a SKU exceeds it —
+ * never an unbounded collect); when no mirror rows exist yet (legacy rows
+ * written before the mirror/journal rollout, or seeds), fall back to the
+ * authoritative prices table via the bounded indexed by_sku read. Both reads
+ * are bounded; an over-cap price history is rejected explicitly, never
+ * silently truncated.
  */
 export async function activePriceForSku(
   ctx: { db: any },
@@ -94,7 +96,12 @@ export async function activePriceForSku(
   const rows = (await ctx.db
     .query("pricesActive")
     .withIndex("by_sku", (q: any) => q.eq("sku_id", skuId))
-    .collect()) as ActivePriceRow[];
+    .take(MAX_ACTIVE_MIRROR_ROWS_PER_SKU + 1)) as ActivePriceRow[];
+  if (rows.length > MAX_ACTIVE_MIRROR_ROWS_PER_SKU) {
+    throw new Error(
+      `SKU ${skuId} has more than ${MAX_ACTIVE_MIRROR_ROWS_PER_SKU} active price mirror rows`,
+    );
+  }
   if (rows.length > 0) return activePriceFromRows(rows, t);
   const prices = (await ctx.db
     .query("prices")

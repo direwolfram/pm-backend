@@ -199,6 +199,7 @@ export interface ProductDoc extends BaseDoc {
   default_price?: number;
   total_stock?: number;
   productListSummaryVersion?: number;
+  productSearchTokensVersion?: number;
   deleting_at?: number;
   attributes: ProductAttribute[];
   created_at: number;
@@ -316,8 +317,12 @@ export interface HomeSectionDoc extends BaseDoc {
   maxAppVersion?: string;
   layoutVariant?: string;
   backgroundColor?: string;
+  backgroundImage?: string;
+  backgroundImageStorageId?: string;
   textColor?: string;
   imageUrl?: string;
+  imageStorageId?: string;
+  storageId?: string;
   iconEmoji?: string;
   maxItems?: number;
   productIds?: string[];
@@ -350,6 +355,7 @@ export interface HomeSectionResponse {
   sortOrder: number;
   layoutVariant?: string;
   backgroundColor?: string;
+  backgroundImage?: string;
   textColor?: string;
   imageUrl?: string;
   iconEmoji?: string;

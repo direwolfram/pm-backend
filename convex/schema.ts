@@ -44,6 +44,7 @@ export default defineSchema({
     key: v.string(),
     horizon: v.optional(v.number()),
     cursor: v.optional(v.union(v.string(), v.null())),
+    complete: v.optional(v.boolean()),
   }).index("by_key", ["key"]),
 
   users: defineTable({
@@ -237,6 +238,7 @@ export default defineSchema({
     default_price: v.optional(v.number()),
     total_stock: v.optional(v.number()),
     productListSummaryVersion: v.optional(v.number()),
+    productSearchTokensVersion: v.optional(v.number()),
     deleting_at: v.optional(v.number()),
     attributes: v.array(
       v.object({ key: v.string(), label: v.string(), value: v.string() }),
@@ -274,10 +276,37 @@ export default defineSchema({
       "updated_at",
     ])
     .index("by_product_list_summary_version", ["productListSummaryVersion"])
+    .index("by_product_search_tokens_version", ["productSearchTokensVersion"])
     .searchIndex("search_products", {
       searchField: "name",
       filterFields: ["status", "primary_category_id", "brand_id"],
     }),
+
+  /**
+   * Tokenized product-name search rows. Convex search indexes cannot be
+   * paginated, so genuine cursor-paginated search runs over this table: one
+   * row per (product, name token), driven by the by_token_updated index
+   * (newest-first) with page-bounded chunk reads. Written transactionally by
+   * products.create / products.update / cascade deletes; legacy rows are
+   * backfilled by products.backfillProductSearchTokens, which records its
+   * completion in transitionState under key "productSearchTokens".
+   */
+  productSearchTokens: defineTable({
+    product_id: v.id("products"),
+    token: v.string(),
+    tokens: v.array(v.string()),
+    updated_at: v.number(),
+    status: v.union(
+      v.literal("draft"),
+      v.literal("active"),
+      v.literal("hidden"),
+      v.literal("discontinued"),
+    ),
+    primary_category_id: v.id("categories"),
+    brand_id: v.optional(v.id("brands")),
+  })
+    .index("by_token_updated", ["token", "updated_at"])
+    .index("by_product", ["product_id"]),
 
   product_media: defineTable({
     product_id: v.id("products"),
@@ -655,8 +684,12 @@ export default defineSchema({
     maxAppVersion: v.optional(v.string()),
     layoutVariant: v.optional(v.string()),
     backgroundColor: v.optional(v.string()),
+    backgroundImage: v.optional(v.string()),
+    backgroundImageStorageId: v.optional(v.id("_storage")),
     textColor: v.optional(v.string()),
     imageUrl: v.optional(v.string()),
+    imageStorageId: v.optional(v.id("_storage")),
+    storageId: v.optional(v.id("_storage")),
     iconEmoji: v.optional(v.string()),
     maxItems: v.optional(v.number()),
     productIds: v.optional(v.array(v.id("products"))),

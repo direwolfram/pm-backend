@@ -273,7 +273,7 @@ describe("products.list legacy rows and read-only enforcement", () => {
     vi.useRealTimers();
   });
 
-  it("serves correct computed summaries for unsummarized legacy rows without writing", async () => {
+  it("serves unsummarized legacy rows from stored fields, flags them pending, and never scans children", async () => {
     const t = convexTest({ schema, modules });
     const env = await seedBase(t);
     const productId = await t.run(async (ctx) => {
@@ -307,18 +307,32 @@ describe("products.list legacy rows and read-only enforcement", () => {
       return pid;
     });
 
+    // Request-time summary scans are gone: the row is served from its stored
+    // (absent) fields and explicitly flagged as pending migration.
     const page = await t.query(api.products.listV2, { limit: 5 });
     expect(page.data).toHaveLength(1);
     expect(page.data[0]).toMatchObject({
-      sku_count: 1,
-      total_stock: 7,
-      default_price: 19,
+      sku_count: 0,
+      total_stock: 0,
     });
+    expect(page.data[0].default_price).toBeUndefined();
+    expect(page.summariesPending).toBe(1);
 
     // The query must not repair/patch anything: the row stays unsummarized.
     const after = await t.run(async (ctx) => await ctx.db.get(productId));
     expect(after?.productListSummaryVersion).toBeUndefined();
     expect(after?.sku_count).toBeUndefined();
+
+    // The bounded backfill migration computes the summary instead.
+    await t.mutation(internal.products.backfillProductListSummaries, {});
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
+    const migrated = await t.query(api.products.listV2, { limit: 5 });
+    expect(migrated.summariesPending).toBe(0);
+    expect(migrated.data[0]).toMatchObject({
+      sku_count: 1,
+      total_stock: 7,
+      default_price: 19,
+    });
   });
 
   it("performs no writes, patches, or scheduled work from the query path", async () => {

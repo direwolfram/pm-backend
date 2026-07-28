@@ -105,6 +105,7 @@ export function pageResponse<T>(
     continueCursor?: string | null;
     isDone?: boolean;
     total: number;
+    totalIsExact?: boolean;
   },
 ) {
   const { limit, offset } = boundedPageArgs(args);
@@ -112,7 +113,7 @@ export function pageResponse<T>(
   return {
     data,
     total: pagination.total,
-    totalIsExact: true,
+    totalIsExact: pagination.totalIsExact ?? true,
     limit,
     offset,
     cursor: nextCursor,
