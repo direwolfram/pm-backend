@@ -20,6 +20,7 @@ import type * as homeSections from "../homeSections.js";
 import type * as inventory from "../inventory.js";
 import type * as lib_customerAggregates from "../lib/customerAggregates.js";
 import type * as lib_customerSearchTokens from "../lib/customerSearchTokens.js";
+import type * as lib_dashboardMetrics from "../lib/dashboardMetrics.js";
 import type * as lib_geo from "../lib/geo.js";
 import type * as lib_inventoryMath from "../lib/inventoryMath.js";
 import type * as lib_pricing from "../lib/pricing.js";
@@ -57,6 +58,7 @@ declare const fullApi: ApiFromModules<{
   inventory: typeof inventory;
   "lib/customerAggregates": typeof lib_customerAggregates;
   "lib/customerSearchTokens": typeof lib_customerSearchTokens;
+  "lib/dashboardMetrics": typeof lib_dashboardMetrics;
   "lib/geo": typeof lib_geo;
   "lib/inventoryMath": typeof lib_inventoryMath;
   "lib/pricing": typeof lib_pricing;

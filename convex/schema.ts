@@ -706,6 +706,15 @@ export default defineSchema({
     title: v.optional(v.string()),
     subtitle: v.optional(v.string()),
     tab: v.string(),
+    // Product card design for this section; unset on legacy rows means
+    // "overlap" (see homeSections.backfillCardType).
+    card_type: v.optional(
+      v.union(
+        v.literal("minimal"),
+        v.literal("small"),
+        v.literal("overlap"),
+      ),
+    ),
     sortOrder: v.optional(v.number()),
     isActive: v.optional(v.boolean()),
     allowEmpty: v.optional(v.boolean()),
