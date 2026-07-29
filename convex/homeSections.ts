@@ -8,6 +8,7 @@ import type {
   HomeSectionDoc,
   HomeTabLayoutDoc,
   InventoryDoc,
+  PriceDoc,
   ProductDoc,
   PromotionDoc,
   SkuDoc,
@@ -234,6 +235,7 @@ type ResolutionDataset =
   | "promotions"
   | "stores"
   | "skus"
+  | "prices"
   | "inventory";
 
 type ResolutionContext = {
@@ -245,6 +247,7 @@ type ResolutionContext = {
   promotions?: Promise<PromotionDoc[]>;
   stores?: Promise<StoreDoc[]>;
   skus?: Promise<SkuDoc[]>;
+  prices?: Promise<PriceDoc[]>;
   inventory?: Promise<InventoryDoc[]>;
 };
 
@@ -715,6 +718,8 @@ function sectionResolutionDatasets(section: HomeSectionDoc, args: { store_id?: s
 
   if (productSectionKinds.has(kind)) {
     datasets.add("products");
+    datasets.add("skus");
+    datasets.add("prices");
   }
   if ((kind === "category_grid" || kind === "category_tabs") && refs.categoryIds.length) {
     datasets.add("categories");
@@ -788,6 +793,12 @@ async function loadSkus(context: ResolutionContext): Promise<SkuDoc[]> {
   return await context.skus;
 }
 
+async function loadPrices(context: ResolutionContext): Promise<PriceDoc[]> {
+  if (!context.required.has("prices")) return [];
+  context.prices ??= context.db.query("prices").collect() as Promise<PriceDoc[]>;
+  return await context.prices;
+}
+
 async function loadInventory(context: ResolutionContext): Promise<InventoryDoc[]> {
   if (!context.required.has("inventory")) return [];
   context.inventory ??= context.db.query("inventory").collect() as Promise<InventoryDoc[]>;
@@ -808,12 +819,13 @@ async function resolveSection(
     return emptyResolvedData();
   }
 
-  const [products, categories, promotions, stores, skus, inventory] = await Promise.all([
+  const [products, categories, promotions, stores, skus, prices, inventory] = await Promise.all([
     loadProducts(context),
     loadCategories(context),
     loadPromotions(context),
     loadStores(context),
     loadSkus(context),
+    loadPrices(context),
     loadInventory(context),
   ]);
 
@@ -857,6 +869,28 @@ async function resolveSection(
     );
   }
   if (maxItems !== undefined) resolvedProducts = resolvedProducts.slice(0, maxItems);
+
+  if (requiredForSection.has("skus")) {
+    const pricesBySku = new Map<string, PriceDoc[]>();
+    for (const price of prices) {
+      const rows = pricesBySku.get(price.sku_id) ?? [];
+      rows.push(price);
+      pricesBySku.set(price.sku_id, rows);
+    }
+    const skusByProduct = new Map<string, any[]>();
+    for (const sku of skus) {
+      if (!sku.is_active) continue;
+      const rows = skusByProduct.get(sku.product_id) ?? [];
+      rows.push({ ...sku, prices: pricesBySku.get(sku._id) ?? [] });
+      skusByProduct.set(sku.product_id, rows);
+    }
+    resolvedProducts = resolvedProducts.map((product) => {
+      const productSkus = (skusByProduct.get(product._id) ?? []).sort(
+        (a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0),
+      );
+      return { ...product, skus: productSkus, skuCount: productSkus.length, sku_count: productSkus.length };
+    });
+  }
 
   const resolvedCategories = requiredForSection.has("categories")
     ? categories
