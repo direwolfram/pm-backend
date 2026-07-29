@@ -305,6 +305,51 @@ describe("product list summaries", () => {
     });
   });
 
+  it("tracks inventory create, adjustment, and delete in total_stock", async () => {
+    const t = convexTest({ schema, modules });
+    const { productId, storeId } = await seedCatalog(t);
+    const skuId = await t.mutation(api.skus.create, {
+      product_id: productId,
+      sku_code: "INV-1",
+      variant_label: "V",
+      is_default: true,
+    });
+
+    const inventoryId = await t.mutation(api.inventory.upsert, {
+      sku_id: skuId,
+      store_id: storeId,
+      quantity_available: 10,
+    });
+    await expect(getProduct(t, productId)).resolves.toMatchObject({
+      total_stock: 10,
+    });
+
+    await t.mutation(api.inventory.adjust, {
+      sku_id: skuId,
+      store_id: storeId,
+      delta: -4,
+      reason: "sale",
+    });
+    await expect(getProduct(t, productId)).resolves.toMatchObject({
+      total_stock: 6,
+    });
+
+    await t.mutation(api.inventory.adjust, {
+      sku_id: skuId,
+      store_id: storeId,
+      delta: 14,
+      reason: "restock",
+    });
+    await expect(getProduct(t, productId)).resolves.toMatchObject({
+      total_stock: 20,
+    });
+
+    await t.mutation(api.inventory.remove, { id: inventoryId });
+    await expect(getProduct(t, productId)).resolves.toMatchObject({
+      total_stock: 0,
+    });
+  });
+
   it("keeps the default-SKU invariant on change and deletion", async () => {
     const t = convexTest({ schema, modules });
     const { productId } = await seedCatalog(t);

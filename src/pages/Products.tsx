@@ -1,16 +1,10 @@
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import { useMutation, useQuery } from "convex/react";
 import { Link, useNavigate } from "react-router";
 import { Pencil, Plus, Search, Trash2 } from "lucide-react";
 import { api } from "@/lib/convexClient";
 import { formatMoney } from "@/lib/format";
-import {
-  accumulatedRows,
-  applyPage,
-  emptyAccumulator,
-  requestNextPage,
-  type PageAccumulator,
-} from "@/lib/productPages";
+import { useCursorPages } from "@/lib/useCursorPages";
 import {
   ConfirmButton,
   EmptyState,
@@ -59,6 +53,7 @@ type ListResult = {
   nextCursor: string | null;
   hasMore: boolean;
   summariesPending?: number;
+  searchMigrationPending?: boolean;
 };
 
 const PAGE_LIMIT = 100;
@@ -121,30 +116,18 @@ export default function Products() {
   const [categoryId, setCategoryId] = useState<string>("all");
   const [brandId, setBrandId] = useState<string>("all");
 
-  const filtersKey = `${search}|${status}|${categoryId}|${brandId}`;
-  const [pagination, setPagination] = useState<PageAccumulator<ProductListRow>>(
-    emptyAccumulator,
-  );
-  const [appliedFiltersKey, setAppliedFiltersKey] = useState(filtersKey);
-  if (appliedFiltersKey !== filtersKey) {
-    setAppliedFiltersKey(filtersKey);
-    setPagination(emptyAccumulator());
-  }
-
-  const result = useQuery(api.products.listV2, {
-    search: search || undefined,
-    status: status === "all" ? undefined : status,
-    category_id: categoryId === "all" ? undefined : categoryId,
-    brand_id: brandId === "all" ? undefined : brandId,
-    limit: PAGE_LIMIT,
-    cursor: pagination.activeCursor,
-  }) as ListResult | undefined;
-
-  const [appliedResult, setAppliedResult] = useState<ListResult | null>(null);
-  if (result && result !== appliedResult) {
-    setAppliedResult(result);
-    setPagination((current) => applyPage(current, current.activeCursor, result.data));
-  }
+  const fingerprint = `${search}|${status}|${categoryId}|${brandId}`;
+  const usePageQuery = (cursor: string | null) =>
+    useQuery(api.products.listV2, {
+      search: search || undefined,
+      status: status === "all" ? undefined : status,
+      category_id: categoryId === "all" ? undefined : categoryId,
+      brand_id: brandId === "all" ? undefined : brandId,
+      limit: PAGE_LIMIT,
+      cursor,
+    }) as ListResult | undefined;
+  const paging = useCursorPages<ProductListRow, ListResult>(fingerprint, usePageQuery);
+  const result = paging.result;
   const categories =
     (useQuery(api.categories.list, { includeInactive: true, limit: 200 }) as
       | { data: CategoryDoc[] }
@@ -285,10 +268,8 @@ export default function Products() {
     if (ok) setDialogOpen(false);
   };
 
-  const rows = useMemo(() => accumulatedRows(pagination), [pagination]);
+  const rows = paging.rows;
   const activeCount = rows.filter((p) => p.status === "active").length;
-  const draftCount = rows.filter((p) => p.status === "draft").length;
-  const discontinuedCount = rows.filter((p) => p.status === "discontinued").length;
   const totalSkus = rows.reduce((sum, p) => sum + p.sku_count, 0);
   const totalStock = rows.reduce((sum, p) => sum + p.total_stock, 0);
   const catalogTotal = result
@@ -309,12 +290,13 @@ export default function Products() {
         }
       />
 
-      <div className="mb-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+      <div className="mb-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
         {[
           ["Catalog items", catalogTotal],
-          ["Active products", activeCount],
-          ["SKUs", totalSkus],
-          ["Units in stock", totalStock],
+          ["Loaded products", rows.length],
+          ["Active (loaded)", activeCount],
+          ["SKUs (loaded)", totalSkus],
+          ["Stock (loaded)", totalStock],
         ].map(([label, value]) => (
           <div key={label} className="rounded-lg border bg-card px-4 py-3">
             <p className="text-xs font-medium text-muted-foreground">{label}</p>
@@ -328,8 +310,8 @@ export default function Products() {
           {[
             ["all", "All"],
             ["active", "Active"],
-            ["draft", `Draft ${draftCount}`],
-            ["discontinued", `Discontinued ${discontinuedCount}`],
+            ["draft", "Draft"],
+            ["discontinued", "Discontinued"],
           ].map(([value, label]) => (
             <button
               key={value}
@@ -384,10 +366,26 @@ export default function Products() {
         </div>
       </div>
 
-      {!result && rows.length === 0 ? (
+      {paging.awaitingPage && rows.length === 0 ? (
         <Loading />
-      ) : rows.length === 0 ? (
+      ) : result?.searchMigrationPending ? (
+        <EmptyState
+          title="Search is being migrated"
+          hint="Product search indexing is still backfilling. Clear the search box to browse with filters, or try again shortly."
+        />
+      ) : rows.length === 0 && paging.exhausted ? (
         <EmptyState title="No products found" hint="Adjust filters or create a new product." />
+      ) : rows.length === 0 ? (
+        <div className="rounded-lg border bg-card px-4 py-8 text-center">
+          <p className="text-sm text-muted-foreground">
+            No matches on this page yet — later pages may still contain results.
+          </p>
+          {paging.hasMore && (
+            <Button variant="outline" className="mt-3" onClick={paging.loadMore}>
+              Load more
+            </Button>
+          )}
+        </div>
       ) : (
         <div className="overflow-hidden rounded-lg border bg-card">
           <Table>
@@ -460,18 +458,16 @@ export default function Products() {
         </div>
       )}
 
-      {rows.length > 0 && (result?.hasMore || !result) && (
+      {rows.length > 0 && (paging.hasMore || paging.awaitingPage) && (
         <div className="mb-4 flex justify-center">
           <Button
             variant="outline"
-            disabled={!result?.hasMore}
-            onClick={() =>
-              setPagination((current) => requestNextPage(current, result?.nextCursor ?? null))
-            }
+            disabled={!paging.hasMore || paging.awaitingPage}
+            onClick={paging.loadMore}
           >
-            {!result
+            {paging.awaitingPage
               ? "Loading…"
-              : `Load more (showing ${rows.length}${result.totalIsExact ? ` of ${result.total}` : ""})`}
+              : `Load more (showing ${rows.length}${result?.totalIsExact ? ` of ${result.total}` : ""})`}
           </Button>
         </div>
       )}

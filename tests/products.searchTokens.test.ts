@@ -112,15 +112,16 @@ describe("products.listV2 token search (post-migration)", () => {
     vi.useRealTimers();
   });
 
-  it("migrates from the capped fallback to cursor-paginated search via backfill", async () => {
+  it("migrates from the explicit pending state to cursor-paginated search via backfill", async () => {
     const t = convexTest({ schema, modules });
     const env = await seedBase(t);
     await insertLegacyProducts(t, env, 5);
 
-    // Pre-migration: legacy capped fallback serves the search.
-    const legacy = await t.query(api.products.listV2, { search: "needle", limit: 2 });
-    expect(legacy.totalIsExact).toBe(true);
-    expect(legacy.total).toBe(5);
+    // Pre-migration: explicit pending state, no match-set scan.
+    const pending = await t.query(api.products.listV2, { search: "needle", limit: 2 });
+    expect(pending.searchMigrationPending).toBe(true);
+    expect(pending.data).toHaveLength(0);
+    expect(pending.totalIsExact).toBe(false);
 
     await completeSearchMigration(t);
 
@@ -235,6 +236,36 @@ describe("products.listV2 token search (post-migration)", () => {
       Promise.all(seen.map(async (id) => (await ctx.db.get(id as Id<"products">))?.name)),
     );
     expect(names).toEqual(["Fresh Milk 1L"]);
+  });
+
+  it("documents the versioned token-matching semantics", async () => {
+    expect(searchTokensForName("Coca-Cola 1.5L")).toEqual(["coca", "cola", "1", "5l"]);
+    expect(searchTokensForName("  Fresh   MILK ")).toEqual(["fresh", "milk"]);
+    expect(searchTokensForName("7-Up")).toEqual(["7", "up"]);
+
+    const t = convexTest({ schema, modules });
+    const env = await seedBase(t);
+    await t.run(async (ctx) => {
+      for (const [index, name] of [
+        "Coca-Cola 1.5L",
+        "Fresh Milk 1L",
+        "Milo Drink",
+      ].entries()) {
+        await ctx.db.insert("products", legacyProductRow(env, index, { name }));
+      }
+    });
+    await completeSearchMigration(t);
+
+    // punctuation splits into tokens, matched case-insensitively
+    expect((await drainSearch(t, { search: "COCA" }, 10)).seen).toHaveLength(1);
+    expect((await drainSearch(t, { search: "cola" }, 10)).seen).toHaveLength(1);
+    // token order does not matter; every token must match
+    expect((await drainSearch(t, { search: "milk fresh" }, 10)).seen).toHaveLength(1);
+    // single-character tokens are matched exactly ("1l" is not "1")
+    expect((await drainSearch(t, { search: "1" }, 10)).seen).toHaveLength(1);
+    // intentional change vs. substring behavior: no prefix matching
+    expect((await drainSearch(t, { search: "mil" }, 10)).seen).toHaveLength(0);
+    expect((await drainSearch(t, { search: "milo" }, 10)).seen).toHaveLength(1);
   });
 
   it("maintains token rows on create, update, and delete", async () => {

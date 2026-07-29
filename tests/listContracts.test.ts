@@ -3,6 +3,7 @@ import { convexTest } from "convex-test";
 import { api, internal } from "../convex/_generated/api";
 import schema from "../convex/schema";
 import type { Id } from "../convex/_generated/dataModel";
+import { SEARCH_TOTAL_UNKNOWN } from "../convex/lib/productSearchTokens";
 
 const modules = import.meta.glob("../convex/**/*.ts");
 
@@ -173,7 +174,7 @@ describe("list response contracts", () => {
     expect(page.total).toBe(8);
   });
 
-  it("products.list returns exact totals for every filter combination", async () => {
+  it("products.list returns exact totals for non-search filters and versioned non-exact search semantics", async () => {
     const t = convexTest({ schema, modules });
     const { categoryId, brandId } = await seedStoreAndCategory(t);
     const otherCategory = await t.run(async (ctx) =>
@@ -197,6 +198,9 @@ describe("list response contracts", () => {
     await mk(0, { brand: brandId });
     await mk(1, { brand: brandId, status: "draft" });
     await mk(2, { category: otherCategory });
+    // Flip search to the versioned token-stream path (writers already
+    // maintained token rows; the backfill only records completion).
+    await t.mutation(internal.products.backfillProductSearchTokens, { limit: 200 });
 
     const cases: Array<[Record<string, unknown>, number]> = [
       [{}, 3],
@@ -224,9 +228,12 @@ describe("list response contracts", () => {
     ];
     for (const [args, expected] of cases) {
       const page = await t.query(api.products.list, { ...args, limit: 10 } as never);
-      expect(page.total, JSON.stringify(args)).toBe(expected);
-      expect(page.totalIsExact).toBe(true);
-      expect(page.data).toHaveLength(expected);
+      const isSearch = typeof args.search === "string";
+      expect(page.totalIsExact, JSON.stringify(args)).toBe(!isSearch);
+      expect(page.total, JSON.stringify(args)).toBe(
+        isSearch ? SEARCH_TOTAL_UNKNOWN : expected,
+      );
+      expect(page.data, JSON.stringify(args)).toHaveLength(expected);
     }
 
     // status change moves the counters

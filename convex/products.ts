@@ -41,10 +41,10 @@ const productStatus = v.union(
 
 /**
  * Hard cap on documents a single list request may scan outside its returned
- * page (counter-missing totals and the legacy pre-migration search fallback).
- * Index ranges cannot be counted without reading them, so these domains are
- * read with take(CAP + 1) and rejected explicitly when larger — never
- * silently truncated and never an unbounded collect.
+ * page (counter-missing totals). Index ranges cannot be counted without
+ * reading them, so these domains are read with take(CAP + 1) and rejected
+ * explicitly when larger — never silently truncated and never an unbounded
+ * collect.
  */
 export const PRODUCT_LIST_SCAN_CAP = 512;
 
@@ -122,7 +122,16 @@ async function pageProducts(
     offset?: number;
     cursor?: string | null;
   },
-) {
+): Promise<{
+  rows: ProductDoc[];
+  pagination: {
+    isDone: boolean;
+    nextCursor: string | null;
+    total: number;
+    totalIsExact?: boolean;
+  };
+  searchMigrationPending?: boolean;
+}> {
   const pageArgs = boundedPageArgs(args);
   const limit = pageArgs.limit;
   const useOffset = args.offset !== undefined && args.cursor === undefined;
@@ -142,77 +151,45 @@ async function pageProducts(
         },
       };
     }
-    if (await productSearchMigrationComplete(ctx)) {
-      // Versioned search semantics (post-migration): genuine cursor pagination
-      // over the productSearchTokens stream. Per-request work is one
-      // page-sized paginated token-index read plus at most `limit` product
-      // gets — independent of the match count. Totals for arbitrary search
-      // are explicitly non-exact (counting matches requires reading them):
-      // total is the SEARCH_TOTAL_UNKNOWN sentinel with totalIsExact false.
-      const page = await searchProductsPage(ctx, {
-        tokens,
-        status: args.status,
-        category_id: args.category_id,
-        brand_id: args.brand_id,
-        limit,
-        cursor,
-      });
+    if (!(await productSearchMigrationComplete(ctx))) {
+      // Explicit migration state: the productSearchTokens backfill has not
+      // completed, so search reports itself unavailable rather than falling
+      // back to a full-match scan. Run products.backfillProductSearchTokens.
       return {
-        rows: page.rows,
+        rows: [],
         pagination: {
-          isDone: page.isDone,
-          nextCursor:
-            page.isDone || !page.continueCursor
-              ? null
-              : wrapCursor(scope, page.continueCursor),
+          isDone: true,
+          nextCursor: null,
           total: SEARCH_TOTAL_UNKNOWN,
           totalIsExact: false,
         },
+        searchMigrationPending: true,
       };
     }
-    // Legacy pre-migration fallback (explicit migration state): the
-    // productSearchTokens backfill has not completed, so search runs against
-    // the unpaginatable Convex search index with a hard domain cap. Convex
-    // search queries cannot be paginated, so the match set is read with a
-    // hard cap and sorted deterministically (newest-first, _id tie-break);
-    // an over-cap match domain is rejected explicitly instead of being
-    // collected unboundedly or silently truncated. Run
-    // products.backfillProductSearchTokens to switch to the paginated path.
-    const matches = (await ctx.db
-      .query("products")
-      .withSearchIndex("search_products", (q: any) => {
-        let s = q.search("name", args.search!.trim());
-        if (args.status) s = s.eq("status", args.status);
-        if (args.category_id) s = s.eq("primary_category_id", args.category_id);
-        if (args.brand_id) s = s.eq("brand_id", args.brand_id);
-        return s;
-      })
-      .take(PRODUCT_LIST_SCAN_CAP + 1)) as ProductDoc[];
-    if (matches.length > PRODUCT_LIST_SCAN_CAP) {
-      throw new Error(
-        `Search matched more than ${PRODUCT_LIST_SCAN_CAP} products; narrow the search term or filters, or complete products.backfillProductSearchTokens for cursor-paginated search`,
-      );
-    }
-    matches.sort(compareProductsNewestFirst);
-    const skip = useOffset
-      ? pageArgs.offset
-      : cursor === null
-        ? 0
-        : Number(cursor);
-    if (!Number.isInteger(skip) || skip < 0 || skip > matches.length) {
-      throw new Error("Invalid cursor: request a fresh first page");
-    }
-    const page = matches.slice(skip, skip + limit);
-    const nextSkip = skip + limit;
+    // Versioned search semantics: genuine cursor pagination over the
+    // productSearchTokens stream. Per-request work is one page-sized
+    // paginated token-index read plus at most `limit` product gets —
+    // independent of the match count. Totals for arbitrary search are
+    // explicitly non-exact (counting matches requires reading them): total
+    // is the SEARCH_TOTAL_UNKNOWN sentinel with totalIsExact false.
+    const page = await searchProductsPage(ctx, {
+      tokens,
+      status: args.status,
+      category_id: args.category_id,
+      brand_id: args.brand_id,
+      limit,
+      cursor,
+    });
     return {
-      rows: page,
+      rows: page.rows,
       pagination: {
-        isDone: nextSkip >= matches.length,
+        isDone: page.isDone,
         nextCursor:
-          useOffset || nextSkip >= matches.length
+          page.isDone || !page.continueCursor
             ? null
-            : wrapCursor(scope, String(nextSkip)),
-        total: matches.length,
+            : wrapCursor(scope, page.continueCursor),
+        total: SEARCH_TOTAL_UNKNOWN,
+        totalIsExact: false,
       },
     };
   }
@@ -344,9 +321,13 @@ export async function listHandler(
     cursor?: string | null;
   },
 ) {
-  const { rows, pagination } = await pageProducts(ctx, args);
+  const { rows, pagination, searchMigrationPending } = await pageProducts(ctx, args);
   const { data, summariesPending } = await enrichProductPage(ctx, rows);
-  return { ...pageResponse(data, args, pagination), summariesPending };
+  return {
+    ...pageResponse(data, args, pagination),
+    summariesPending,
+    searchMigrationPending: searchMigrationPending ?? false,
+  };
 }
 
 /**
@@ -390,8 +371,8 @@ export const list = query({
  *   products.backfillProductSearchTokens has completed (migration state in
  *   transitionState); per-request work is one page-sized paginated token
  *   read plus page-sized product gets, independent of the match count.
- *   Pre-migration, a legacy fallback keeps the PRODUCT_LIST_SCAN_CAP-capped
- *   search-index behavior.
+ *   Until the backfill completes, search returns an explicit
+ *   searchMigrationPending state instead of scanning match sets.
  * - Reads: one bounded page plus fixed metadata; enrichment fetches only the
  *   brands/categories referenced by the returned page, deduplicated, serves
  *   stored summary fields, reports stale summaries via summariesPending, and

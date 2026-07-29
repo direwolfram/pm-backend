@@ -8,11 +8,17 @@ import {
   listHandler,
   PRODUCT_LIST_SCAN_CAP,
 } from "../convex/products";
+import { SEARCH_TOTAL_UNKNOWN } from "../convex/lib/productSearchTokens";
 import { doc, FakeConvexDb } from "./fakeConvexDb";
 
 const modules = import.meta.glob("../convex/**/*.ts");
 
 const CAP = PRODUCT_LIST_SCAN_CAP;
+
+async function completeSearchMigration(t: ReturnType<typeof convexTest>) {
+  await t.mutation(internal.products.backfillProductSearchTokens, { limit: 200 });
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
+}
 
 async function seedBase(t: ReturnType<typeof convexTest>) {
   return await t.run(async (ctx) => {
@@ -110,6 +116,7 @@ describe("products.listV2 contract", () => {
     expect(v2.total).toBe(legacy.total);
     expect(typeof v2.nextCursor).toBe("string");
 
+    await completeSearchMigration(t);
     const legacySearch = await t.query(api.products.list, {
       search: "contract",
       status: "active",
@@ -128,6 +135,8 @@ describe("products.listV2 contract", () => {
       legacySearch.data.map((row) => row._id),
     );
     expect(v2Search.total).toBe(legacySearch.total);
+    expect(v2Search.totalIsExact).toBe(false);
+    expect(v2Search.total).toBe(SEARCH_TOTAL_UNKNOWN);
   });
 
   it("rejects legacy offset arguments", async () => {
@@ -170,6 +179,7 @@ describe("products.listV2 contract", () => {
       updatedAt: (n) => 9_000 - 1_000 * Math.floor(n / 3),
       name: (n) => `Needle Product ${n}`,
     });
+    await completeSearchMigration(t);
 
     const seen: string[] = [];
     let cursor: string | null = null;
@@ -183,7 +193,9 @@ describe("products.listV2 contract", () => {
         limit: 5,
         cursor,
       });
-      expect(page.total).toBe(12);
+      expect(page.total).toBe(SEARCH_TOTAL_UNKNOWN);
+      expect(page.totalIsExact).toBe(false);
+      expect(page.searchMigrationPending).toBe(false);
       for (const row of page.data) {
         expect(row.updated_at).toBeLessThanOrEqual(lastUpdated);
         lastUpdated = row.updated_at;
@@ -212,15 +224,39 @@ describe("products.listV2 contract", () => {
     ).rejects.toThrow(/cursor/i);
   });
 
-  it("rejects search domains above the scan cap explicitly", async () => {
+  it("returns explicit migration state for search until the backfill completes", async () => {
     const t = convexTest({ schema, modules });
     const env = await seedBase(t);
     await insertProducts(t, env, CAP + 1, {
       name: (n) => `Needle Product ${n}`,
     });
-    await expect(
-      t.query(api.products.listV2, { search: "needle", limit: 10 }),
-    ).rejects.toThrow(/narrow the search term/);
+
+    // Pre-migration: no scan, no cap rejection — an explicit pending state.
+    const pending = await t.query(api.products.listV2, { search: "needle", limit: 10 });
+    expect(pending).toMatchObject({
+      total: SEARCH_TOTAL_UNKNOWN,
+      totalIsExact: false,
+      hasMore: false,
+      nextCursor: null,
+      searchMigrationPending: true,
+    });
+    expect(pending.data).toHaveLength(0);
+
+    // Post-migration: the same over-512 match set is pageable.
+    await completeSearchMigration(t);
+    const seen: string[] = [];
+    let cursor: string | null = null;
+    let guard = 0;
+    do {
+      guard += 1;
+      expect(guard).toBeLessThan(200);
+      const page = await t.query(api.products.listV2, { search: "needle", limit: 25, cursor });
+      expect(page.searchMigrationPending).toBe(false);
+      seen.push(...page.data.map((row) => row._id as string));
+      cursor = page.nextCursor;
+    } while (cursor !== null);
+    expect(seen).toHaveLength(CAP + 1);
+    expect(new Set(seen).size).toBe(CAP + 1);
   });
 
   it("never falls back to an unbounded count when counters are missing", async () => {
@@ -254,11 +290,17 @@ describe("products.listV2 contract", () => {
     const t = convexTest({ schema, modules });
     const env = await seedBase(t);
     await insertProducts(t, env, 3);
+    await completeSearchMigration(t);
     const page = await t.query(api.products.listV2, {
       search: "absent",
       limit: 5,
     });
-    expect(page).toMatchObject({ total: 0, hasMore: false, nextCursor: null });
+    expect(page).toMatchObject({
+      total: SEARCH_TOTAL_UNKNOWN,
+      totalIsExact: false,
+      hasMore: false,
+      nextCursor: null,
+    });
     expect(page.data).toHaveLength(0);
   });
 });
@@ -541,21 +583,16 @@ describe("products.listV2 read bounds as catalog grows", () => {
     expect(snapshots[0].categoryGets).toBe(1);
   });
 
-  it("keeps search page reads proportional to the match set, not the catalog", async () => {
-    const reads: number[] = [];
-    for (const unrelatedCount of [50, 2_000]) {
-      const db = catalog(20, unrelatedCount);
-      const result = await listHandler(
-        { db },
-        { search: "target", limit: 5 },
-      );
-      expect(result.total).toBe(20);
-      expect(result.data).toHaveLength(5);
-      reads.push(
-        db.stats.documentsReturned["products.search:search_products"] ?? 0,
-      );
-    }
-    expect(reads[0]).toBe(20);
-    expect(reads[1]).toBe(20);
+  it("search before migration performs no match-set reads and reports pending state", async () => {
+    const db = catalog(20, 50);
+    const result = await listHandler({ db }, { search: "target", limit: 5 });
+    expect(result.searchMigrationPending).toBe(true);
+    expect(result.totalIsExact).toBe(false);
+    expect(result.total).toBe(SEARCH_TOTAL_UNKNOWN);
+    expect(result.data).toHaveLength(0);
+    // Neither the unpaginatable search index nor the products table is read.
+    expect(db.stats.documentsReturned["products.search:search_products"]).toBeUndefined();
+    expect(db.stats.collect.products).toBeUndefined();
+    expect(db.stats.documentsReturned["products.by_updated"]).toBeUndefined();
   });
 });

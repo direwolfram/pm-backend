@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { convexTest } from "convex-test";
-import { api } from "../convex/_generated/api";
+import { api, internal } from "../convex/_generated/api";
 import schema from "../convex/schema";
 import type { Id } from "../convex/_generated/dataModel";
 import { listHandler } from "../convex/products";
@@ -208,7 +208,8 @@ describe("products.list query behavior", () => {
       expect(new Set(seen).size).toBe(seen.length);
     }
 
-    // search continuation over relevance order
+    // search continuation over the token stream (newest-first)
+    await t.mutation(internal.products.backfillProductSearchTokens, { limit: 200 });
     const seen: string[] = [];
     let cursor: string | null = null;
     do {

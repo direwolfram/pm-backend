@@ -1,93 +1,164 @@
 import { describe, expect, it } from "vitest";
 import {
   accumulatedRows,
-  applyPage,
-  emptyAccumulator,
-  requestNextPage,
-  resetAccumulator,
-  type PageAccumulator,
+  applyPageResponse,
+  initialPageState,
+  isExhausted,
+  MAX_AUTO_CONTINUATIONS,
+  pendingContinuation,
+  requestContinuation,
+  resetForFingerprint,
+  type CursorPageState,
 } from "../src/lib/productPages";
 
 type Row = { _id: string };
 
-function pageRows(prefix: string, count: number): Row[] {
-  return Array.from({ length: count }, (_, index) => ({
-    _id: `${prefix}_${index}`,
-  }));
+const FP = "s|all|all|all";
+
+function rows(prefix: string, count: number): Row[] {
+  return Array.from({ length: count }, (_, index) => ({ _id: `${prefix}_${index}` }));
 }
 
-function loadFirstPage(state: PageAccumulator<Row>, rows: Row[], nextCursor: string | null) {
-  let next = applyPage(state, state.activeCursor, rows);
-  next = requestNextPage(next, nextCursor);
-  return next;
+function page(
+  state: CursorPageState<Row>,
+  cursor: string | null,
+  data: Row[],
+  nextCursor: string | null,
+  hasMore: boolean,
+  fingerprint = FP,
+) {
+  return applyPageResponse(state, { fingerprint, cursor, data, nextCursor, hasMore });
 }
 
-describe("Products screen cursor pagination", () => {
-  it("reaches records beyond the first 200 through load-more navigation", () => {
-    let state = emptyAccumulator<Row>();
-    state = loadFirstPage(state, pageRows("page0", 100), "cursor_1");
-    expect(state.activeCursor).toBe("cursor_1");
+describe("cursor page state machine", () => {
+  it("reaches records beyond 200 through continuation", () => {
+    let state = initialPageState<Row>(FP);
+    state = page(state, null, rows("page0", 100), "cursor_1", true);
+    state = requestContinuation(state, "cursor_1");
+    state = page(state, "cursor_1", rows("page1", 100), "cursor_2", true);
+    state = requestContinuation(state, "cursor_2");
+    state = page(state, "cursor_2", rows("page2", 100), null, false);
 
-    state = loadFirstPage(state, pageRows("page1", 100), "cursor_2");
-    state = loadFirstPage(state, pageRows("page2", 100), null);
-
-    const rows = accumulatedRows(state);
-    expect(rows).toHaveLength(300);
-    expect(new Set(rows.map((row) => row._id)).size).toBe(300);
-    expect(rows[0]._id).toBe("page0_0");
-    expect(rows[299]._id).toBe("page2_99");
-    // No further page was queued once the stream ended.
-    expect(state.activeCursor).toBe("cursor_2");
+    const all = accumulatedRows(state);
+    expect(all).toHaveLength(300);
+    expect(new Set(all.map((row) => row._id)).size).toBe(300);
+    expect(all[0]._id).toBe("page0_0");
+    expect(all[299]._id).toBe("page2_99");
+    expect(isExhausted(state)).toBe(true);
   });
 
-  it("reapplies a page idempotently so stale or reactive responses never duplicate rows", () => {
-    let state = emptyAccumulator<Row>();
-    state = loadFirstPage(state, pageRows("page0", 100), "cursor_1");
-    state = loadFirstPage(state, pageRows("page1", 100), null);
+  it("auto-continues an empty first page with hasMore and applies the matching second page", () => {
+    let state = initialPageState<Row>(FP);
+    state = page(state, null, [], "cursor_1", true);
 
-    // A reactive refetch of the first page replaces it in place.
-    state = applyPage(state, null, pageRows("page0", 100));
-    // A stale response for an already-applied cursor also replaces in place.
-    state = applyPage(state, "cursor_1", pageRows("page1", 100));
+    // Empty page is not the end: continuation was requested automatically.
+    expect(isExhausted(state)).toBe(false);
+    expect(state.activeCursor).toBe("cursor_1");
+    expect(accumulatedRows(state)).toHaveLength(0);
 
-    const rows = accumulatedRows(state);
-    expect(rows).toHaveLength(200);
-    expect(new Set(rows.map((row) => row._id)).size).toBe(200);
+    state = page(state, "cursor_1", rows("match", 3), null, false);
+    expect(accumulatedRows(state).map((row) => row._id)).toEqual([
+      "match_0",
+      "match_1",
+      "match_2",
+    ]);
+    expect(isExhausted(state)).toBe(true);
+  });
+
+  it("auto-continues several consecutive empty pages before a match", () => {
+    let state = initialPageState<Row>(FP);
+    state = page(state, null, [], "cursor_1", true);
+    state = page(state, "cursor_1", [], "cursor_2", true);
+    state = page(state, "cursor_2", [], "cursor_3", true);
+    expect(state.requested).toEqual([null, "cursor_1", "cursor_2", "cursor_3"]);
+    expect(accumulatedRows(state)).toHaveLength(0);
+    expect(isExhausted(state)).toBe(false);
+
+    state = page(state, "cursor_3", rows("hit", 2), null, false);
+    expect(accumulatedRows(state)).toHaveLength(2);
+    expect(isExhausted(state)).toBe(true);
+  });
+
+  it("bounds auto-continuation and still allows manual load more", () => {
+    let state = initialPageState<Row>(FP);
+    let cursor: string | null = null;
+    for (let index = 0; index < MAX_AUTO_CONTINUATIONS + 3; index += 1) {
+      const next = `cursor_${index + 1}`;
+      state = page(state, cursor, [], next, true);
+      cursor = next;
+    }
+    // Auto-continuation stopped at the cap: further pages require a gesture.
+    expect(state.requested).toHaveLength(MAX_AUTO_CONTINUATIONS + 1);
+    expect(isExhausted(state)).toBe(false);
+    expect(pendingContinuation(state)).toBe(`cursor_${MAX_AUTO_CONTINUATIONS + 1}`);
+
+    state = requestContinuation(state, pendingContinuation(state));
+    expect(state.activeCursor).toBe(`cursor_${MAX_AUTO_CONTINUATIONS + 1}`);
+  });
+
+  it("treats a fully exhausted no-match search as exhausted with zero rows", () => {
+    let state = initialPageState<Row>(FP);
+    state = page(state, null, [], null, false);
+    expect(accumulatedRows(state)).toHaveLength(0);
+    expect(isExhausted(state)).toBe(true);
+    expect(pendingContinuation(state)).toBeNull();
+  });
+
+  it("ignores responses from an old fingerprint after reset", () => {
+    let state = initialPageState<Row>(FP);
+    state = page(state, null, rows("page0", 100), "cursor_1", true);
+    state = requestContinuation(state, "cursor_1");
+
+    const reset = resetForFingerprint(state, "new|all|all|all");
+    expect(reset.requested).toEqual([null]);
+    expect(reset.activeCursor).toBeNull();
+    expect(accumulatedRows(reset)).toHaveLength(0);
+
+    // Stale in-flight response from the old fingerprint is dropped.
+    const stale = page(reset, "cursor_1", rows("stale", 50), null, false, FP);
+    expect(stale).toBe(reset);
+    expect(accumulatedRows(stale)).toHaveLength(0);
+
+    // Stale response for the first page of the old fingerprint is also dropped.
+    const staleFirst = page(reset, null, rows("staleFirst", 50), null, false, FP);
+    expect(accumulatedRows(staleFirst)).toHaveLength(0);
   });
 
   it("ignores responses for cursors that were never requested", () => {
-    let state = emptyAccumulator<Row>();
-    state = loadFirstPage(state, pageRows("page0", 100), "cursor_1");
-
-    // Response from a different filter set arriving after reset is dropped.
-    const afterReset = resetAccumulator<Row>();
-    const mixed = applyPage(afterReset, "cursor_1", pageRows("stale", 100));
-    expect(mixed).toBe(afterReset);
-    expect(accumulatedRows(mixed)).toHaveLength(0);
-    void state;
+    let state = initialPageState<Row>(FP);
+    state = page(state, null, rows("page0", 10), "cursor_1", true);
+    const next = page(state, "cursor_9", rows("bogus", 10), null, false);
+    expect(next).toBe(state);
+    expect(accumulatedRows(next)).toHaveLength(10);
   });
 
-  it("resets accumulated pages when search or filters change", () => {
-    let state = emptyAccumulator<Row>();
-    state = loadFirstPage(state, pageRows("page0", 100), "cursor_1");
-    state = loadFirstPage(state, pageRows("page1", 100), null);
-    expect(accumulatedRows(state)).toHaveLength(200);
+  it("reapplies pages idempotently so reactive refetches never duplicate rows", () => {
+    let state = initialPageState<Row>(FP);
+    state = page(state, null, rows("page0", 100), "cursor_1", true);
+    state = requestContinuation(state, "cursor_1");
+    state = page(state, "cursor_1", rows("page1", 100), null, false);
 
-    // Filter change: reset, then the fresh first page is the only content.
-    state = resetAccumulator<Row>();
-    state = loadFirstPage(state, pageRows("filtered", 3), null);
-    const rows = accumulatedRows(state);
-    expect(rows).toHaveLength(3);
-    expect(rows.map((row) => row._id)).toEqual(["filtered_0", "filtered_1", "filtered_2"]);
+    // Reactive refetches replace in place.
+    state = page(state, null, rows("page0", 100), "cursor_1", true);
+    state = page(state, "cursor_1", rows("page1", 100), null, false);
+
+    const all = accumulatedRows(state);
+    expect(all).toHaveLength(200);
+    expect(new Set(all.map((row) => row._id)).size).toBe(200);
   });
 
   it("does not queue duplicate or empty continuations", () => {
-    let state = emptyAccumulator<Row>();
-    state = loadFirstPage(state, pageRows("page0", 100), null);
-    expect(state.cursors).toEqual([null]);
+    let state = initialPageState<Row>(FP);
+    state = page(state, null, rows("page0", 10), "cursor_1", true);
+    state = requestContinuation(state, "cursor_1");
+    state = requestContinuation(state, "cursor_1");
+    expect(state.requested).toEqual([null, "cursor_1"]);
+    expect(requestContinuation(state, null)).toBe(state);
+  });
 
-    state = requestNextPage(state, "cursor_1");
-    state = requestNextPage(state, "cursor_1");
-    expect(state.cursors).toEqual([null, "cursor_1"]);
+  it("reset on an unchanged fingerprint is a no-op", () => {
+    let state = initialPageState<Row>(FP);
+    state = page(state, null, rows("page0", 10), null, false);
+    expect(resetForFingerprint(state, FP)).toBe(state);
   });
 });
