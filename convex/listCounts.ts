@@ -161,10 +161,31 @@ function keysForRow(scope: ListCountScope, row: any) {
   return productCountKeys(row);
 }
 
+function reconcileStateKey(scope: ListCountScope) {
+  return `listCountsReconcile:${scope}`;
+}
+
+/**
+ * Read-and-check the run generation for a reconcile pass. Every restart of
+ * reconcileListCounts bumps the generation transactionally; continuations
+ * and the final swap verify it, so an older run that is still in flight when
+ * a newer one starts aborts instead of overwriting fresh counters with a
+ * stale snapshot.
+ */
+async function currentReconcileGeneration(ctx: { db: any }, scope: ListCountScope) {
+  const state = await ctx.db
+    .query("transitionState")
+    .withIndex("by_key", (q: any) => q.eq("key", reconcileStateKey(scope)))
+    .first();
+  return { state, generation: (state?.horizon ?? 0) as number };
+}
+
 /**
  * Bounded, resumable, idempotent rebuild of every counter of one scope.
- * Continuations carry (cursor, accumulator); the final chunk swaps all rows
- * transactionally, so public reads always see a complete set of counters.
+ * Continuations carry (cursor, accumulator, generation); the final chunk
+ * verifies the generation and swaps all rows in the same transaction, so
+ * public reads always see a complete set of counters and overlapping runs
+ * can never interleave their swaps — the superseded run aborts explicitly.
  */
 export const reconcileListCounts = internalMutation({
   args: {
@@ -175,8 +196,43 @@ export const reconcileListCounts = internalMutation({
     ),
     cursor: v.optional(v.string()),
     counts: v.optional(v.any()),
+    generation: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
+    let generation = args.generation;
+    if (generation === undefined) {
+      const { state, generation: current } = await currentReconcileGeneration(
+        ctx,
+        args.scope,
+      );
+      if (args.cursor === undefined || !state) {
+        // Run start: claim a new generation. Any older run still in flight
+        // is superseded and aborts at its next continuation.
+        generation = current + 1;
+        if (state) {
+          await ctx.db.patch(state._id, { horizon: generation });
+        } else {
+          await ctx.db.insert("transitionState", {
+            key: reconcileStateKey(args.scope),
+            horizon: generation,
+          });
+        }
+      } else {
+        // Manual continuation of the in-flight run (cursor without an
+        // explicit generation): adopt the current generation.
+        generation = current;
+      }
+    } else {
+      const { generation: current } = await currentReconcileGeneration(ctx, args.scope);
+      if (current !== generation) {
+        return {
+          done: false,
+          superseded: true,
+          processed: 0,
+          generation,
+        };
+      }
+    }
     const accumulator = new Map<string, number>(
       Object.entries((args.counts as Record<string, number> | undefined) ?? {}),
     );
@@ -199,15 +255,32 @@ export const reconcileListCounts = internalMutation({
         scope: args.scope,
         cursor: result.continueCursor,
         counts: Object.fromEntries(accumulator),
+        generation,
       });
       return {
         done: false,
         processed: result.page.length,
         distinctKeys: accumulator.size,
         nextCursor: result.continueCursor,
+        generation,
+        counts: Object.fromEntries(accumulator),
       };
     }
-    // Final chunk: swap every counter for the scope in one transaction.
+    // Final chunk: verify the generation and swap every counter for the
+    // scope in one transaction — a superseded run aborts here instead of
+    // overwriting the newer run's counters.
+    const { generation: currentGeneration } = await currentReconcileGeneration(
+      ctx,
+      args.scope,
+    );
+    if (currentGeneration !== generation) {
+      return {
+        done: false,
+        superseded: true,
+        processed: result.page.length,
+        generation,
+      };
+    }
     const existing = (await ctx.db
       .query("listCounts")
       .withIndex("by_scope", (q: any) => q.eq("scope", args.scope))
@@ -242,6 +315,7 @@ export const reconcileListCounts = internalMutation({
       done: true,
       processed: result.page.length,
       distinctKeys: accumulator.size,
+      generation,
     };
   },
 });

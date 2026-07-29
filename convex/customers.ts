@@ -8,6 +8,15 @@ import {
   orderCountsForCustomerStats,
 } from "./lib/customerAggregates";
 import {
+  CUSTOMER_SEARCH_TOKENS_VERSION,
+  customerSearchMigrationComplete,
+  customerSearchTokensForQuery,
+  markCustomerSearchMigrationComplete,
+  searchCustomersPage,
+  syncCustomerSearchTokens,
+} from "./lib/customerSearchTokens";
+import { SEARCH_TOTAL_UNKNOWN } from "./lib/productSearchTokens";
+import {
   applyListCountChange,
   customerCountKeys,
   customerTotalKey,
@@ -21,6 +30,14 @@ import type {
 } from "./model";
 
 const CUSTOMER_BACKFILL_LIMIT = 100;
+
+/**
+ * Hard cap on documents a single list request may scan outside its returned
+ * page (counter-missing totals). Index ranges cannot be counted without
+ * reading them, so these domains are read with take(CAP + 1) and rejected
+ * explicitly when larger — never a full-range fallback collect.
+ */
+export const CUSTOMER_LIST_SCAN_CAP = 512;
 
 function customerListScope(args: {
   search?: string;
@@ -42,7 +59,16 @@ async function pageCustomers(
     offset?: number;
     cursor?: string | null;
   },
-) {
+): Promise<{
+  rows: CustomerDoc[];
+  pagination: {
+    isDone: boolean;
+    nextCursor: string | null;
+    total: number;
+    totalIsExact?: boolean;
+  };
+  searchMigrationPending?: boolean;
+}> {
   const pageArgs = boundedPageArgs(args);
   const limit = pageArgs.limit;
   const useOffset = args.offset !== undefined && args.cursor === undefined;
@@ -50,36 +76,56 @@ async function pageCustomers(
   const cursor = unwrapCursor(scope, args.cursor);
   const isSearch = !!args.search?.trim();
   if (isSearch) {
-    // Search domain: the exact total is the size of the (status-filtered)
-    // match set, read once and bounded by the match set itself. Cursor is
-    // the number of matches already consumed (scoped by the fingerprint).
-    const matches = (await ctx.db
-      .query("customers")
-      .withSearchIndex("search_customers", (q: any) => {
-        let s = q.search("search_text", args.search!.trim().toLowerCase());
-        if (args.status) s = s.eq("status", args.status);
-        return s;
-      })
-      .collect()) as CustomerDoc[];
-    const skip = useOffset
-      ? pageArgs.offset
-      : cursor === null
-        ? 0
-        : Number(cursor);
-    if (!Number.isInteger(skip) || skip < 0 || skip > matches.length) {
-      throw new Error("Invalid cursor: request a fresh first page");
+    const tokens = customerSearchTokensForQuery(args.search!.trim());
+    if (tokens.length === 0) {
+      return {
+        rows: [],
+        pagination: {
+          isDone: true,
+          nextCursor: null,
+          total: SEARCH_TOTAL_UNKNOWN,
+          totalIsExact: false,
+        },
+      };
     }
-    const page = matches.slice(skip, skip + limit);
-    const nextSkip = skip + limit;
+    if (!(await customerSearchMigrationComplete(ctx))) {
+      // Explicit migration state: the customerSearchTokens backfill has not
+      // completed, so search reports itself unavailable rather than falling
+      // back to a full-match collect. Run
+      // customers.backfillCustomerSearchTokens.
+      return {
+        rows: [],
+        pagination: {
+          isDone: true,
+          nextCursor: null,
+          total: SEARCH_TOTAL_UNKNOWN,
+          totalIsExact: false,
+        },
+        searchMigrationPending: true,
+      };
+    }
+    // Versioned search semantics: genuine cursor pagination over the
+    // customerSearchTokens stream. Per-request work is one page-sized
+    // paginated token-index read plus at most `limit` customer gets —
+    // independent of the match count. Totals for arbitrary search are
+    // explicitly non-exact (counting matches requires reading them): total
+    // is the SEARCH_TOTAL_UNKNOWN sentinel with totalIsExact false.
+    const page = await searchCustomersPage(ctx, {
+      tokens,
+      status: args.status,
+      limit,
+      cursor,
+    });
     return {
-      rows: page,
+      rows: page.rows,
       pagination: {
-        isDone: nextSkip >= matches.length,
+        isDone: page.isDone,
         nextCursor:
-          useOffset || nextSkip >= matches.length
+          page.isDone || !page.continueCursor
             ? null
-            : wrapCursor(scope, String(nextSkip)),
-        total: matches.length,
+            : wrapCursor(scope, page.continueCursor),
+        total: SEARCH_TOTAL_UNKNOWN,
+        totalIsExact: false,
       },
     };
   }
@@ -91,11 +137,20 @@ async function pageCustomers(
             q.eq("status", args.status!),
           )
       : ctx.db.query("customers").withIndex("by_created");
-  // Exact total: maintained counters (O(1)); missing counter rows fall back
-  // to a bounded count of the match domain.
+  // Exact total: maintained counters (O(1)). Missing counter rows use a
+  // bounded scan that rejects over-cap domains explicitly — never a
+  // request-time full-range collect.
   const maintained = await exactListTotal(ctx, "customers", customerTotalKey(args));
-  const total =
-    maintained ?? ((await makeBuilder().collect()) as CustomerDoc[]).length;
+  let total = maintained;
+  if (total === undefined) {
+    const rows = await makeBuilder().take(CUSTOMER_LIST_SCAN_CAP + 1);
+    if (rows.length > CUSTOMER_LIST_SCAN_CAP) {
+      throw new Error(
+        `Customer list counters are missing for this filter and more than ${CUSTOMER_LIST_SCAN_CAP} customers match; run listCounts.reconcileListCounts for scope "customers" before querying`,
+      );
+    }
+    total = rows.length;
+  }
   const ordered = makeBuilder().order("desc");
   if (!useOffset) {
     const result = await ordered.paginate({
@@ -135,13 +190,16 @@ export async function listHandler(
     cursor?: string | null;
   },
 ) {
-  const { rows, pagination } = await pageCustomers(ctx, args);
+  const { rows, pagination, searchMigrationPending } = await pageCustomers(ctx, args);
   const data = rows.map((c) => ({
     ...c,
     order_count: c.order_count ?? 0,
     total_spend: money(c.total_spend ?? 0),
   }));
-  return pageResponse(data, args, pagination);
+  return {
+    ...pageResponse(data, args, pagination),
+    searchMigrationPending: searchMigrationPending ?? false,
+  };
 }
 
 export const list = query({
@@ -206,10 +264,12 @@ export const create = mutation({
       order_count: 0,
       total_spend: 0,
       customerStatsVersion: CUSTOMER_ORDER_STATS_VERSION,
+      customerSearchTokensVersion: CUSTOMER_SEARCH_TOKENS_VERSION,
       created_at: t,
       updated_at: t,
     };
     const id = await ctx.db.insert("customers", doc);
+    await syncCustomerSearchTokens(ctx, { ...doc, _id: id } as CustomerDoc);
     await applyListCountChange(ctx, "customers", customerCountKeys, null, doc);
     return id;
   },
@@ -261,6 +321,8 @@ export const setStatus = mutation({
     const customer = await ctx.db.get(args.id);
     if (!customer) throw new Error("Customer not found");
     await ctx.db.patch(args.id, { status: args.status, updated_at: now() });
+    const after = (await ctx.db.get(args.id)) as CustomerDoc | null;
+    if (after) await syncCustomerSearchTokens(ctx, after);
     await applyListCountChange(
       ctx,
       "customers",
@@ -288,6 +350,8 @@ export const updateProfile = mutation({
       search_text: customerSearchText({ ...customer, ...patch }),
       updated_at: now(),
     });
+    const after = (await ctx.db.get(id)) as CustomerDoc | null;
+    if (after) await syncCustomerSearchTokens(ctx, after);
     // display_name and email are searchable; any change to them (or to the
     // phone fields via updatePhone) must refresh the denormalized order
     // search text.
@@ -336,6 +400,8 @@ export const updatePhone = mutation({
         }),
         updated_at: now(),
       });
+      const after = (await ctx.db.get(args.id)) as CustomerDoc | null;
+      if (after) await syncCustomerSearchTokens(ctx, after);
       await ctx.scheduler.runAfter(0, anyApi.orders.refreshCustomerOrderSearch, {
         customer_id: args.id,
       });
@@ -441,6 +507,53 @@ export const continueCustomerOrderStatsReconcile = internalMutation({
   args: { customer_id: v.id("customers") },
   handler: async (ctx, args) => {
     return await reconcileCustomerStatsChunk(ctx, args.customer_id, null);
+  },
+});
+
+/**
+ * Backfills customerSearchTokens rows for customers written before the token
+ * stream existed (also fills missing search_text first). Drains in bounded
+ * batches via the by_customer_search_tokens_version index and records
+ * completion in transitionState ("customerSearchTokens"), which flips list
+ * search from the explicit migration-pending state to cursor-paginated
+ * token search.
+ */
+export const backfillCustomerSearchTokens = internalMutation({
+  args: { limit: v.optional(v.number()), cursor: v.optional(v.string()) },
+  handler: async (ctx, args) => {
+    const limit = Math.min(Math.max(args.limit ?? 100, 1), 200);
+    const result = await ctx.db
+      .query("customers")
+      .withIndex("by_customer_search_tokens_version", (q) =>
+        q.lt("customerSearchTokensVersion", CUSTOMER_SEARCH_TOKENS_VERSION),
+      )
+      .order("asc")
+      .paginate({ numItems: limit, cursor: args.cursor ?? null });
+    let synced = 0;
+    for (const customer of result.page as CustomerDoc[]) {
+      const searchText = customer.search_text ?? customerSearchText(customer);
+      if (customer.search_text !== searchText) {
+        await ctx.db.patch(customer._id, { search_text: searchText });
+      }
+      await syncCustomerSearchTokens(ctx, { ...customer, search_text: searchText });
+      synced += 1;
+    }
+    if (!result.isDone) {
+      await ctx.scheduler.runAfter(
+        0,
+        anyApi.customers.backfillCustomerSearchTokens,
+        { limit, cursor: result.continueCursor },
+      );
+    } else {
+      await markCustomerSearchMigrationComplete(ctx);
+    }
+    return {
+      processed: result.page.length,
+      synced,
+      nextCursor: result.continueCursor,
+      remainingMayExist: !result.isDone,
+      complete: result.isDone,
+    };
   },
 });
 

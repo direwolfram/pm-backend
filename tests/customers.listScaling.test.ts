@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { convexTest } from "convex-test";
-import { api } from "../convex/_generated/api";
+import { api, internal } from "../convex/_generated/api";
 import schema from "../convex/schema";
 import { listHandler } from "../convex/customers";
 import { doc, FakeConvexDb } from "./fakeConvexDb";
@@ -124,6 +124,7 @@ describe("customers.list cursor pagination", () => {
       }
     });
 
+    await t.mutation(internal.customers.backfillCustomerSearchTokens, { limit: 200 });
     const seen: string[] = [];
     let cursor: string | null = null;
     let pages = 0;
@@ -201,6 +202,7 @@ describe("customers.list cursor pagination", () => {
       phone_number: "9551234",
       display_name: "Searchable",
     });
+    await t.mutation(internal.customers.backfillCustomerSearchTokens, { limit: 200 });
 
     let found = await t.query(api.customers.list, {
       search: "+639551234",

@@ -75,6 +75,7 @@ export default defineSchema({
     order_count: v.optional(v.number()),
     total_spend: v.optional(v.number()),
     customerStatsVersion: v.optional(v.number()),
+    customerSearchTokensVersion: v.optional(v.number()),
     statsGeneration: v.optional(v.number()),
     reconcile_cursor: v.optional(v.union(v.string(), v.null())),
     reconcile_generation: v.optional(v.number()),
@@ -90,10 +91,36 @@ export default defineSchema({
     .index("by_created", ["created_at"])
     .index("by_status_created", ["status", "created_at"])
     .index("by_customer_stats_version", ["customerStatsVersion"])
+    .index("by_customer_search_tokens_version", ["customerSearchTokensVersion"])
     .searchIndex("search_customers", {
       searchField: "search_text",
       filterFields: ["status"],
     }),
+
+  /**
+   * Tokenized customer search rows (name, email, phone). Convex search
+   * indexes cannot be paginated, so genuine cursor-paginated search runs
+   * over this table: one row per (customer, search token), driven by the
+   * by_token_created index (newest-first) with a single page-sized read per
+   * request. Written transactionally by customers.create / updateProfile /
+   * setStatus / updatePhone; legacy rows are backfilled by
+   * customers.backfillCustomerSearchTokens, which records completion in
+   * transitionState under key "customerSearchTokens".
+   */
+  customerSearchTokens: defineTable({
+    customer_id: v.id("customers"),
+    token: v.string(),
+    tokens: v.array(v.string()),
+    created_at: v.number(),
+    status: v.union(
+      v.literal("guest"),
+      v.literal("active"),
+      v.literal("blocked"),
+      v.literal("deleted"),
+    ),
+  })
+    .index("by_token_created", ["token", "created_at"])
+    .index("by_customer", ["customer_id"]),
 
   otp_challenges: defineTable({
     phone_country_code: v.string(),

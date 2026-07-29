@@ -14,6 +14,7 @@ type TableName =
   | "pricesActive"
   | "priceTransitions"
   | "productSearchTokens"
+  | "customerSearchTokens"
   | "listCounts"
   | "transitionState"
   | "product_similar_products"

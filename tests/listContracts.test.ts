@@ -75,19 +75,39 @@ describe("list response contracts", () => {
     page = await t.query(api.customers.list, { limit: 10 });
     expect(page.total).toBe(2);
 
-    // search totals are exact match counts
+    // flip search to the versioned token-stream path (writers already
+    // maintained token rows; the backfill only records completion)
+    await t.mutation(internal.customers.backfillCustomerSearchTokens, { limit: 200 });
+
+    // search totals are explicitly non-exact under the versioned contract
     page = await t.query(api.customers.list, { search: "alice", limit: 10 });
-    expect(page.total).toBe(1);
+    expect(page.totalIsExact).toBe(false);
+    expect(page.total).toBe(SEARCH_TOTAL_UNKNOWN);
+    expect(page.data).toHaveLength(1);
     page = await t.query(api.customers.list, {
-      search: "910000000",
+      search: "9100000001",
       limit: 10,
     });
-    expect(page.total).toBe(2);
+    expect(page.totalIsExact).toBe(false);
+    expect(page.data).toHaveLength(1);
+    // full concatenated number is itself a token
+    page = await t.query(api.customers.list, {
+      search: "639100000002",
+      limit: 10,
+    });
+    expect(page.data).toHaveLength(1);
     page = await t.query(api.customers.list, {
       search: "nothing-matches",
       limit: 10,
     });
-    expect(page).toMatchObject({ total: 0, hasMore: false });
+    expect(page).toMatchObject({ total: SEARCH_TOTAL_UNKNOWN, hasMore: false });
+    expect(page.data).toHaveLength(0);
+    // intentional versioned change: no prefix matching on partial numbers
+    page = await t.query(api.customers.list, {
+      search: "910000000",
+      limit: 10,
+    });
+    expect(page.data).toHaveLength(0);
   });
 
   it("orders.list returns exact totals for status, store, search, and windows", async () => {

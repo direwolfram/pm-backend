@@ -77,6 +77,7 @@ export interface CustomerDoc extends BaseDoc {
   order_count?: number;
   total_spend?: number;
   customerStatsVersion?: number;
+  customerSearchTokensVersion?: number;
   statsGeneration?: number;
   reconcile_cursor?: string | null;
   reconcile_generation?: number;
