@@ -21,8 +21,10 @@ import { deletePriceCascade } from "./prices";
 import {
   applyListCountChange,
   exactListTotal,
+  inventoryCountKeys,
   productCountKeys,
   productTotalKey,
+  skuCountKeys,
 } from "./listCounts";
 import type { Id } from "./_generated/dataModel";
 import type {
@@ -803,6 +805,7 @@ export const continueProductDelete = internalMutation({
       .take(CASCADE_BATCH_LIMIT - operations);
     for (const i of inv) {
       await ctx.db.delete(i._id);
+      await applyListCountChange(ctx, "inventory", inventoryCountKeys, i, null);
       operations += 1;
     }
     if (operations >= CASCADE_BATCH_LIMIT) {
@@ -819,6 +822,7 @@ export const continueProductDelete = internalMutation({
       // Keep pricesActive consistent: mirrors of this SKU's prices go with it.
       await deletePricesActiveForSku(ctx, s._id);
       await ctx.db.delete(s._id);
+      await applyListCountChange(ctx, "skus", skuCountKeys, {}, null);
       operations += 1;
     }
     if (operations >= CASCADE_BATCH_LIMIT) {

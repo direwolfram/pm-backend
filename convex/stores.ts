@@ -6,6 +6,7 @@ import {
   decrementProductStock,
   refreshProductDefaultPrice,
 } from "./lib/productListSummaries";
+import { applyListCountChange, inventoryCountKeys } from "./listCounts";
 import { deletePriceCascade } from "./prices";
 import type { DeliveryZoneDoc, InventoryDoc, PriceDoc, StoreDoc } from "./model";
 
@@ -165,6 +166,7 @@ export const continueStoreDelete = internalMutation({
     const deletedStockByProduct = new Map<string, number>();
     for (const row of inv) {
       await ctx.db.delete(row._id);
+      await applyListCountChange(ctx, "inventory", inventoryCountKeys, row, null);
       const productId = row.productId;
       if (productId) {
         const quantity =

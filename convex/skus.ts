@@ -7,6 +7,7 @@ import {
   recomputeProductListSummary,
 } from "./lib/productListSummaries";
 import { deletePriceCascade } from "./prices";
+import { applyListCountChange, inventoryCountKeys, skuCountKeys } from "./listCounts";
 import type { InventoryDoc, PriceDoc, SkuDoc } from "./model";
 
 const CASCADE_BATCH_LIMIT = 100;
@@ -171,6 +172,7 @@ export const create = mutation({
     if (args.is_default) {
       await unsetOtherDefaults(ctx, args.product_id, id as string);
     }
+    await applyListCountChange(ctx, "skus", skuCountKeys, null, {});
     await recomputeProductListSummary(ctx, args.product_id);
     return id;
   },
@@ -327,6 +329,7 @@ export const continueSkuDelete = internalMutation({
       .take(CASCADE_BATCH_LIMIT - operations);
     for (const i of inv) {
       await ctx.db.delete(i._id);
+      await applyListCountChange(ctx, "inventory", inventoryCountKeys, i as InventoryDoc, null);
       operations += 1;
     }
     if (operations >= CASCADE_BATCH_LIMIT) {
@@ -336,6 +339,7 @@ export const continueSkuDelete = internalMutation({
       return { done: false, operations };
     }
     await ctx.db.delete(args.id);
+    await applyListCountChange(ctx, "skus", skuCountKeys, {}, null);
     // ensure a remaining SKU becomes default if we deleted the default
     if (sku.is_default) {
       const remaining = (await ctx.db
