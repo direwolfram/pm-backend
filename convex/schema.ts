@@ -401,6 +401,7 @@ export default defineSchema({
     ends_at: v.optional(v.number()),
   })
     .index("by_sku", ["sku_id"])
+    .index("by_price", ["price_id"])
     .index("by_ends_at", ["ends_at"]),
 
   inventory: defineTable({

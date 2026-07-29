@@ -23,6 +23,7 @@ import type * as lib_geo from "../lib/geo.js";
 import type * as lib_inventoryMath from "../lib/inventoryMath.js";
 import type * as lib_pricing from "../lib/pricing.js";
 import type * as lib_productListSummaries from "../lib/productListSummaries.js";
+import type * as lib_productSearchTokens from "../lib/productSearchTokens.js";
 import type * as listCounts from "../listCounts.js";
 import type * as model from "../model.js";
 import type * as orders from "../orders.js";
@@ -58,6 +59,7 @@ declare const fullApi: ApiFromModules<{
   "lib/inventoryMath": typeof lib_inventoryMath;
   "lib/pricing": typeof lib_pricing;
   "lib/productListSummaries": typeof lib_productListSummaries;
+  "lib/productSearchTokens": typeof lib_productSearchTokens;
   listCounts: typeof listCounts;
   model: typeof model;
   orders: typeof orders;

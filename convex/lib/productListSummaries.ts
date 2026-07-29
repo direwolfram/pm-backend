@@ -204,9 +204,33 @@ export async function recomputeProductListSummary(
 const MAX_ACTIVE_MIRROR_ROWS_PER_SKU = 1_000;
 
 /**
- * Delete every pricesActive mirror row for one SKU. Must run whenever prices
- * are deleted outside prices.remove (batched cascades) so stale mirrors can
- * never contribute to default_price.
+ * Delete the exact pricesActive mirror row of one price via the bounded
+ * by_price reverse lookup (at most one mirror per price — a cardinality
+ * invariant enforced by syncPriceActiveRow). Unlike
+ * deletePricesActiveForSku this never touches mirrors of OTHER prices, so
+ * batch deletions (store cascades) preserve base and surviving-store
+ * mirrors exactly. Idempotent: a missing mirror is a no-op.
+ */
+export async function deletePriceActiveMirror(ctx: { db: any }, priceId: string) {
+  const rows = await ctx.db
+    .query("pricesActive")
+    .withIndex("by_price", (q: any) => q.eq("price_id", priceId))
+    .take(2);
+  if (rows.length > 1) {
+    throw new Error(
+      `Price ${priceId} has more than one active mirror row; reconcile pricesActive`,
+    );
+  }
+  if (rows[0]) await ctx.db.delete(rows[0]._id);
+  return rows.length;
+}
+
+/**
+ * Delete every pricesActive mirror row for one SKU. Must only run when the
+ * SKU itself is being deleted (SKU/product cascades) — for individual price
+ * deletions use deletePriceActiveMirror so surviving prices keep their
+ * mirrors. Must run whenever prices are deleted outside prices.remove
+ * (batched cascades) so stale mirrors can never contribute to default_price.
  */
 export async function deletePricesActiveForSku(ctx: { db: any }, skuId: string) {
   const rows = await ctx.db

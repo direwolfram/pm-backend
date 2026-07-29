@@ -4,10 +4,9 @@ import { query, mutation, internalMutation } from "./functions";
 import { now, paginate } from "./helpers";
 import {
   decrementProductStock,
-  deletePricesActiveForSku,
   refreshProductDefaultPrice,
 } from "./lib/productListSummaries";
-import { deletePriceTransitionJournal } from "./prices";
+import { deletePriceCascade } from "./prices";
 import type { DeliveryZoneDoc, InventoryDoc, PriceDoc, StoreDoc } from "./model";
 
 const CASCADE_BATCH_LIMIT = 100;
@@ -194,20 +193,16 @@ export const continueStoreDelete = internalMutation({
       .query("prices")
       .withIndex("by_store", (q) => q.eq("store_id", args.id))
       .take(CASCADE_BATCH_LIMIT - operations)) as PriceDoc[];
-    const priceSkus = new Set<string>();
     const priceProducts = new Set<string>();
     for (const p of prices) {
-      await ctx.db.delete(p._id);
-      await deletePriceTransitionJournal(ctx, p._id);
-      priceSkus.add(p.sku_id);
+      // Invariant-preserving deletion: only this price's own mirror goes
+      // with it; base and other-store mirrors of the same SKU survive.
+      await deletePriceCascade(ctx, p);
       if (p.product_id) priceProducts.add(p.product_id);
       operations += 1;
     }
-    // Mirror cleanup: pricesActive rows for deleted prices go with them,
-    // and affected products get their default_price reconciled.
-    for (const skuId of priceSkus) {
-      await deletePricesActiveForSku(ctx, skuId);
-    }
+    // Reconcile default_price only after the batch's surviving mirrors are
+    // correct (idempotent across batch continuations).
     for (const productId of priceProducts) {
       await refreshProductDefaultPrice(ctx, productId);
     }

@@ -3,6 +3,7 @@ import { anyApi } from "convex/server";
 import { query, mutation, internalMutation } from "./functions";
 import { assertPricePair, now } from "./helpers";
 import {
+  deletePriceActiveMirror,
   PRICE_ACTIVE_LOOKAHEAD_MS,
   priceIsActiveMaterializable,
   recomputeProductListSummary,
@@ -83,10 +84,10 @@ async function syncPriceActiveRow(
   price: PriceDoc,
   t: number,
 ) {
-  const rows = (await ctx.db
+  const mirror = (await ctx.db
     .query("pricesActive")
-    .withIndex("by_sku", (q: any) => q.eq("sku_id", price.sku_id))
-    .collect()) as {
+    .withIndex("by_price", (q: any) => q.eq("price_id", price._id))
+    .first()) as {
     _id: string;
     price_id: string;
     product_id?: string;
@@ -94,8 +95,7 @@ async function syncPriceActiveRow(
     sale_price: number;
     starts_at: number;
     ends_at?: number;
-  }[];
-  const mirror = rows.find((row) => row.price_id === price._id);
+  } | null;
   if (priceIsActiveMaterializable(price, t)) {
     const payload = {
       sku_id: price.sku_id,
@@ -127,15 +127,6 @@ async function syncPriceActiveRow(
     return true;
   }
   return false;
-}
-
-async function removePriceActiveRow(ctx: { db: any }, price: PriceDoc) {
-  const rows = (await ctx.db
-    .query("pricesActive")
-    .withIndex("by_sku", (q: any) => q.eq("sku_id", price.sku_id))
-    .collect()) as { _id: string; price_id: string }[];
-  const mirror = rows.find((row) => row.price_id === price._id);
-  if (mirror) await ctx.db.delete(mirror._id);
 }
 
 export async function listBySkuHandler(
@@ -276,17 +267,34 @@ export const upsert = mutation({
   },
 });
 
+/**
+ * Invariant-preserving price deletion: removes the source price, its
+ * transition journal entries, and ONLY its own pricesActive mirror (bounded
+ * by_price reverse lookup). Base and other-store mirrors of the same SKU
+ * are never touched, so a store cascade leaves surviving prices fully
+ * mirrored. Idempotent — journal and mirror deletion are no-ops when
+ * already gone, and callers may invoke it once per batch under retries.
+ * Callers recompute affected product summaries after the batch's surviving
+ * mirrors are correct.
+ */
+export async function deletePriceCascade(
+  ctx: { db: any },
+  price: { _id: string },
+) {
+  await ctx.db.delete(price._id);
+  await deletePriceActiveMirror(ctx, price._id);
+  await deletePriceTransitionJournal(ctx, price._id);
+}
+
 export const remove = mutation({
   args: { id: v.id("prices") },
   handler: async (ctx, args) => {
     const price = (await ctx.db.get(args.id)) as PriceDoc | null;
-    await ctx.db.delete(args.id);
     if (price) {
-      await removePriceActiveRow(ctx, price);
-      await deletePriceTransitionJournal(ctx, args.id);
-    }
-    if (price?.product_id) {
-      await recomputeProductListSummary(ctx, price.product_id);
+      await deletePriceCascade(ctx, price);
+      if (price.product_id) {
+        await recomputeProductListSummary(ctx, price.product_id);
+      }
     }
   },
 });

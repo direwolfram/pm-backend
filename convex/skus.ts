@@ -6,7 +6,7 @@ import {
   deletePricesActiveForSku,
   recomputeProductListSummary,
 } from "./lib/productListSummaries";
-import { deletePriceTransitionJournal } from "./prices";
+import { deletePriceCascade } from "./prices";
 import type { InventoryDoc, PriceDoc, SkuDoc } from "./model";
 
 const CASCADE_BATCH_LIMIT = 100;
@@ -309,11 +309,11 @@ export const continueSkuDelete = internalMutation({
       .withIndex("by_sku", (q) => q.eq("sku_id", args.id))
       .take(CASCADE_BATCH_LIMIT);
     for (const p of prices) {
-      await ctx.db.delete(p._id);
-      await deletePriceTransitionJournal(ctx, p._id);
+      await deletePriceCascade(ctx, p);
       operations += 1;
     }
-    // Mirror cleanup: pricesActive rows for this SKU go with its prices.
+    // Mirror sweep: any pricesActive rows for this SKU left by prices deleted
+    // in earlier (pre-helper) batches go with the SKU.
     await deletePricesActiveForSku(ctx, args.id);
     if (operations >= CASCADE_BATCH_LIMIT) {
       await ctx.scheduler.runAfter(0, anyApi.skus.continueSkuDelete, {

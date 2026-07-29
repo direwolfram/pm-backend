@@ -17,7 +17,7 @@ import {
   searchTokensForQuery,
   syncProductSearchTokens,
 } from "./lib/productSearchTokens";
-import { deletePriceTransitionJournal } from "./prices";
+import { deletePriceCascade } from "./prices";
 import {
   applyListCountChange,
   exactListTotal,
@@ -788,8 +788,7 @@ export const continueProductDelete = internalMutation({
       .withIndex("by_product", (q) => q.eq("product_id", args.id))
       .take(CASCADE_BATCH_LIMIT - operations);
     for (const pr of prices) {
-      await ctx.db.delete(pr._id);
-      await deletePriceTransitionJournal(ctx, pr._id);
+      await deletePriceCascade(ctx, pr);
       operations += 1;
     }
     if (operations >= CASCADE_BATCH_LIMIT) {
