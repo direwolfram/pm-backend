@@ -46,8 +46,14 @@ export function useCursorPages<T, R extends CursorPageResult<T>>(
   const [state, setState] = useState<CursorPageState<T>>(() =>
     initialPageState<T>(fingerprint),
   );
-  const activeCursor = state.activeCursor;
-  const result = usePageQuery(activeCursor);
+  // Derive the query cursor synchronously: on the first render after a
+  // fingerprint change the state still holds the previous fingerprint and a
+  // possibly deep activeCursor scoped to the OLD filters. Sending that
+  // opaque cursor with the new filters would be an invalid-cursor request,
+  // so a mismatched fingerprint always queries the first page (null).
+  const queryCursor =
+    state.fingerprint === fingerprint ? state.activeCursor : null;
+  const result = usePageQuery(queryCursor);
 
   useEffect(() => {
     // Syncing the accumulator to a new filter/search fingerprint; the state
@@ -64,13 +70,13 @@ export function useCursorPages<T, R extends CursorPageResult<T>>(
     setState((current) =>
       applyPageResponse(current, {
         fingerprint,
-        cursor: activeCursor,
+        cursor: queryCursor,
         data: result.data,
         nextCursor: result.nextCursor,
         hasMore: result.hasMore,
       }),
     );
-  }, [result, fingerprint, activeCursor]);
+  }, [result, fingerprint, queryCursor]);
 
   const exhausted = isExhausted(state);
   const continuation = pendingContinuation(state);

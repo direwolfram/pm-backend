@@ -21,8 +21,10 @@ function cursorKey(cursor: string | null) {
 function createQueryStore() {
   const listeners = new Set<() => void>();
   const data = new Map<string, Page>();
+  const calls: { fingerprint: string; cursor: string | null }[] = [];
   let version = 0;
   return {
+    calls,
     set(fingerprint: string, cursor: string | null, page: Page) {
       data.set(`${fingerprint}|${cursorKey(cursor)}`, page);
       version += 1;
@@ -36,6 +38,7 @@ function createQueryStore() {
         },
         () => version,
       );
+      calls.push({ fingerprint, cursor });
       return data.get(`${fingerprint}|${cursorKey(cursor)}`);
     },
   };
@@ -131,6 +134,32 @@ describe("useCursorPages", () => {
 
     act(() => screen.getByTestId("loadMore").click());
     await waitFor(() => expect(screen.getByTestId("count").textContent).toBe("300"));
+    expect(screen.getByTestId("exhausted").textContent).toBe("true");
+  });
+
+  it("sends cursor null on the first request after a deep-page filter change", async () => {
+    const store = createQueryStore();
+    store.set(FP_A, null, { data: rows("a0", 100), nextCursor: "c1", hasMore: true });
+    store.set(FP_A, "c1", { data: rows("a1", 100), nextCursor: "c2", hasMore: true });
+    store.set(FP_B, null, { data: rows("b0", 4), nextCursor: null, hasMore: false });
+
+    const { rerender } = render(<Harness fingerprint={FP_A} store={store} />);
+    await waitFor(() => expect(screen.getByTestId("count").textContent).toBe("100"));
+    act(() => screen.getByTestId("loadMore").click());
+    await waitFor(() => expect(screen.getByTestId("count").textContent).toBe("200"));
+
+    // Now positioned on page 2 (activeCursor "c1", "c2" pending).
+    store.calls.length = 0;
+    rerender(<Harness fingerprint={FP_B} store={store} />);
+    await waitFor(() => expect(screen.getByTestId("count").textContent).toBe("4"));
+
+    // The first new-fingerprint request used cursor null, and no request ever
+    // combined the new fingerprint with an old-fingerprint cursor.
+    const newFilterCalls = store.calls.filter((call) => call.fingerprint === FP_B);
+    expect(newFilterCalls.length).toBeGreaterThan(0);
+    expect(newFilterCalls[0].cursor).toBeNull();
+    expect(newFilterCalls.every((call) => call.cursor === null)).toBe(true);
+    expect(screen.getByTestId("rows").textContent).toBe("b0_0,b0_1,b0_2,b0_3");
     expect(screen.getByTestId("exhausted").textContent).toBe("true");
   });
 

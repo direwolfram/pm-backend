@@ -368,7 +368,7 @@ export default function Products() {
 
       {paging.awaitingPage && rows.length === 0 ? (
         <Loading />
-      ) : result?.searchMigrationPending ? (
+      ) : result?.searchMigrationPending && rows.length === 0 ? (
         <EmptyState
           title="Search is being migrated"
           hint="Product search indexing is still backfilling. Clear the search box to browse with filters, or try again shortly."
