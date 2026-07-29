@@ -3,10 +3,12 @@ import { mutation } from "./functions";
 import {
   computeSellable,
   isLowStock,
+  nextShelfLifeRefreshAt,
   pickPriorityScore,
   shelfLifeDaysRemaining,
 } from "./lib/inventoryMath";
 import { slugify } from "./helpers";
+import { productCountKeys } from "./listCounts";
 import type { Id as ConvexId } from "./_generated/dataModel";
 
 interface SeedProduct {
@@ -201,6 +203,9 @@ export const run = mutation({
         isFrequentlyBought: product.isFrequentlyBought,
         rating_average: 0,
         rating_count: 0,
+        sku_count: 0,
+        total_stock: 0,
+        productListSummaryVersion: 2,
         attributes: [],
         created_at: t,
         updated_at: t,
@@ -218,11 +223,17 @@ export const run = mutation({
     }
 
     const inventoryIds: ConvexId<"inventory">[] = [];
+    const stockByProduct = new Map<string, number>();
     let inventoryCount = 0;
     for (const [index, product] of products.entries()) {
       for (const [centerIndex, centerId] of centerIds.entries()) {
         if (inventoryCount >= 50) break;
         const availableQuantity = 10 + ((index + centerIndex) % 20);
+        const productId = productIds.get(product.sku)!;
+        stockByProduct.set(
+          productId as string,
+          (stockByProduct.get(productId as string) ?? 0) + availableQuantity,
+        );
         const reservedQuantity = centerIndex === 0 && index % 7 === 0 ? 2 : 0;
         const replenishmentThreshold = 6;
         const sellable = computeSellable(availableQuantity, reservedQuantity);
@@ -258,6 +269,35 @@ export const run = mutation({
       }
     }
 
+    // Keep product list summaries consistent with the seeded stock.
+    for (const [productId, totalStock] of stockByProduct) {
+      await ctx.db.patch(productId as ConvexId<"products">, {
+        total_stock: totalStock,
+        productListSummaryVersion: 2,
+      });
+    }
+
+    // Maintained list counters for the seeded products.
+    const counts = new Map<string, number>();
+    for (const product of await ctx.db.query("products").collect()) {
+      for (const key of productCountKeys(product)) {
+        counts.set(key, (counts.get(key) ?? 0) + 1);
+      }
+    }
+    for (const [key, count] of counts) {
+      const existing = await ctx.db
+        .query("listCounts")
+        .withIndex("by_scope_key", (q) =>
+          q.eq("scope", "products").eq("key", key),
+        )
+        .first();
+      if (existing) {
+        await ctx.db.patch(existing._id, { count: existing.count + count });
+      } else {
+        await ctx.db.insert("listCounts", { scope: "products", key, count });
+      }
+    }
+
     for (const [i, inventoryId] of inventoryIds.slice(0, 10).entries()) {
       const expiryDate = t + (i + 1) * day;
       const daysRemaining = shelfLifeDaysRemaining(expiryDate, t);
@@ -273,6 +313,7 @@ export const run = mutation({
         discountPercent: daysRemaining <= 2 ? 10 : 0,
         qualityCheckStatus: "passed",
         pickPriority: pickPriorityScore(expiryDate),
+        nextShelfLifeRefreshAt: nextShelfLifeRefreshAt(expiryDate, t),
       });
       await ctx.db.patch(inventoryId, {
         batchCount: 1,

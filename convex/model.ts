@@ -73,6 +73,15 @@ export interface CustomerDoc extends BaseDoc {
   status: CustomerStatus;
   referral_code?: string;
   marketing_opt_in: boolean;
+  search_text?: string;
+  order_count?: number;
+  total_spend?: number;
+  customerStatsVersion?: number;
+  customerSearchTokensVersion?: number;
+  statsGeneration?: number;
+  reconcile_cursor?: string | null;
+  reconcile_generation?: number;
+  reconcile_totals?: { order_count: number; total_spend: number };
   created_at: number;
   updated_at: number;
 }
@@ -103,6 +112,7 @@ export interface StoreDoc extends BaseDoc {
   latitude: number;
   longitude: number;
   timezone: string;
+  deleting_at?: number;
   created_at: number;
   updated_at: number;
 }
@@ -124,6 +134,7 @@ export interface BrandDoc extends BaseDoc {
   logo_url?: string;
   logo_color?: string;
   is_active: boolean;
+  deleting_at?: number;
 }
 
 export interface CategoryDoc extends BaseDoc {
@@ -137,6 +148,7 @@ export interface CategoryDoc extends BaseDoc {
   image_color?: string;
   sort_order: number;
   is_active: boolean;
+  deleting_at?: number;
 }
 
 export interface ProductAttribute {
@@ -183,6 +195,13 @@ export interface ProductDoc extends BaseDoc {
   image_color?: string;
   rating_average: number;
   rating_count: number;
+  sku_count?: number;
+  default_sku_id?: string;
+  default_price?: number;
+  total_stock?: number;
+  productListSummaryVersion?: number;
+  productSearchTokensVersion?: number;
+  deleting_at?: number;
   attributes: ProductAttribute[];
   created_at: number;
   updated_at: number;
@@ -213,6 +232,7 @@ export interface SkuDoc extends BaseDoc {
   sort_order: number;
   is_default: boolean;
   is_active: boolean;
+  deleting_at?: number;
 }
 
 export interface PriceDoc extends BaseDoc {
@@ -261,6 +281,7 @@ export interface PromotionDoc extends BaseDoc {
   starts_at: number;
   ends_at: number;
   is_active: boolean;
+  deleting_at?: number;
 }
 
 export interface PromotionTargetDoc extends BaseDoc {
@@ -297,8 +318,12 @@ export interface HomeSectionDoc extends BaseDoc {
   maxAppVersion?: string;
   layoutVariant?: string;
   backgroundColor?: string;
+  backgroundImage?: string;
+  backgroundImageStorageId?: string;
   textColor?: string;
   imageUrl?: string;
+  imageStorageId?: string;
+  storageId?: string;
   iconEmoji?: string;
   maxItems?: number;
   productIds?: string[];
@@ -331,6 +356,7 @@ export interface HomeSectionResponse {
   sortOrder: number;
   layoutVariant?: string;
   backgroundColor?: string;
+  backgroundImage?: string;
   textColor?: string;
   imageUrl?: string;
   iconEmoji?: string;
@@ -368,6 +394,9 @@ export interface OrderDoc extends BaseDoc {
   delivery_fee_amount: number;
   total_amount: number;
   customer_notes?: string;
+  item_count?: number;
+  order_search_text?: string;
+  orderSummaryVersion?: number;
   placed_at: number;
   estimated_delivery_at?: number;
   delivered_at?: number;

@@ -65,7 +65,7 @@ export default function Orders() {
     (useQuery(api.stores.list, { includeInactive: true, limit: 100 }) as
       | { data: StoreDoc[] }
       | undefined)?.data ?? [];
-  const result = useQuery(api.orders.list, {
+  const result = useQuery(api.orders.listV2, {
     status: status === "all" ? undefined : status,
     store_id: storeId === "all" ? undefined : storeId,
     search: search || undefined,

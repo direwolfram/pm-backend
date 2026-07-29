@@ -37,6 +37,7 @@ export type HomeSectionResponse = {
   sortOrder: number;
   layoutVariant?: string;
   backgroundColor?: string;
+  backgroundImage?: string;
   textColor?: string;
   imageUrl?: string;
   iconEmoji?: string;

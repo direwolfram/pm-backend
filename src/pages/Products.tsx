@@ -1,9 +1,10 @@
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import { useMutation, useQuery } from "convex/react";
 import { Link, useNavigate } from "react-router";
 import { Pencil, Plus, Search, Trash2 } from "lucide-react";
 import { api } from "@/lib/convexClient";
 import { formatMoney } from "@/lib/format";
+import { useCursorPages } from "@/lib/useCursorPages";
 import {
   ConfirmButton,
   EmptyState,
@@ -45,7 +46,17 @@ import type {
   ProductListRow,
 } from "../../convex/model";
 
-type ListResult = { data: ProductListRow[]; total: number };
+type ListResult = {
+  data: ProductListRow[];
+  total: number;
+  totalIsExact: boolean;
+  nextCursor: string | null;
+  hasMore: boolean;
+  summariesPending?: number;
+  searchMigrationPending?: boolean;
+};
+
+const PAGE_LIMIT = 100;
 
 const EMPTY_FORM = {
   name: "",
@@ -105,13 +116,18 @@ export default function Products() {
   const [categoryId, setCategoryId] = useState<string>("all");
   const [brandId, setBrandId] = useState<string>("all");
 
-  const result = useQuery(api.products.list, {
-    search: search || undefined,
-    status: status === "all" ? undefined : status,
-    category_id: categoryId === "all" ? undefined : categoryId,
-    brand_id: brandId === "all" ? undefined : brandId,
-    limit: 200,
-  }) as ListResult | undefined;
+  const fingerprint = `${search}|${status}|${categoryId}|${brandId}`;
+  const usePageQuery = (cursor: string | null) =>
+    useQuery(api.products.listV2, {
+      search: search || undefined,
+      status: status === "all" ? undefined : status,
+      category_id: categoryId === "all" ? undefined : categoryId,
+      brand_id: brandId === "all" ? undefined : brandId,
+      limit: PAGE_LIMIT,
+      cursor,
+    }) as ListResult | undefined;
+  const paging = useCursorPages<ProductListRow, ListResult>(fingerprint, usePageQuery);
+  const result = paging.result;
   const categories =
     (useQuery(api.categories.list, { includeInactive: true, limit: 200 }) as
       | { data: CategoryDoc[] }
@@ -252,12 +268,15 @@ export default function Products() {
     if (ok) setDialogOpen(false);
   };
 
-  const rows = useMemo(() => result?.data ?? [], [result]);
+  const rows = paging.rows;
   const activeCount = rows.filter((p) => p.status === "active").length;
-  const draftCount = rows.filter((p) => p.status === "draft").length;
-  const discontinuedCount = rows.filter((p) => p.status === "discontinued").length;
   const totalSkus = rows.reduce((sum, p) => sum + p.sku_count, 0);
   const totalStock = rows.reduce((sum, p) => sum + p.total_stock, 0);
+  const catalogTotal = result
+    ? result.totalIsExact
+      ? result.total
+      : `${rows.length}+`
+    : rows.length;
 
   return (
     <div>
@@ -271,12 +290,13 @@ export default function Products() {
         }
       />
 
-      <div className="mb-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+      <div className="mb-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
         {[
-          ["Catalog items", result?.total ?? rows.length],
-          ["Active products", activeCount],
-          ["SKUs", totalSkus],
-          ["Units in stock", totalStock],
+          ["Catalog items", catalogTotal],
+          ["Loaded products", rows.length],
+          ["Active (loaded)", activeCount],
+          ["SKUs (loaded)", totalSkus],
+          ["Stock (loaded)", totalStock],
         ].map(([label, value]) => (
           <div key={label} className="rounded-lg border bg-card px-4 py-3">
             <p className="text-xs font-medium text-muted-foreground">{label}</p>
@@ -290,8 +310,8 @@ export default function Products() {
           {[
             ["all", "All"],
             ["active", "Active"],
-            ["draft", `Draft ${draftCount}`],
-            ["discontinued", `Discontinued ${discontinuedCount}`],
+            ["draft", "Draft"],
+            ["discontinued", "Discontinued"],
           ].map(([value, label]) => (
             <button
               key={value}
@@ -346,10 +366,26 @@ export default function Products() {
         </div>
       </div>
 
-      {!result ? (
+      {paging.awaitingPage && rows.length === 0 ? (
         <Loading />
-      ) : rows.length === 0 ? (
+      ) : result?.searchMigrationPending && rows.length === 0 ? (
+        <EmptyState
+          title="Search is being migrated"
+          hint="Product search indexing is still backfilling. Clear the search box to browse with filters, or try again shortly."
+        />
+      ) : rows.length === 0 && paging.exhausted ? (
         <EmptyState title="No products found" hint="Adjust filters or create a new product." />
+      ) : rows.length === 0 ? (
+        <div className="rounded-lg border bg-card px-4 py-8 text-center">
+          <p className="text-sm text-muted-foreground">
+            No matches on this page yet — later pages may still contain results.
+          </p>
+          {paging.hasMore && (
+            <Button variant="outline" className="mt-3" onClick={paging.loadMore}>
+              Load more
+            </Button>
+          )}
+        </div>
       ) : (
         <div className="overflow-hidden rounded-lg border bg-card">
           <Table>
@@ -419,6 +455,20 @@ export default function Products() {
               ))}
             </TableBody>
           </Table>
+        </div>
+      )}
+
+      {rows.length > 0 && (paging.hasMore || paging.awaitingPage) && (
+        <div className="mb-4 flex justify-center">
+          <Button
+            variant="outline"
+            disabled={!paging.hasMore || paging.awaitingPage}
+            onClick={paging.loadMore}
+          >
+            {paging.awaitingPage
+              ? "Loading…"
+              : `Load more (showing ${rows.length}${result?.totalIsExact ? ` of ${result.total}` : ""})`}
+          </Button>
         </div>
       )}
 

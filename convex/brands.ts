@@ -1,7 +1,17 @@
 import { v } from "convex/values";
-import { query, mutation } from "./functions";
-import { paginate } from "./helpers";
-import type { BrandDoc } from "./model";
+import { anyApi } from "convex/server";
+import { query, mutation, internalMutation } from "./functions";
+import { now, paginate } from "./helpers";
+import { applyListCountChange, productCountKeys } from "./listCounts";
+import type { BrandDoc, ProductDoc } from "./model";
+
+const CASCADE_BATCH_LIMIT = 100;
+/**
+ * Products set-null per execution. Each product costs 1 read + 1 write plus
+ * 8 maintained-counter reads + 8 writes, so a continuation stays under
+ * ~50 reads / ~225 writes.
+ */
+const BRAND_SETNULL_BATCH_LIMIT = 25;
 
 export const list = query({
   args: {
@@ -78,23 +88,67 @@ export const update = mutation({
   },
 });
 
-/** SQL behavior: products.brand_id references brands on delete set null. */
+/**
+ * SQL behavior: products.brand_id references brands on delete set null;
+ * promotion targets cascade. Bounded, resumable internal continuation.
+ */
 export const remove = mutation({
   args: { id: v.id("brands") },
   handler: async (ctx, args) => {
-    const products = await ctx.db
+    const brand = (await ctx.db.get(args.id)) as BrandDoc | null;
+    if (!brand) return { id: args.id, deleting: true };
+    if (!brand.deleting_at) {
+      await ctx.db.patch(args.id, { deleting_at: now() });
+    }
+    await ctx.scheduler.runAfter(0, anyApi.brands.continueBrandDelete, {
+      id: args.id,
+    });
+    return { id: args.id, deleting: true };
+  },
+});
+
+export const continueBrandDelete = internalMutation({
+  args: { id: v.id("brands") },
+  handler: async (ctx, args) => {
+    const brand = (await ctx.db.get(args.id)) as BrandDoc | null;
+    if (!brand) return { done: true, deleted: true };
+    let operations = 0;
+    const products = (await ctx.db
       .query("products")
       .withIndex("by_brand", (q) => q.eq("brand_id", args.id))
-      .collect();
+      .take(BRAND_SETNULL_BATCH_LIMIT)) as ProductDoc[];
     for (const p of products) {
       await ctx.db.patch(p._id, { brand_id: undefined });
+      await applyListCountChange(
+        ctx,
+        "products",
+        productCountKeys,
+        p,
+        { ...p, brand_id: undefined },
+      );
+      operations += 1;
+    }
+    if (products.length >= BRAND_SETNULL_BATCH_LIMIT) {
+      await ctx.scheduler.runAfter(0, anyApi.brands.continueBrandDelete, {
+        id: args.id,
+      });
+      return { done: false, operations };
     }
     const targets = await ctx.db
       .query("promotion_targets")
-      .collect();
+      .withIndex("by_brand", (q) => q.eq("brand_id", args.id))
+      .take(CASCADE_BATCH_LIMIT - operations);
     for (const t of targets) {
-      if (t.brand_id === args.id) await ctx.db.delete(t._id);
+      await ctx.db.delete(t._id);
+      operations += 1;
+    }
+    if (operations >= CASCADE_BATCH_LIMIT) {
+      await ctx.scheduler.runAfter(0, anyApi.brands.continueBrandDelete, {
+        id: args.id,
+      });
+      return { done: false, operations };
     }
     await ctx.db.delete(args.id);
+    return { done: true, operations };
   },
 });

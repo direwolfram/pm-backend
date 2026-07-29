@@ -1,7 +1,15 @@
 import { v } from "convex/values";
-import { query, mutation } from "./functions";
+import { anyApi } from "convex/server";
+import { query, mutation, internalMutation } from "./functions";
 import { now, paginate } from "./helpers";
-import type { DeliveryZoneDoc, StoreDoc } from "./model";
+import {
+  decrementProductStock,
+  refreshProductDefaultPrice,
+} from "./lib/productListSummaries";
+import { deletePriceCascade } from "./prices";
+import type { DeliveryZoneDoc, InventoryDoc, PriceDoc, StoreDoc } from "./model";
+
+const CASCADE_BATCH_LIMIT = 100;
 
 export const list = query({
   args: {
@@ -101,28 +109,111 @@ export const update = mutation({
   },
 });
 
+/**
+ * Cascade: delivery zones, inventory, and prices go with the store; orders
+ * restrict. Bounded, resumable internal continuation.
+ */
 export const remove = mutation({
   args: { id: v.id("stores") },
   handler: async (ctx, args) => {
+    const store = (await ctx.db.get(args.id)) as StoreDoc | null;
+    if (!store) return { id: args.id, deleting: true };
     const order = await ctx.db
       .query("orders")
       .withIndex("by_store", (q) => q.eq("store_id", args.id))
       .first();
     if (order) throw new Error("Cannot delete a store that has orders");
+    if (!store.deleting_at) {
+      await ctx.db.patch(args.id, { deleting_at: now() });
+    }
+    await ctx.scheduler.runAfter(0, anyApi.stores.continueStoreDelete, {
+      id: args.id,
+    });
+    return { id: args.id, deleting: true };
+  },
+});
+
+export const continueStoreDelete = internalMutation({
+  args: { id: v.id("stores") },
+  handler: async (ctx, args) => {
+    const store = (await ctx.db.get(args.id)) as StoreDoc | null;
+    if (!store) return { done: true, deleted: true };
+    const order = await ctx.db
+      .query("orders")
+      .withIndex("by_store", (q) => q.eq("store_id", args.id))
+      .first();
+    if (order) throw new Error("Cannot delete a store that has orders");
+    let operations = 0;
     const zones = await ctx.db
       .query("delivery_zones")
       .withIndex("by_store", (q) => q.eq("store_id", args.id))
-      .collect();
-    for (const z of zones) await ctx.db.delete(z._id);
-    const inv = await ctx.db.query("inventory").collect();
-    for (const row of inv) {
-      if (row.store_id === args.id) await ctx.db.delete(row._id);
+      .take(CASCADE_BATCH_LIMIT);
+    for (const z of zones) {
+      await ctx.db.delete(z._id);
+      operations += 1;
     }
-    const prices = await ctx.db.query("prices").collect();
+    if (operations >= CASCADE_BATCH_LIMIT) {
+      await ctx.scheduler.runAfter(0, anyApi.stores.continueStoreDelete, {
+        id: args.id,
+      });
+      return { done: false, operations };
+    }
+    const inv = (await ctx.db
+      .query("inventory")
+      .withIndex("by_store", (q) => q.eq("store_id", args.id))
+      .take(CASCADE_BATCH_LIMIT - operations)) as InventoryDoc[];
+    const deletedStockByProduct = new Map<string, number>();
+    for (const row of inv) {
+      await ctx.db.delete(row._id);
+      const productId = row.productId;
+      if (productId) {
+        const quantity =
+          row.quantity_available ??
+          (row as InventoryDoc & { availableQuantity?: number })
+            .availableQuantity ??
+          0;
+        deletedStockByProduct.set(
+          productId,
+          (deletedStockByProduct.get(productId) ?? 0) + quantity,
+        );
+      }
+      operations += 1;
+    }
+    // Keep product total_stock exact as inventory disappears.
+    for (const [productId, quantity] of deletedStockByProduct) {
+      await decrementProductStock(ctx, productId, quantity);
+    }
+    if (operations >= CASCADE_BATCH_LIMIT) {
+      await ctx.scheduler.runAfter(0, anyApi.stores.continueStoreDelete, {
+        id: args.id,
+      });
+      return { done: false, operations };
+    }
+    const prices = (await ctx.db
+      .query("prices")
+      .withIndex("by_store", (q) => q.eq("store_id", args.id))
+      .take(CASCADE_BATCH_LIMIT - operations)) as PriceDoc[];
+    const priceProducts = new Set<string>();
     for (const p of prices) {
-      if (p.store_id === args.id) await ctx.db.delete(p._id);
+      // Invariant-preserving deletion: only this price's own mirror goes
+      // with it; base and other-store mirrors of the same SKU survive.
+      await deletePriceCascade(ctx, p);
+      if (p.product_id) priceProducts.add(p.product_id);
+      operations += 1;
+    }
+    // Reconcile default_price only after the batch's surviving mirrors are
+    // correct (idempotent across batch continuations).
+    for (const productId of priceProducts) {
+      await refreshProductDefaultPrice(ctx, productId);
+    }
+    if (operations >= CASCADE_BATCH_LIMIT) {
+      await ctx.scheduler.runAfter(0, anyApi.stores.continueStoreDelete, {
+        id: args.id,
+      });
+      return { done: false, operations };
     }
     await ctx.db.delete(args.id);
+    return { done: true, operations };
   },
 });
 
@@ -149,6 +240,11 @@ export const createZone = mutation({
   handler: async (ctx, args) => {
     if (args.estimated_minutes_max < args.estimated_minutes_min) {
       throw new Error("Max ETA must be >= min ETA");
+    }
+    const store = await ctx.db.get(args.store_id);
+    if (!store) throw new Error("Store not found");
+    if ((store as { deleting_at?: number }).deleting_at) {
+      throw new Error("Store is being deleted");
     }
     return await ctx.db.insert("delivery_zones", {
       store_id: args.store_id,

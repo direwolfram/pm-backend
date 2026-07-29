@@ -1,6 +1,15 @@
 import { v } from "convex/values";
-import { query, mutation } from "./functions";
+import { anyApi } from "convex/server";
+import { query, mutation, internalMutation } from "./functions";
+import { now } from "./helpers";
+import {
+  deletePricesActiveForSku,
+  recomputeProductListSummary,
+} from "./lib/productListSummaries";
+import { deletePriceCascade } from "./prices";
 import type { InventoryDoc, PriceDoc, SkuDoc } from "./model";
+
+const CASCADE_BATCH_LIMIT = 100;
 
 export const listAll = query({
   args: { search: v.optional(v.string()) },
@@ -139,6 +148,9 @@ export const create = mutation({
   handler: async (ctx, args) => {
     const product = await ctx.db.get(args.product_id);
     if (!product) throw new Error("Product not found");
+    if ((product as { deleting_at?: number }).deleting_at) {
+      throw new Error("Product is being deleted");
+    }
     await assertUniqueSkuCode(ctx, args.sku_code, args.barcode);
     const id = await ctx.db.insert("skus", {
       product_id: args.product_id,
@@ -159,6 +171,7 @@ export const create = mutation({
     if (args.is_default) {
       await unsetOtherDefaults(ctx, args.product_id, id as string);
     }
+    await recomputeProductListSummary(ctx, args.product_id);
     return id;
   },
 });
@@ -187,9 +200,10 @@ export const update = mutation({
     if (!sku) throw new Error("SKU not found");
     const nextProductId = patch.product_id ?? sku.product_id;
     const product = (await ctx.db.get(nextProductId as any)) as
-      | { name?: string }
+      | { name?: string; deleting_at?: number }
       | null;
     if (!product) throw new Error("Product not found");
+    if (product.deleting_at) throw new Error("Product is being deleted");
     if (patch.sku_code || patch.barcode) {
       await assertUniqueSkuCode(
         ctx,
@@ -209,6 +223,19 @@ export const update = mutation({
         priceSummaryVersion: 1,
       });
     }
+    if (nextProductId !== sku.product_id) {
+      // A SKU move must keep the active-price mirrors pointing at the new
+      // product so transition drains recompute the right summaries.
+      const mirrors = await ctx.db
+        .query("pricesActive")
+        .withIndex("by_sku", (q) => q.eq("sku_id", id))
+        .collect();
+      for (const mirror of mirrors) {
+        if (mirror.product_id !== nextProductId) {
+          await ctx.db.patch(mirror._id, { product_id: nextProductId });
+        }
+      }
+    }
     const inventory = await ctx.db
       .query("inventory")
       .withIndex("by_sku", (q) => q.eq("sku_id", id))
@@ -225,35 +252,89 @@ export const update = mutation({
     if (patch.is_default) {
       await unsetOtherDefaults(ctx, sku.product_id, id as string);
     }
+    await recomputeProductListSummary(ctx, sku.product_id);
+    if (nextProductId !== sku.product_id) {
+      await recomputeProductListSummary(ctx, nextProductId);
+    }
     return id;
   },
 });
 
-/** SQL cascade: prices and inventory rows go with the SKU. */
+/**
+ * SQL cascade: prices and inventory rows go with the SKU. Deletion is a
+ * bounded, resumable workflow: the public mutation validates restrict rules
+ * (order items), marks the SKU as deleting, and schedules internal cleanup
+ * that drains prices and inventory in fixed-size batches before removing
+ * the SKU root.
+ */
 export const remove = mutation({
   args: { id: v.id("skus") },
   handler: async (ctx, args) => {
     const sku = (await ctx.db.get(args.id)) as SkuDoc | null;
-    if (!sku) throw new Error("SKU not found");
+    if (!sku) return { id: args.id, deleting: true };
     const orderItem = await ctx.db
       .query("order_items")
-      .collect()
-      .then((rows) => rows.find((r) => r.sku_id === args.id));
+      .withIndex("by_sku", (q) => q.eq("sku_id", args.id))
+      .first();
     if (orderItem) {
       throw new Error(
         "Cannot delete: this SKU appears in orders. Deactivate it instead.",
       );
     }
+    if (!sku.deleting_at) {
+      await ctx.db.patch(args.id, { deleting_at: now() });
+    }
+    await ctx.scheduler.runAfter(0, anyApi.skus.continueSkuDelete, {
+      id: args.id,
+    });
+    return { id: args.id, deleting: true };
+  },
+});
+
+export const continueSkuDelete = internalMutation({
+  args: { id: v.id("skus") },
+  handler: async (ctx, args) => {
+    const sku = (await ctx.db.get(args.id)) as SkuDoc | null;
+    if (!sku) return { done: true, deleted: true };
+    const orderItem = await ctx.db
+      .query("order_items")
+      .withIndex("by_sku", (q) => q.eq("sku_id", args.id))
+      .first();
+    if (orderItem) {
+      throw new Error("Cannot delete: this SKU appears in orders");
+    }
+    let operations = 0;
     const prices = await ctx.db
       .query("prices")
       .withIndex("by_sku", (q) => q.eq("sku_id", args.id))
-      .collect();
-    for (const p of prices) await ctx.db.delete(p._id);
+      .take(CASCADE_BATCH_LIMIT);
+    for (const p of prices) {
+      await deletePriceCascade(ctx, p);
+      operations += 1;
+    }
+    // Mirror sweep: any pricesActive rows for this SKU left by prices deleted
+    // in earlier (pre-helper) batches go with the SKU.
+    await deletePricesActiveForSku(ctx, args.id);
+    if (operations >= CASCADE_BATCH_LIMIT) {
+      await ctx.scheduler.runAfter(0, anyApi.skus.continueSkuDelete, {
+        id: args.id,
+      });
+      return { done: false, operations };
+    }
     const inv = await ctx.db
       .query("inventory")
       .withIndex("by_sku", (q) => q.eq("sku_id", args.id))
-      .collect();
-    for (const i of inv) await ctx.db.delete(i._id);
+      .take(CASCADE_BATCH_LIMIT - operations);
+    for (const i of inv) {
+      await ctx.db.delete(i._id);
+      operations += 1;
+    }
+    if (operations >= CASCADE_BATCH_LIMIT) {
+      await ctx.scheduler.runAfter(0, anyApi.skus.continueSkuDelete, {
+        id: args.id,
+      });
+      return { done: false, operations };
+    }
     await ctx.db.delete(args.id);
     // ensure a remaining SKU becomes default if we deleted the default
     if (sku.is_default) {
@@ -265,5 +346,7 @@ export const remove = mutation({
         await ctx.db.patch(remaining[0]._id as any, { is_default: true });
       }
     }
+    await recomputeProductListSummary(ctx, sku.product_id);
+    return { done: true, operations };
   },
 });

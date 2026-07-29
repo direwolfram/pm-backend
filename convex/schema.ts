@@ -21,6 +21,32 @@ const deliveryMode = v.union(
 );
 
 export default defineSchema({
+  /**
+   * Transactionally maintained exact counts for admin list endpoints,
+   * keyed by scope + filter dimension tuple. Lets list queries return an
+   * exact numeric total for equality filter combinations with O(1) reads.
+   * Drift (only possible via direct DB writes) is repaired by
+   * listCounts.reconcileListCounts.
+   */
+  listCounts: defineTable({
+    scope: v.string(),
+    key: v.string(),
+    count: v.number(),
+  })
+    .index("by_scope", ["scope"])
+    .index("by_scope_key", ["scope", "key"]),
+
+  /**
+   * Singleton-style progress rows for background drains (e.g. the price
+   * transition activation horizon).
+   */
+  transitionState: defineTable({
+    key: v.string(),
+    horizon: v.optional(v.number()),
+    cursor: v.optional(v.union(v.string(), v.null())),
+    complete: v.optional(v.boolean()),
+  }).index("by_key", ["key"]),
+
   users: defineTable({
     name: v.optional(v.string()),
     email: v.optional(v.string()),
@@ -45,12 +71,56 @@ export default defineSchema({
     ),
     referral_code: v.optional(v.string()),
     marketing_opt_in: v.boolean(),
+    search_text: v.optional(v.string()),
+    order_count: v.optional(v.number()),
+    total_spend: v.optional(v.number()),
+    customerStatsVersion: v.optional(v.number()),
+    customerSearchTokensVersion: v.optional(v.number()),
+    statsGeneration: v.optional(v.number()),
+    reconcile_cursor: v.optional(v.union(v.string(), v.null())),
+    reconcile_generation: v.optional(v.number()),
+    reconcile_totals: v.optional(
+      v.object({ order_count: v.number(), total_spend: v.number() }),
+    ),
     created_at: v.number(),
     updated_at: v.number(),
   })
     .index("by_phone", ["phone_country_code", "phone_number"])
     .index("by_status", ["status"])
-    .index("by_referral_code", ["referral_code"]),
+    .index("by_referral_code", ["referral_code"])
+    .index("by_created", ["created_at"])
+    .index("by_status_created", ["status", "created_at"])
+    .index("by_customer_stats_version", ["customerStatsVersion"])
+    .index("by_customer_search_tokens_version", ["customerSearchTokensVersion"])
+    .searchIndex("search_customers", {
+      searchField: "search_text",
+      filterFields: ["status"],
+    }),
+
+  /**
+   * Tokenized customer search rows (name, email, phone). Convex search
+   * indexes cannot be paginated, so genuine cursor-paginated search runs
+   * over this table: one row per (customer, search token), driven by the
+   * by_token_created index (newest-first) with a single page-sized read per
+   * request. Written transactionally by customers.create / updateProfile /
+   * setStatus / updatePhone; legacy rows are backfilled by
+   * customers.backfillCustomerSearchTokens, which records completion in
+   * transitionState under key "customerSearchTokens".
+   */
+  customerSearchTokens: defineTable({
+    customer_id: v.id("customers"),
+    token: v.string(),
+    tokens: v.array(v.string()),
+    created_at: v.number(),
+    status: v.union(
+      v.literal("guest"),
+      v.literal("active"),
+      v.literal("blocked"),
+      v.literal("deleted"),
+    ),
+  })
+    .index("by_token_created", ["token", "created_at"])
+    .index("by_customer", ["customer_id"]),
 
   otp_challenges: defineTable({
     phone_country_code: v.string(),
@@ -104,6 +174,7 @@ export default defineSchema({
     latitude: v.number(),
     longitude: v.number(),
     timezone: v.string(),
+    deleting_at: v.optional(v.number()),
     created_at: v.number(),
     updated_at: v.number(),
   }).index("by_status", ["status"]),
@@ -125,6 +196,7 @@ export default defineSchema({
     logo_url: v.optional(v.string()),
     logo_color: v.optional(v.string()),
     is_active: v.boolean(),
+    deleting_at: v.optional(v.number()),
   }).index("by_name", ["name"]),
 
   categories: defineTable({
@@ -138,6 +210,7 @@ export default defineSchema({
     image_color: v.optional(v.string()),
     sort_order: v.number(),
     is_active: v.boolean(),
+    deleting_at: v.optional(v.number()),
   })
     .index("by_parent", ["parent_id"])
     .index("by_slug", ["slug"]),
@@ -187,6 +260,13 @@ export default defineSchema({
     image_color: v.optional(v.string()),
     rating_average: v.number(),
     rating_count: v.number(),
+    sku_count: v.optional(v.number()),
+    default_sku_id: v.optional(v.id("skus")),
+    default_price: v.optional(v.number()),
+    total_stock: v.optional(v.number()),
+    productListSummaryVersion: v.optional(v.number()),
+    productSearchTokensVersion: v.optional(v.number()),
+    deleting_at: v.optional(v.number()),
     attributes: v.array(
       v.object({ key: v.string(), label: v.string(), value: v.string() }),
     ),
@@ -201,10 +281,59 @@ export default defineSchema({
     .index("by_frequently_bought", ["isFrequentlyBought"])
     .index("by_slug", ["slug"])
     .index("by_status", ["status"])
+    .index("by_updated", ["updated_at"])
+    .index("by_status_updated", ["status", "updated_at"])
+    .index("by_category_updated", ["primary_category_id", "updated_at"])
+    .index("by_brand_updated", ["brand_id", "updated_at"])
+    .index("by_category_status_updated", [
+      "primary_category_id",
+      "status",
+      "updated_at",
+    ])
+    .index("by_brand_status_updated", ["brand_id", "status", "updated_at"])
+    .index("by_category_brand_updated", [
+      "primary_category_id",
+      "brand_id",
+      "updated_at",
+    ])
+    .index("by_category_brand_status_updated", [
+      "primary_category_id",
+      "brand_id",
+      "status",
+      "updated_at",
+    ])
+    .index("by_product_list_summary_version", ["productListSummaryVersion"])
+    .index("by_product_search_tokens_version", ["productSearchTokensVersion"])
     .searchIndex("search_products", {
       searchField: "name",
       filterFields: ["status", "primary_category_id", "brand_id"],
     }),
+
+  /**
+   * Tokenized product-name search rows. Convex search indexes cannot be
+   * paginated, so genuine cursor-paginated search runs over this table: one
+   * row per (product, name token), driven by the by_token_updated index
+   * (newest-first) with page-bounded chunk reads. Written transactionally by
+   * products.create / products.update / cascade deletes; legacy rows are
+   * backfilled by products.backfillProductSearchTokens, which records its
+   * completion in transitionState under key "productSearchTokens".
+   */
+  productSearchTokens: defineTable({
+    product_id: v.id("products"),
+    token: v.string(),
+    tokens: v.array(v.string()),
+    updated_at: v.number(),
+    status: v.union(
+      v.literal("draft"),
+      v.literal("active"),
+      v.literal("hidden"),
+      v.literal("discontinued"),
+    ),
+    primary_category_id: v.id("categories"),
+    brand_id: v.optional(v.id("brands")),
+  })
+    .index("by_token_updated", ["token", "updated_at"])
+    .index("by_product", ["product_id"]),
 
   product_media: defineTable({
     product_id: v.id("products"),
@@ -221,6 +350,7 @@ export default defineSchema({
     similar_product_id: v.id("products"),
   })
     .index("by_product", ["product_id"])
+    .index("by_similar_product", ["similar_product_id"])
     .index("by_pair", ["product_id", "similar_product_id"]),
 
   skus: defineTable({
@@ -238,6 +368,7 @@ export default defineSchema({
     sort_order: v.number(),
     is_default: v.boolean(),
     is_active: v.boolean(),
+    deleting_at: v.optional(v.number()),
   })
     .index("by_product", ["product_id"])
     .index("by_sku_code", ["sku_code"])
@@ -257,9 +388,48 @@ export default defineSchema({
   })
     .index("by_sku", ["sku_id"])
     .index("by_product", ["product_id"])
+    .index("by_sku_starts", ["sku_id", "starts_at"])
     .index("by_sku_store", ["sku_id", "store_id"])
     .index("by_store", ["store_id"])
+    .index("by_starts_at", ["starts_at"])
     .index("by_price_summary_version", ["priceSummaryVersion"]),
+
+  /**
+   * Persisted next-transition records for prices with a future starts_at:
+   * one row at starts_at - PRICE_ACTIVE_LOOKAHEAD_MS (materialize the mirror
+   * before activation) and one at starts_at (refresh stored summaries).
+   * prices.scheduleTransition drains rows with due_at <= now in bounded
+   * batches, so a price created days or months before its activation is
+   * always materialized on time without rescanning price history.
+   * Written transactionally by prices.upsert and every price-deletion path
+   * cleans it up; prices.backfillPriceTransitions journals legacy rows.
+   */
+  priceTransitions: defineTable({
+    price_id: v.id("prices"),
+    due_at: v.number(),
+  })
+    .index("by_due", ["due_at"])
+    .index("by_price", ["price_id"]),
+
+  /**
+   * Persisted materialization of the price set that is currently active or
+   * scheduled to activate within PRICE_ACTIVE_LOOKAHEAD_MS, per SKU. Lets the
+   * product list select the correct active price with a bounded read instead
+   * of scanning unbounded historical prices. Maintained transactionally by
+   * prices.upsert / prices.remove / prices.scheduleTransition.
+   */
+  pricesActive: defineTable({
+    sku_id: v.id("skus"),
+    price_id: v.id("prices"),
+    product_id: v.optional(v.id("products")),
+    store_id: v.optional(v.id("stores")),
+    sale_price: v.number(),
+    starts_at: v.number(),
+    ends_at: v.optional(v.number()),
+  })
+    .index("by_sku", ["sku_id"])
+    .index("by_price", ["price_id"])
+    .index("by_ends_at", ["ends_at"]),
 
   inventory: defineTable({
     sku_id: v.optional(v.id("skus")),
@@ -388,9 +558,18 @@ export default defineSchema({
     ),
     pickPriority: v.number(),
     expiredAt: v.optional(v.number()),
+    nextShelfLifeRefreshAt: v.optional(v.number()),
   })
     .index("by_inventory_expiry", ["inventoryId", "expiryDate"])
-    .index("by_near_expiry", ["isNearExpiry"]),
+    .index("by_near_expiry", ["isNearExpiry"])
+    .index("by_expiry", ["expiryDate"])
+    .index("by_unexpired_expiry", ["expiredAt", "expiryDate"])
+    .index("by_shelf_life_due", ["nextShelfLifeRefreshAt", "expiryDate"])
+    .index("by_unexpired_shelf_life_due", [
+      "expiredAt",
+      "nextShelfLifeRefreshAt",
+      "expiryDate",
+    ]),
 
   deliverySlots: defineTable({
     fulfillmentCenterId: v.id("fulfillmentCenters"),
@@ -470,6 +649,7 @@ export default defineSchema({
     starts_at: v.number(),
     ends_at: v.number(),
     is_active: v.boolean(),
+    deleting_at: v.optional(v.number()),
   })
     .index("by_coupon_code", ["coupon_code"])
     .index("by_kind", ["kind"])
@@ -483,7 +663,10 @@ export default defineSchema({
     brand_id: v.optional(v.id("brands")),
   })
     .index("by_promotion", ["promotion_id"])
-    .index("by_product", ["product_id"]),
+    .index("by_product", ["product_id"])
+    .index("by_sku", ["sku_id"])
+    .index("by_category", ["category_id"])
+    .index("by_brand", ["brand_id"]),
 
   home_sections: defineTable({
     id: v.optional(v.string()),
@@ -529,8 +712,12 @@ export default defineSchema({
     maxAppVersion: v.optional(v.string()),
     layoutVariant: v.optional(v.string()),
     backgroundColor: v.optional(v.string()),
+    backgroundImage: v.optional(v.string()),
+    backgroundImageStorageId: v.optional(v.id("_storage")),
     textColor: v.optional(v.string()),
     imageUrl: v.optional(v.string()),
+    imageStorageId: v.optional(v.id("_storage")),
+    storageId: v.optional(v.id("_storage")),
     iconEmoji: v.optional(v.string()),
     maxItems: v.optional(v.number()),
     productIds: v.optional(v.array(v.id("products"))),
@@ -564,7 +751,11 @@ export default defineSchema({
     category_id: v.optional(v.id("categories")),
     promotion_id: v.optional(v.id("promotions")),
     sort_order: v.number(),
-  }).index("by_section", ["section_id"]),
+  })
+    .index("by_section", ["section_id"])
+    .index("by_product", ["product_id"])
+    .index("by_category", ["category_id"])
+    .index("by_promotion", ["promotion_id"]),
 
   carts: defineTable({
     customer_id: v.optional(v.id("customers")),
@@ -650,6 +841,9 @@ export default defineSchema({
     delivery_fee_amount: v.number(),
     total_amount: v.number(),
     customer_notes: v.optional(v.string()),
+    item_count: v.optional(v.number()),
+    order_search_text: v.optional(v.string()),
+    orderSummaryVersion: v.optional(v.number()),
     placed_at: v.number(),
     estimated_delivery_at: v.optional(v.number()),
     delivered_at: v.optional(v.number()),
@@ -658,7 +852,17 @@ export default defineSchema({
     .index("by_number", ["order_number"])
     .index("by_customer", ["customer_id", "placed_at"])
     .index("by_store", ["store_id"])
-    .index("by_status", ["status"]),
+    .index("by_status", ["status"])
+    .index("by_placed", ["placed_at"])
+    .index("by_store_placed", ["store_id", "placed_at"])
+    .index("by_status_placed", ["status", "placed_at"])
+    .index("by_store_status_placed", ["store_id", "status", "placed_at"])
+    .index("by_order_stats_backfill", ["item_count", "placed_at"])
+    .index("by_order_summary_version", ["orderSummaryVersion", "placed_at"])
+    .searchIndex("search_orders", {
+      searchField: "order_search_text",
+      filterFields: ["status", "store_id"],
+    }),
 
   order_items: defineTable({
     order_id: v.id("orders"),
@@ -670,7 +874,10 @@ export default defineSchema({
     unit_price: v.number(),
     compare_at_price: v.optional(v.number()),
     line_total: v.number(),
-  }).index("by_order", ["order_id"]),
+  })
+    .index("by_order", ["order_id"])
+    .index("by_product", ["product_id"])
+    .index("by_sku", ["sku_id"]),
 
   payment_methods: defineTable({
     customer_id: v.id("customers"),

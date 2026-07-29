@@ -1,7 +1,10 @@
 import { v } from "convex/values";
-import { query, mutation } from "./functions";
-import { paginate, slugify } from "./helpers";
+import { anyApi } from "convex/server";
+import { query, mutation, internalMutation } from "./functions";
+import { now, paginate, slugify } from "./helpers";
 import type { CategoryDoc } from "./model";
+
+const CASCADE_BATCH_LIMIT = 100;
 
 export const list = query({
   args: {
@@ -61,6 +64,7 @@ async function assertNoCategoryCycle(
     }
     const parent = await ctx.db.get(current);
     if (!parent) throw new Error("Parent category not found");
+    if (parent.deleting_at) throw new Error("Parent category is being deleted");
     current = parent.parent_id;
   }
 }
@@ -111,34 +115,89 @@ export const update = mutation({
   },
 });
 
-/** SQL behavior: children get parent_id set null; blocked if products exist. */
+/**
+ * SQL behavior: products restrict deletion; children get parent_id set null;
+ * home-section items and promotion targets cascade. All phases are bounded,
+ * resumable internal continuations.
+ */
 export const remove = mutation({
   args: { id: v.id("categories") },
   handler: async (ctx, args) => {
-    const products = await ctx.db
+    const category = (await ctx.db.get(args.id)) as CategoryDoc | null;
+    if (!category) return { id: args.id, deleting: true };
+    const product = await ctx.db
       .query("products")
       .withIndex("by_category", (q) => q.eq("primary_category_id", args.id))
-      .collect();
-    if (products.length > 0) {
-      throw new Error(
-        `Cannot delete: ${products.length} product(s) use this category`,
-      );
+      .first();
+    if (product) {
+      throw new Error("Cannot delete: products use this category");
     }
+    if (!category.deleting_at) {
+      await ctx.db.patch(args.id, { deleting_at: now() });
+    }
+    await ctx.scheduler.runAfter(0, anyApi.categories.continueCategoryDelete, {
+      id: args.id,
+    });
+    return { id: args.id, deleting: true };
+  },
+});
+
+export const continueCategoryDelete = internalMutation({
+  args: { id: v.id("categories") },
+  handler: async (ctx, args) => {
+    const category = (await ctx.db.get(args.id)) as CategoryDoc | null;
+    if (!category) return { done: true, deleted: true };
+    const product = await ctx.db
+      .query("products")
+      .withIndex("by_category", (q) => q.eq("primary_category_id", args.id))
+      .first();
+    if (product) {
+      throw new Error("Cannot delete: products use this category");
+    }
+    let operations = 0;
     const children = await ctx.db
       .query("categories")
       .withIndex("by_parent", (q) => q.eq("parent_id", args.id))
-      .collect();
+      .take(CASCADE_BATCH_LIMIT);
     for (const c of children) {
       await ctx.db.patch(c._id, { parent_id: undefined });
+      operations += 1;
     }
-    const items = await ctx.db.query("home_section_items").collect();
+    if (operations >= CASCADE_BATCH_LIMIT) {
+      await ctx.scheduler.runAfter(0, anyApi.categories.continueCategoryDelete, {
+        id: args.id,
+      });
+      return { done: false, operations };
+    }
+    const items = await ctx.db
+      .query("home_section_items")
+      .withIndex("by_category", (q) => q.eq("category_id", args.id))
+      .take(CASCADE_BATCH_LIMIT - operations);
     for (const item of items) {
-      if (item.category_id === args.id) await ctx.db.delete(item._id);
+      await ctx.db.delete(item._id);
+      operations += 1;
     }
-    const targets = await ctx.db.query("promotion_targets").collect();
+    if (operations >= CASCADE_BATCH_LIMIT) {
+      await ctx.scheduler.runAfter(0, anyApi.categories.continueCategoryDelete, {
+        id: args.id,
+      });
+      return { done: false, operations };
+    }
+    const targets = await ctx.db
+      .query("promotion_targets")
+      .withIndex("by_category", (q) => q.eq("category_id", args.id))
+      .take(CASCADE_BATCH_LIMIT - operations);
     for (const t of targets) {
-      if (t.category_id === args.id) await ctx.db.delete(t._id);
+      await ctx.db.delete(t._id);
+      operations += 1;
+    }
+    if (operations >= CASCADE_BATCH_LIMIT) {
+      await ctx.scheduler.runAfter(0, anyApi.categories.continueCategoryDelete, {
+        id: args.id,
+      });
+      return { done: false, operations };
     }
     await ctx.db.delete(args.id);
+    return { done: true, operations };
   },
 });

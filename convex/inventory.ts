@@ -1,6 +1,8 @@
 import { v } from "convex/values";
-import { query, mutation } from "./functions";
+import { anyApi } from "convex/server";
+import { query, mutation, internalMutation } from "./functions";
 import { deriveInventoryStatus, now } from "./helpers";
+import { recomputeProductListSummary } from "./lib/productListSummaries";
 import type {
   InventoryDoc,
   InventoryRow,
@@ -222,10 +224,20 @@ export const upsert = mutation({
       manualUnavailable: args.unavailable ?? existing?.status === "unavailable",
     });
     const sku = (await ctx.db.get(args.sku_id)) as SkuDoc | null;
+    if ((sku as { deleting_at?: number } | null)?.deleting_at) {
+      throw new Error("SKU is being deleted");
+    }
     const product = sku
       ? ((await ctx.db.get(sku.product_id as any)) as ProductDoc | null)
       : null;
+    if ((product as { deleting_at?: number } | null)?.deleting_at) {
+      throw new Error("Product is being deleted");
+    }
     const store = (await ctx.db.get(args.store_id)) as StoreDoc | null;
+    if (!store) throw new Error("Store not found");
+    if ((store as { deleting_at?: number }).deleting_at) {
+      throw new Error("Store is being deleted");
+    }
     if (existing) {
       await ctx.db.patch(existing._id as any, {
         quantity_available: args.quantity_available,
@@ -240,9 +252,12 @@ export const upsert = mutation({
         storeName: store?.name,
         storeInventorySummaryVersion: STORE_INVENTORY_SUMMARY_VERSION,
       });
+      if (sku?.product_id) {
+        await recomputeProductListSummary(ctx, sku.product_id);
+      }
       return existing._id;
     }
-    return await ctx.db.insert("inventory", {
+    const id = await ctx.db.insert("inventory", {
       sku_id: args.sku_id,
       store_id: args.store_id,
       quantity_available: args.quantity_available,
@@ -258,29 +273,36 @@ export const upsert = mutation({
       storeName: store?.name,
       storeInventorySummaryVersion: STORE_INVENTORY_SUMMARY_VERSION,
     });
+    if (sku?.product_id) {
+      await recomputeProductListSummary(ctx, sku.product_id);
+    }
+    return id;
   },
 });
 
-export const backfillStoreInventorySummaries = mutation({
+export const backfillStoreInventorySummaries = internalMutation({
   args: { limit: v.optional(v.number()), cursor: v.optional(v.string()) },
   handler: async (ctx, args) => {
     const limit = Math.min(Math.max(args.limit ?? 50, 1), 200);
-    const candidateLimit = args.cursor ? Math.min(limit * 2, 400) : limit;
-    const candidates = ((await ctx.db
+    const result = await ctx.db
       .query("inventory")
       .withIndex("by_store_inventory_summary_version", (q: any) =>
-        q.eq("storeInventorySummaryVersion", undefined),
+        // Stale means missing (undefined) OR any version older than current.
+        q.lt("storeInventorySummaryVersion", STORE_INVENTORY_SUMMARY_VERSION),
       )
-      .take(candidateLimit)) as InventoryDoc[])
-      .filter(isLegacyInventoryRow);
-    const cursorIndex = args.cursor
-      ? candidates.findIndex((row) => row._id === args.cursor)
-      : -1;
-    const rows = candidates
-      .slice(cursorIndex >= 0 ? cursorIndex + 1 : 0)
-      .slice(0, limit);
+      .order("asc")
+      .paginate({ numItems: limit, cursor: args.cursor ?? null });
     let patched = 0;
-    for (const row of rows) {
+    for (const row of result.page as InventoryDoc[]) {
+      if (!isLegacyInventoryRow(row)) {
+        // Quick-commerce rows are summarized by quickInventorySummaryVersion;
+        // stamp this version so the backfill terminates.
+        await ctx.db.patch(row._id as any, {
+          storeInventorySummaryVersion: STORE_INVENTORY_SUMMARY_VERSION,
+        });
+        patched += 1;
+        continue;
+      }
       const sku = (await ctx.db.get(row.sku_id as any)) as SkuDoc | null;
       const product = sku
         ? ((await ctx.db.get(sku.product_id as any)) as ProductDoc | null)
@@ -306,11 +328,18 @@ export const backfillStoreInventorySummaries = mutation({
         patched += 1;
       }
     }
+    if (!result.isDone) {
+      await ctx.scheduler.runAfter(
+        0,
+        anyApi.inventory.backfillStoreInventorySummaries,
+        { limit, cursor: result.continueCursor },
+      );
+    }
     return {
-      processed: rows.length,
+      processed: result.page.length,
       patched,
-      nextCursor: rows.at(-1)?._id,
-      remainingMayExist: candidates.length >= candidateLimit,
+      nextCursor: result.continueCursor,
+      remainingMayExist: !result.isDone,
     };
   },
 });
@@ -347,6 +376,9 @@ export const adjust = mutation({
       status,
       updated_at: now(),
     });
+    if (existing.productId) {
+      await recomputeProductListSummary(ctx, existing.productId);
+    }
     return { quantity_available: next, status };
   },
 });
@@ -405,6 +437,10 @@ export const setUnavailable = mutation({
 export const remove = mutation({
   args: { id: v.id("inventory") },
   handler: async (ctx, args) => {
+    const row = (await ctx.db.get(args.id)) as InventoryDoc | null;
     await ctx.db.delete(args.id);
+    if (row?.productId) {
+      await recomputeProductListSummary(ctx, row.productId);
+    }
   },
 });
