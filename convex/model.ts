@@ -52,6 +52,8 @@ export type HomeSectionKind =
   | "store_inventory_section"
   | "custom_cta"
   | "spacer";
+/** ProductCard `design` prop values; sections default to "overlap". */
+export type HomeSectionCardType = "minimal" | "small" | "overlap";
 export type SupportTicketStatus =
   | "open"
   | "waiting_for_customer"
@@ -299,6 +301,7 @@ export interface HomeSectionDoc extends BaseDoc {
   title?: string;
   subtitle?: string;
   tab: string;
+  card_type?: HomeSectionCardType;
   sortOrder?: number;
   isActive?: boolean;
   allowEmpty?: boolean;
@@ -354,6 +357,7 @@ export interface HomeSectionResponse {
   subtitle?: string;
   tab: string;
   sortOrder: number;
+  card_type: HomeSectionCardType;
   layoutVariant?: string;
   backgroundColor?: string;
   backgroundImage?: string;

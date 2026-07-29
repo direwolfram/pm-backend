@@ -18,8 +18,17 @@ import type { CustomerDoc, OrderDoc, ProductDoc } from "./model";
  * - products:  all | status:<s> | category:<c> | brand:<b> |
  *              category:<c>|brand:<b> | category:<c>|status:<s> |
  *              brand:<b>|status:<s> | category:<c>|brand:<b>|status:<s>
+ * - skus:      all
+ * - inventory: status:<status>            (dashboard stock-state counts)
+ * - support_tickets: all | status:<status> (dashboard open-ticket count)
  */
-export type ListCountScope = "customers" | "orders" | "products";
+export type ListCountScope =
+  | "customers"
+  | "orders"
+  | "products"
+  | "skus"
+  | "inventory"
+  | "support_tickets";
 
 const RECONCILE_BATCH_LIMIT = 200;
 const MAX_DISTINCT_COUNT_KEYS = 5_000;
@@ -200,10 +209,25 @@ function scopeTable(scope: ListCountScope) {
   return scope;
 }
 
+export function skuCountKeys() {
+  return ["all"];
+}
+
+export function inventoryCountKeys(row: { status?: string }) {
+  return row.status ? [`status:${row.status}`] : [];
+}
+
+export function supportTicketCountKeys(row: { status: string }) {
+  return ["all", `status:${row.status}`];
+}
+
 function keysForRow(scope: ListCountScope, row: any) {
   if (scope === "customers") return customerCountKeys(row);
   if (scope === "orders") return orderCountKeys(row);
-  return productCountKeys(row);
+  if (scope === "products") return productCountKeys(row);
+  if (scope === "skus") return skuCountKeys();
+  if (scope === "inventory") return inventoryCountKeys(row);
+  return supportTicketCountKeys(row);
 }
 
 function reconcileStateKey(scope: ListCountScope) {
@@ -238,6 +262,9 @@ export const reconcileListCounts = internalMutation({
       v.literal("customers"),
       v.literal("orders"),
       v.literal("products"),
+      v.literal("skus"),
+      v.literal("inventory"),
+      v.literal("support_tickets"),
     ),
     cursor: v.optional(v.string()),
     counts: v.optional(v.any()),

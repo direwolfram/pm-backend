@@ -1,4 +1,5 @@
 import { money } from "../helpers";
+import { applyOrderMetricsChange } from "./dashboardMetrics";
 import type { CustomerDoc, OrderDoc, OrderStatus } from "../model";
 
 /**
@@ -74,6 +75,9 @@ export async function applyOrderStatsChange(
   before: OrderDoc | null,
   after: OrderDoc | null,
 ) {
+  // Dashboard order metrics share this funnel: every order create, amount
+  // edit, status transition, reassignment, and delete flows through here.
+  await applyOrderMetricsChange(ctx, before, after);
   const beforeStats = orderCountsForCustomerStats(before);
   const afterStats = orderCountsForCustomerStats(after);
   if (before?.customer_id && before.customer_id !== after?.customer_id) {

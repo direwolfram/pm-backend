@@ -47,6 +47,20 @@ export default defineSchema({
     complete: v.optional(v.boolean()),
   }).index("by_key", ["key"]),
 
+  /**
+   * Maintained dashboard metric documents (see lib/dashboardMetrics.ts).
+   * Keys: "orders:lifetime" and "orders:daily:<yyyy-mm-dd>" (Asia/Manila
+   * day). count = orders, amount = revenue over non-cancelled/non-refunded
+   * orders. Updated transactionally by every order mutation; rebuilt by
+   * dashboard.backfillOrderMetrics.
+   */
+  metricAggregates: defineTable({
+    key: v.string(),
+    day: v.optional(v.string()),
+    count: v.number(),
+    amount: v.number(),
+  }).index("by_key", ["key"]),
+
   users: defineTable({
     name: v.optional(v.string()),
     email: v.optional(v.string()),
@@ -653,7 +667,8 @@ export default defineSchema({
   })
     .index("by_coupon_code", ["coupon_code"])
     .index("by_kind", ["kind"])
-    .index("by_active", ["is_active"]),
+    .index("by_active", ["is_active"])
+    .index("by_active_starts", ["is_active", "starts_at"]),
 
   promotion_targets: defineTable({
     promotion_id: v.id("promotions"),
@@ -691,6 +706,15 @@ export default defineSchema({
     title: v.optional(v.string()),
     subtitle: v.optional(v.string()),
     tab: v.string(),
+    // Product card design for this section; unset on legacy rows means
+    // "overlap" (see homeSections.backfillCardType).
+    card_type: v.optional(
+      v.union(
+        v.literal("minimal"),
+        v.literal("small"),
+        v.literal("overlap"),
+      ),
+    ),
     sortOrder: v.optional(v.number()),
     isActive: v.optional(v.boolean()),
     allowEmpty: v.optional(v.boolean()),

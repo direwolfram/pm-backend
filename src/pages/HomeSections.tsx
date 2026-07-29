@@ -51,6 +51,7 @@ import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import type {
+  HomeSectionCardType,
   HomeSectionDoc,
   HomeSectionKind,
   HomeSectionResponse,
@@ -85,6 +86,7 @@ type FormState = {
   seasonalTags: string;
   minAppVersion: string;
   maxAppVersion: string;
+  cardType: HomeSectionCardType;
   layoutVariant: string;
   backgroundColor: string;
   backgroundImage: string;
@@ -117,6 +119,12 @@ const EMPTY_CATEGORY_FORM: CategoryFormState = {
   backgroundColor: "",
   sortOrder: "0",
 };
+
+const CARD_TYPE_OPTIONS: { value: HomeSectionCardType; label: string }[] = [
+  { value: "overlap", label: "Overlap" },
+  { value: "small", label: "Small" },
+  { value: "minimal", label: "Minimal" },
+];
 
 const KINDS: { value: HomeSectionKind; label: string }[] = [
   { value: "header", label: "Header" },
@@ -266,6 +274,7 @@ const EMPTY_FORM: FormState = {
   seasonalTags: "",
   minAppVersion: "",
   maxAppVersion: "",
+  cardType: "overlap",
   layoutVariant: "",
   backgroundColor: "",
   backgroundImage: "",
@@ -333,6 +342,7 @@ function sectionToForm(section: AdminSection): FormState {
     seasonalTags: csv(section.seasonalTags),
     minAppVersion: section.minAppVersion ?? "",
     maxAppVersion: section.maxAppVersion ?? "",
+    cardType: section.card_type ?? "overlap",
     layoutVariant: section.layoutVariant ?? "",
     backgroundColor: section.backgroundColor ?? "",
     backgroundImage: section.backgroundImage ?? "",
@@ -372,6 +382,7 @@ function cleanPayload(form: FormState) {
     seasonalTags: parseCsv(form.seasonalTags),
     minAppVersion: form.minAppVersion.trim() || undefined,
     maxAppVersion: form.maxAppVersion.trim() || undefined,
+    card_type: form.cardType,
     layoutVariant: form.layoutVariant.trim() || undefined,
     backgroundColor: form.backgroundColor.trim() || undefined,
     backgroundImage: form.backgroundImage.trim() || undefined,
@@ -1253,6 +1264,22 @@ function SectionDialog({
           </EditorGroup>
 
           <EditorGroup title="Design">
+            <div>
+              <Label>Product card type</Label>
+              <Select
+                value={form.cardType}
+                onValueChange={(cardType) =>
+                  setForm({ ...form, cardType: cardType as HomeSectionCardType })
+                }
+              >
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  {CARD_TYPE_OPTIONS.map((option) => (
+                    <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
             <TextField label="Layout variant" value={form.layoutVariant} onChange={(layoutVariant) => setForm({ ...form, layoutVariant })} />
             <ColorField label="Background color" value={form.backgroundColor} onChange={(backgroundColor) => setForm({ ...form, backgroundColor })} />
             <TextField label="Background image URL" value={form.backgroundImage} onChange={(backgroundImage) => setForm({ ...form, backgroundImage })} />

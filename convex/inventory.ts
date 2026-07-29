@@ -3,6 +3,7 @@ import { anyApi } from "convex/server";
 import { query, mutation, internalMutation } from "./functions";
 import { deriveInventoryStatus, now } from "./helpers";
 import { recomputeProductListSummary } from "./lib/productListSummaries";
+import { applyListCountChange, inventoryCountKeys } from "./listCounts";
 import type {
   InventoryDoc,
   InventoryRow,
@@ -239,6 +240,12 @@ export const upsert = mutation({
       throw new Error("Store is being deleted");
     }
     if (existing) {
+      const next = {
+        ...existing,
+        quantity_available: args.quantity_available,
+        low_stock_threshold: threshold,
+        status,
+      };
       await ctx.db.patch(existing._id as any, {
         quantity_available: args.quantity_available,
         low_stock_threshold: threshold,
@@ -252,6 +259,13 @@ export const upsert = mutation({
         storeName: store?.name,
         storeInventorySummaryVersion: STORE_INVENTORY_SUMMARY_VERSION,
       });
+      await applyListCountChange(
+        ctx,
+        "inventory",
+        inventoryCountKeys,
+        existing,
+        next,
+      );
       if (sku?.product_id) {
         await recomputeProductListSummary(ctx, sku.product_id);
       }
@@ -272,6 +286,9 @@ export const upsert = mutation({
       productId: sku?.product_id,
       storeName: store?.name,
       storeInventorySummaryVersion: STORE_INVENTORY_SUMMARY_VERSION,
+    });
+    await applyListCountChange(ctx, "inventory", inventoryCountKeys, null, {
+      status,
     });
     if (sku?.product_id) {
       await recomputeProductListSummary(ctx, sku.product_id);
@@ -376,6 +393,10 @@ export const adjust = mutation({
       status,
       updated_at: now(),
     });
+    await applyListCountChange(ctx, "inventory", inventoryCountKeys, existing, {
+      ...existing,
+      status,
+    });
     if (existing.productId) {
       await recomputeProductListSummary(ctx, existing.productId);
     }
@@ -408,6 +429,10 @@ export const setThreshold = mutation({
       status,
       updated_at: now(),
     });
+    await applyListCountChange(ctx, "inventory", inventoryCountKeys, existing, {
+      ...existing,
+      status,
+    });
   },
 });
 
@@ -431,6 +456,10 @@ export const setUnavailable = mutation({
       manualUnavailable: args.unavailable,
     });
     await ctx.db.patch(existing._id as any, { status, updated_at: now() });
+    await applyListCountChange(ctx, "inventory", inventoryCountKeys, existing, {
+      ...existing,
+      status,
+    });
   },
 });
 
@@ -439,6 +468,9 @@ export const remove = mutation({
   handler: async (ctx, args) => {
     const row = (await ctx.db.get(args.id)) as InventoryDoc | null;
     await ctx.db.delete(args.id);
+    if (row) {
+      await applyListCountChange(ctx, "inventory", inventoryCountKeys, row, null);
+    }
     if (row?.productId) {
       await recomputeProductListSummary(ctx, row.productId);
     }

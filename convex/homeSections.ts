@@ -1,5 +1,6 @@
 import { v } from "convex/values";
-import { mutation, query } from "./functions";
+import { anyApi } from "convex/server";
+import { internalMutation, mutation, query } from "./functions";
 import { now, slugify } from "./helpers";
 import type {
   BrandDoc,
@@ -33,12 +34,27 @@ const homeSectionKind = v.union(
 
 const timeWindow = v.object({ start: v.string(), end: v.string() });
 
+/**
+ * Product card design per section, passed by the app to ProductCard's
+ * `design` prop. Anything outside these three values is rejected by the
+ * argument validator; omitted means DEFAULT_CARD_TYPE.
+ */
+export const CARD_TYPES = ["minimal", "small", "overlap"] as const;
+export const DEFAULT_CARD_TYPE = "overlap";
+
+const homeSectionCardType = v.union(
+  v.literal("minimal"),
+  v.literal("small"),
+  v.literal("overlap"),
+);
+
 const sectionFields = {
   key: v.optional(v.string()),
   kind: v.optional(homeSectionKind),
   title: v.optional(v.string()),
   subtitle: v.optional(v.string()),
   tab: v.optional(v.string()),
+  card_type: v.optional(homeSectionCardType),
   sortOrder: v.optional(v.number()),
   isActive: v.optional(v.boolean()),
   allowEmpty: v.optional(v.boolean()),
@@ -364,6 +380,7 @@ function normalizeSection(section: HomeSectionDoc): HomeSectionDoc {
     key: section.key ?? `legacy_${section._id}`,
     title: section.title ?? "",
     tab: section.tab ?? "All",
+    card_type: section.card_type ?? DEFAULT_CARD_TYPE,
     sortOrder: section.sortOrder ?? section.sort_order ?? 0,
     isActive: section.isActive ?? section.is_active ?? false,
     allowEmpty: section.allowEmpty ?? false,
@@ -894,6 +911,7 @@ async function responseForSection(
     subtitle: normalized.subtitle,
     tab: normalized.tab,
     sortOrder: normalized.sortOrder ?? 0,
+    card_type: normalized.card_type ?? DEFAULT_CARD_TYPE,
     layoutVariant: normalized.layoutVariant,
     backgroundColor: normalized.backgroundColor,
     backgroundImage: images.backgroundImage,
@@ -1329,9 +1347,31 @@ async function updateSectionDocument(
   const { allowDuplicateTopChrome, ...fields } = patch;
   const existing = (await ctx.db.get(id as any)) as HomeSectionDoc | null;
   if (!existing) throw new Error("Home section not found");
-  const next = mergeSection(existing, { ...fields, updatedAt: now() });
+  const merged = mergeSection(existing, { ...fields, updatedAt: now() });
+  // Legacy rows may carry a body sortOrder below the top-chrome range;
+  // echoing it back on an unrelated edit (e.g. changing card_type) must not
+  // fail validation, so heal it like toggleSection/restoreSection do. A
+  // patch that deliberately sets a NEW sub-range value is still rejected.
+  const currentSortOrder = existing.sortOrder ?? existing.sort_order ?? 0;
+  const explicitlyLowered =
+    fields.sortOrder !== undefined &&
+    fields.sortOrder !== currentSortOrder &&
+    !isTopChromeKind(merged.kind) &&
+    fields.sortOrder < BODY_SECTION_MIN_SORT_ORDER;
+  const healedSortOrder = explicitlyLowered ? undefined : healBodySortOrder(merged);
+  const next =
+    healedSortOrder !== undefined ? { ...merged, sortOrder: healedSortOrder } : merged;
   await validateSection(ctx, next, id, { allowDuplicateTopChrome });
-  await ctx.db.patch(id as any, cleanPatch({ ...fields, updatedAt: now() }));
+  await ctx.db.patch(
+    id as any,
+    cleanPatch({
+      ...fields,
+      ...(healedSortOrder !== undefined
+        ? { sortOrder: healedSortOrder, sort_order: healedSortOrder }
+        : {}),
+      updatedAt: now(),
+    }),
+  );
   return id;
 }
 
@@ -1662,6 +1702,7 @@ export const create = mutation({
     title: v.string(),
     kind: homeSectionKind,
     tab: v.optional(v.string()),
+    card_type: v.optional(homeSectionCardType),
     sort_order: v.optional(v.number()),
     is_active: v.optional(v.boolean()),
   },
@@ -1679,6 +1720,7 @@ export const create = mutation({
       title: args.title,
       kind: args.kind,
       tab: args.tab ?? "All",
+      card_type: args.card_type ?? DEFAULT_CARD_TYPE,
       sortOrder: args.sort_order ?? defaultSortOrder,
       isActive: args.is_active ?? true,
       allowEmpty: false,
@@ -1698,6 +1740,7 @@ export const update = mutation({
     title: v.optional(v.string()),
     kind: v.optional(homeSectionKind),
     tab: v.optional(v.string()),
+    card_type: v.optional(homeSectionCardType),
     sort_order: v.optional(v.number()),
     is_active: v.optional(v.boolean()),
   },
@@ -1717,3 +1760,42 @@ export const update = mutation({
   },
 });
 export const remove = archiveSection;
+
+const CARD_TYPE_BACKFILL_LIMIT = 200;
+
+/**
+ * Bounded, resumable, idempotent migration: stamps the default card_type on
+ * every home section written before the field existed. Rows that already
+ * carry a value are never touched, so re-runs are no-ops and concurrent
+ * section writes (which always store a validated value) cannot be clobbered.
+ * Drains in fixed-size pages via self-scheduled continuations.
+ */
+export const backfillCardType = internalMutation({
+  args: { cursor: v.optional(v.string()), limit: v.optional(v.number()) },
+  handler: async (ctx, args) => {
+    const limit = Math.min(Math.max(args.limit ?? 100, 1), CARD_TYPE_BACKFILL_LIMIT);
+    const result = await ctx.db
+      .query("home_sections")
+      .order("asc")
+      .paginate({ numItems: limit, cursor: args.cursor ?? null });
+    let patched = 0;
+    for (const section of result.page as HomeSectionDoc[]) {
+      if (section.card_type === undefined) {
+        await ctx.db.patch(section._id as any, { card_type: DEFAULT_CARD_TYPE });
+        patched += 1;
+      }
+    }
+    if (!result.isDone) {
+      await ctx.scheduler.runAfter(0, anyApi.homeSections.backfillCardType, {
+        cursor: result.continueCursor,
+        limit,
+      });
+    }
+    return {
+      done: result.isDone,
+      processed: result.page.length,
+      patched,
+      nextCursor: result.isDone ? undefined : result.continueCursor,
+    };
+  },
+});
