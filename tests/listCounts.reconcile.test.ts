@@ -188,6 +188,119 @@ describe("reconcileListCounts concurrency safety", () => {
       counts: (first as { counts?: Record<string, number> }).counts,
     });
     expect(second.done).toBe(true);
+    expect((second as { restarted?: boolean }).restarted).toBeUndefined();
     expect(await counterRow(t, "all")).toMatchObject({ count: 250 });
+  });
+});
+
+describe("reconcileListCounts preserves writes committed mid-run", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("restarts when customers are created between chunks and finishes exact", async () => {
+    const t = convexTest({ schema, modules });
+    await insertCustomers(t, 250); // two reconcile chunks
+
+    const first = await t.mutation(internal.listCounts.reconcileListCounts, {
+      scope: "customers",
+    });
+    expect(first.done).toBe(false);
+
+    // Live writes land mid-scan (through the public mutation, which bumps
+    // both the counters and the mutation generation).
+    await t.mutation(api.customers.create, {
+      phone_country_code: "+63",
+      phone_number: "9999999901",
+      status: "active",
+    });
+    await t.mutation(api.customers.create, {
+      phone_country_code: "+63",
+      phone_number: "9999999902",
+      status: "guest",
+    });
+
+    // The next chunk finalizes, detects the generation change, and restarts.
+    const second = await t.mutation(internal.listCounts.reconcileListCounts, {
+      scope: "customers",
+      cursor: (first as { nextCursor?: string }).nextCursor,
+      counts: (first as { counts?: Record<string, number> }).counts,
+      generation: first.generation,
+      mutationGeneration: first.mutationGeneration,
+      restarts: 0,
+    });
+    expect(second).toMatchObject({ done: false, restarted: true });
+
+    // The restarted pass drains via its scheduled continuations.
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
+    expect(await counterRow(t, "all")).toMatchObject({ count: 252 });
+    expect(await counterRow(t, "status:active")).toMatchObject({ count: 126 });
+    expect(await counterRow(t, "status:guest")).toMatchObject({ count: 126 });
+
+    const page = await t.query(api.customers.list, { limit: 10 });
+    expect(page.total).toBe(252);
+    expect(page.totalIsExact).toBe(true);
+  });
+
+  it("restarts when a status change lands between chunks and keeps status counters exact", async () => {
+    const t = convexTest({ schema, modules });
+    await insertCustomers(t, 250); // 125 active, 125 guest
+    const first = await t.mutation(internal.listCounts.reconcileListCounts, {
+      scope: "customers",
+    });
+    expect(first.done).toBe(false);
+
+    // Flip one active customer to blocked mid-scan.
+    const victim = await t.run(async (ctx) => {
+      const row = await ctx.db
+        .query("customers")
+        .withIndex("by_status_created", (q) => q.eq("status", "active"))
+        .first();
+      return row!._id;
+    });
+    await t.mutation(api.customers.setStatus, { id: victim, status: "blocked" });
+
+    const second = await t.mutation(internal.listCounts.reconcileListCounts, {
+      scope: "customers",
+      cursor: (first as { nextCursor?: string }).nextCursor,
+      counts: (first as { counts?: Record<string, number> }).counts,
+      generation: first.generation,
+      mutationGeneration: first.mutationGeneration,
+      restarts: 0,
+    });
+    expect(second).toMatchObject({ done: false, restarted: true });
+
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
+    expect(await counterRow(t, "all")).toMatchObject({ count: 250 });
+    expect(await counterRow(t, "status:active")).toMatchObject({ count: 124 });
+    expect(await counterRow(t, "status:guest")).toMatchObject({ count: 125 });
+    expect(await counterRow(t, "status:blocked")).toMatchObject({ count: 1 });
+
+    const blocked = await t.query(api.customers.list, { status: "blocked", limit: 10 });
+    expect(blocked.total).toBe(1);
+    expect(blocked.data[0]._id).toBe(victim);
+  });
+
+  it("fails explicitly after too many mid-scan restarts", async () => {
+    const t = convexTest({ schema, modules });
+    await insertCustomers(t, 10);
+
+    await t.mutation(api.customers.create, {
+      phone_country_code: "+63",
+      phone_number: "9999999903",
+    });
+
+    await expect(
+      t.mutation(internal.listCounts.reconcileListCounts, {
+        scope: "customers",
+        mutationGeneration: 0, // stale: a live write already bumped it
+        restarts: 5,
+      }),
+    ).rejects.toThrow(/restarted 5 times/);
   });
 });

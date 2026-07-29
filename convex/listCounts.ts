@@ -24,6 +24,13 @@ export type ListCountScope = "customers" | "orders" | "products";
 const RECONCILE_BATCH_LIMIT = 200;
 const MAX_DISTINCT_COUNT_KEYS = 5_000;
 
+/**
+ * Maximum times a single reconcile pass may restart after live writes landed
+ * mid-scan. Beyond this the run fails explicitly instead of starving under
+ * continuous write volume.
+ */
+export const MAX_RECONCILE_RESTARTS = 5;
+
 export function customerCountKeys(customer: {
   status: CustomerDoc["status"];
 }) {
@@ -115,6 +122,43 @@ export async function bumpListCount(
   await ctx.db.patch(row._id, { count: row.count + delta });
 }
 
+function mutationGenerationStateKey(scope: ListCountScope) {
+  return `listCountsMutations:${scope}`;
+}
+
+async function currentMutationGeneration(ctx: { db: any }, scope: ListCountScope) {
+  const state = await ctx.db
+    .query("transitionState")
+    .withIndex("by_key", (q: any) => q.eq("key", mutationGenerationStateKey(scope)))
+    .first();
+  return (state?.horizon ?? 0) as number;
+}
+
+/**
+ * Transactionally bumped by every live list-count update (once per
+ * applyListCountChange call). reconcileListCounts snapshots this generation
+ * at run start and restarts its scan when it changed mid-run, so writes
+ * committed during reconciliation are never clobbered by a stale final swap.
+ * The reconcile swap itself writes counters directly and does NOT bump this.
+ */
+export async function bumpListCountMutationGeneration(
+  ctx: { db: any },
+  scope: ListCountScope,
+) {
+  const state = await ctx.db
+    .query("transitionState")
+    .withIndex("by_key", (q: any) => q.eq("key", mutationGenerationStateKey(scope)))
+    .first();
+  if (state) {
+    await ctx.db.patch(state._id, { horizon: (state.horizon ?? 0) + 1 });
+  } else {
+    await ctx.db.insert("transitionState", {
+      key: mutationGenerationStateKey(scope),
+      horizon: 1,
+    });
+  }
+}
+
 /** Apply a before/after document change to the maintained counters. */
 export async function applyListCountChange<T>(
   ctx: { db: any },
@@ -129,6 +173,7 @@ export async function applyListCountChange<T>(
   if (after) {
     for (const key of keysOf(after)) await bumpListCount(ctx, scope, key, 1);
   }
+  if (before || after) await bumpListCountMutationGeneration(ctx, scope);
 }
 
 /**
@@ -197,6 +242,8 @@ export const reconcileListCounts = internalMutation({
     cursor: v.optional(v.string()),
     counts: v.optional(v.any()),
     generation: v.optional(v.number()),
+    mutationGeneration: v.optional(v.number()),
+    restarts: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
     let generation = args.generation;
@@ -233,6 +280,10 @@ export const reconcileListCounts = internalMutation({
         };
       }
     }
+    const mutationGeneration =
+      args.mutationGeneration ??
+      (await currentMutationGeneration(ctx, args.scope));
+    const restarts = args.restarts ?? 0;
     const accumulator = new Map<string, number>(
       Object.entries((args.counts as Record<string, number> | undefined) ?? {}),
     );
@@ -256,6 +307,8 @@ export const reconcileListCounts = internalMutation({
         cursor: result.continueCursor,
         counts: Object.fromEntries(accumulator),
         generation,
+        mutationGeneration,
+        restarts,
       });
       return {
         done: false,
@@ -263,12 +316,18 @@ export const reconcileListCounts = internalMutation({
         distinctKeys: accumulator.size,
         nextCursor: result.continueCursor,
         generation,
+        mutationGeneration,
+        restarts,
         counts: Object.fromEntries(accumulator),
       };
     }
-    // Final chunk: verify the generation and swap every counter for the
-    // scope in one transaction — a superseded run aborts here instead of
-    // overwriting the newer run's counters.
+    // Final chunk, two protections verified in the same transaction as the
+    // swap:
+    // 1. run generation — a superseded run aborts instead of overwriting the
+    //    newer run's counters;
+    // 2. mutation generation — live writes committed mid-scan bumped it, so
+    //    this snapshot is stale: restart the scan from scratch (bounded by
+    //    MAX_RECONCILE_RESTARTS) instead of clobbering the live counters.
     const { generation: currentGeneration } = await currentReconcileGeneration(
       ctx,
       args.scope,
@@ -279,6 +338,41 @@ export const reconcileListCounts = internalMutation({
         superseded: true,
         processed: result.page.length,
         generation,
+      };
+    }
+    const finalMutationGeneration = await currentMutationGeneration(ctx, args.scope);
+    if (finalMutationGeneration !== mutationGeneration) {
+      if (restarts + 1 > MAX_RECONCILE_RESTARTS) {
+        throw new Error(
+          `reconcileListCounts for ${args.scope} restarted ${restarts} times because writes kept landing mid-scan; retry under lower write volume`,
+        );
+      }
+      const { state, generation: currentRun } = await currentReconcileGeneration(
+        ctx,
+        args.scope,
+      );
+      const nextGeneration = currentRun + 1;
+      if (state) {
+        await ctx.db.patch(state._id, { horizon: nextGeneration });
+      } else {
+        await ctx.db.insert("transitionState", {
+          key: reconcileStateKey(args.scope),
+          horizon: nextGeneration,
+        });
+      }
+      await ctx.scheduler.runAfter(0, anyApi.listCounts.reconcileListCounts, {
+        scope: args.scope,
+        generation: nextGeneration,
+        mutationGeneration: finalMutationGeneration,
+        restarts: restarts + 1,
+      });
+      return {
+        done: false,
+        restarted: true,
+        processed: result.page.length,
+        generation: nextGeneration,
+        mutationGeneration: finalMutationGeneration,
+        restarts: restarts + 1,
       };
     }
     const existing = (await ctx.db
