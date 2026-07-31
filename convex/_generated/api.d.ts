@@ -10,6 +10,8 @@
 
 import type * as brands from "../brands.js";
 import type * as cascades from "../cascades.js";
+import type * as catalogData from "../catalogData.js";
+import type * as catalogImport from "../catalogImport.js";
 import type * as categories from "../categories.js";
 import type * as crons from "../crons.js";
 import type * as customers from "../customers.js";
@@ -48,6 +50,8 @@ import type {
 declare const fullApi: ApiFromModules<{
   brands: typeof brands;
   cascades: typeof cascades;
+  catalogData: typeof catalogData;
+  catalogImport: typeof catalogImport;
   categories: typeof categories;
   crons: typeof crons;
   customers: typeof customers;
