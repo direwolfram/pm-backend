@@ -1,0 +1,35 @@
+name: Apply home-section bounded-read fix
+
+on:
+  push:
+    branches:
+      - direwolfram/fix-from-clickup
+    paths:
+      - scripts/apply-home-sections-fix.mjs
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: node scripts/apply-home-sections-fix.mjs
+      - run: npm install -g npm@latest
+      - run: npm ci --no-audit --no-fund
+      - run: npm test
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm run build
+      - name: Commit applied fix
+        run: |
+          git config user.name "direwolfram"
+          git config user.email "38549123+direwolfram@users.noreply.github.com"
+          git add convex/homeSections.ts tests/homeSections.readScaling.test.ts .github/workflows/apply-home-sections-fix.yml scripts/apply-home-sections-fix.mjs
+          git commit -m "fix: bound home-section catalog resolution"
+          git push
