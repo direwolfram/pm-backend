@@ -79,46 +79,12 @@ async function assertNoCategoryCycle(
 
 edit("convex/promotions.ts", (s) => {
   s = s.replace('import { now, paginate } from "./helpers";', 'import { now } from "./helpers";');
-  s = replace(s,
-`const CASCADE_BATCH_LIMIT = 100;`,
-`const CASCADE_BATCH_LIMIT = 100;
-const PROMOTION_PAGE_LIMIT = 100;
-const PROMOTION_OFFSET_LIMIT = 500;`, "promotion caps");
-  const oldList = `export const list = query({
-  args: {
-    kind: v.optional(promotionKind),
-    activeOnly: v.optional(v.boolean()),
-    limit: v.optional(v.number()),
-    offset: v.optional(v.number()),
-  },
-  handler: async (ctx, args) => {
-    let rows = (await ctx.db.query("promotions").collect()) as PromotionDoc[];
-    if (args.kind) rows = rows.filter((p) => p.kind === args.kind);
-    if (args.activeOnly) {
-      const t = Date.now();
-      rows = rows.filter(
-        (p) => p.is_active && p.starts_at <= t && p.ends_at > t,
-      );
-    }
-    const targets = (await ctx.db
-      .query("promotion_targets")
-      .collect()) as PromotionTargetDoc[];
-    const enriched = rows.map((p) => ({
-      ...p,
-      target_count: targets.filter((t) => t.promotion_id === p._id).length,
-      is_running: p.is_active && p.starts_at <= Date.now() && p.ends_at > Date.now(),
-    }));
-    enriched.sort((a, b) => b.starts_at - a.starts_at);
-    return paginate(enriched, args);
-  },
-});`;
+  s = replace(s, `const CASCADE_BATCH_LIMIT = 100;`, `const CASCADE_BATCH_LIMIT = 100;\nconst PROMOTION_PAGE_LIMIT = 100;\nconst PROMOTION_OFFSET_LIMIT = 500;`, "promotion caps");
+  const start = s.indexOf("export const list = query({");
+  const end = s.indexOf("\n\nexport const get = query({", start);
+  if (start < 0 || end < 0) throw new Error("Missing patch target: promotion list");
   const newList = `export const list = query({
-  args: {
-    kind: v.optional(promotionKind),
-    activeOnly: v.optional(v.boolean()),
-    limit: v.optional(v.number()),
-    offset: v.optional(v.number()),
-  },
+  args: { kind: v.optional(promotionKind), activeOnly: v.optional(v.boolean()), limit: v.optional(v.number()), offset: v.optional(v.number()) },
   handler: async (ctx, args) => {
     const limit = Math.min(Math.max(args.limit ?? 50, 1), PROMOTION_PAGE_LIMIT);
     const offset = Math.min(Math.max(args.offset ?? 0, 0), PROMOTION_OFFSET_LIMIT);
@@ -129,200 +95,87 @@ const PROMOTION_OFFSET_LIMIT = 500;`, "promotion caps");
         ? ctx.db.query("promotions").withIndex("by_active_starts", (q: any) => q.eq("is_active", true).lte("starts_at", t))
         : ctx.db.query("promotions").withIndex("by_active_starts");
     const candidates = (await queryBuilder.order("desc").take(offset + limit + 1)) as PromotionDoc[];
-    const filtered = args.activeOnly
-      ? candidates.filter((p) => p.is_active && p.starts_at <= t && p.ends_at > t)
-      : candidates;
+    const filtered = args.activeOnly ? candidates.filter((p) => p.is_active && p.starts_at <= t && p.ends_at > t) : candidates;
     const page = filtered.slice(offset, offset + limit);
     const data = await Promise.all(page.map(async (promotion) => {
-      const targets = await ctx.db
-        .query("promotion_targets")
-        .withIndex("by_promotion", (q: any) => q.eq("promotion_id", promotion._id))
-        .take(CASCADE_BATCH_LIMIT + 1);
+      const targets = await ctx.db.query("promotion_targets").withIndex("by_promotion", (q: any) => q.eq("promotion_id", promotion._id)).take(CASCADE_BATCH_LIMIT + 1);
       if (targets.length > CASCADE_BATCH_LIMIT) throw new Error("Promotion target count exceeds the supported bound");
-      return {
-        ...promotion,
-        target_count: targets.length,
-        is_running: promotion.is_active && promotion.starts_at <= t && promotion.ends_at > t,
-      };
+      return { ...promotion, target_count: targets.length, is_running: promotion.is_active && promotion.starts_at <= t && promotion.ends_at > t };
     }));
-    return {
-      data,
-      total: offset + filtered.length + (candidates.length > offset + limit ? 1 : 0),
-      limit,
-      offset,
-      hasMore: candidates.length > offset + limit,
-    };
+    return { data, total: offset + filtered.length + (candidates.length > offset + limit ? 1 : 0), limit, offset, hasMore: candidates.length > offset + limit };
   },
 });`;
-  s = replace(s, oldList, newList, "promotion list");
-  s = replace(s,
-`  handler: async (ctx, args) => {
-    validateWindow(args.starts_at, args.ends_at);`,
-`  handler: async (ctx, args) => {
-    if ((args.targets?.length ?? 0) > CASCADE_BATCH_LIMIT) throw new Error(\`A promotion can have at most \${CASCADE_BATCH_LIMIT} targets\`);
-    validateWindow(args.starts_at, args.ends_at);`, "promotion create cap");
+  s = s.slice(0, start) + newList + s.slice(end);
+  s = replace(s, `  handler: async (ctx, args) => {\n    validateWindow(args.starts_at, args.ends_at);`, `  handler: async (ctx, args) => {\n    if ((args.targets?.length ?? 0) > CASCADE_BATCH_LIMIT) throw new Error(\`A promotion can have at most \${CASCADE_BATCH_LIMIT} targets\`);\n    validateWindow(args.starts_at, args.ends_at);`, "promotion create cap");
   return s;
 });
 
 edit("convex/skus.ts", (s) => {
-  s = replace(s,
-`/** Keep exactly one default SKU per product. */
-async function unsetOtherDefaults`,
-`/** Invariant: every product with an active SKU has exactly one active default. */
-async function unsetOtherDefaults`, "SKU invariant doc");
-  s = replace(s,
-`}
-
-export const create = mutation({`,
-`}
+  s = replace(s, `/** Keep exactly one default SKU per product. */`, `/** Invariant: every product with an active SKU has exactly one active default. */`, "SKU invariant doc");
+  const marker = `\nexport const create = mutation({`;
+  const idx = s.indexOf(marker);
+  if (idx < 0) throw new Error("Missing patch target: SKU create marker");
+  const helper = `
 
 async function reconcileProductDefault(ctx: { db: any }, productId: string, preferredId?: string) {
-  const skus = (await ctx.db
-    .query("skus")
-    .withIndex("by_product", (q: any) => q.eq("product_id", productId))
-    .collect()) as SkuDoc[];
+  const skus = (await ctx.db.query("skus").withIndex("by_product", (q: any) => q.eq("product_id", productId)).collect()) as SkuDoc[];
   const active = skus.filter((sku) => sku.is_active && !sku.deleting_at);
   if (!active.length) {
     for (const sku of skus) if (sku.is_default) await ctx.db.patch(sku._id, { is_default: false });
     return;
   }
-  const preferred = active.find((sku) => sku._id === preferredId);
-  const current = preferred ?? active.find((sku) => sku.is_default) ?? active[0];
+  const current = active.find((sku) => sku._id === preferredId) ?? active.find((sku) => sku.is_default) ?? active[0];
   for (const sku of skus) {
     const shouldDefault = sku._id === current._id;
     if (sku.is_default !== shouldDefault) await ctx.db.patch(sku._id, { is_default: shouldDefault });
   }
-}
-
-export const create = mutation({`, "SKU reconcile helper");
-  s = replace(s,
-`    if (args.is_default) {
-      await unsetOtherDefaults(ctx, args.product_id, id as string);
-    }
-    await applyListCountChange`,
-`    await reconcileProductDefault(ctx, args.product_id, args.is_default && (args.is_active ?? true) ? id as string : undefined);
-    await applyListCountChange`, "SKU create invariant");
-  s = replace(s,
-`    if (patch.is_default) {
-      await unsetOtherDefaults(ctx, sku.product_id, id as string);
-    }
-    await recomputeProductListSummary(ctx, sku.product_id);`,
-`    const effectiveActive = patch.is_active ?? sku.is_active;
-    const preferredDestination = patch.is_default && effectiveActive ? id as string : undefined;
-    if (preferredDestination) await unsetOtherDefaults(ctx, nextProductId, id as string);
-    if (nextProductId !== sku.product_id) await reconcileProductDefault(ctx, sku.product_id);
-    await reconcileProductDefault(ctx, nextProductId, preferredDestination);
-    await recomputeProductListSummary(ctx, sku.product_id);`, "SKU move invariant");
-  s = replace(s,
-`    // ensure a remaining SKU becomes default if we deleted the default
-    if (sku.is_default) {
-      const remaining = (await ctx.db
-        .query("skus")
-        .withIndex("by_product", (q) => q.eq("product_id", sku.product_id))
-        .collect()) as SkuDoc[];
-      if (remaining.length > 0) {
-        await ctx.db.patch(remaining[0]._id as any, { is_default: true });
-      }
-    }
-    await recomputeProductListSummary`,
-`    await reconcileProductDefault(ctx, sku.product_id);
-    await recomputeProductListSummary`, "SKU delete invariant");
+}`;
+  s = s.slice(0, idx) + helper + s.slice(idx);
+  s = replace(s, `    if (args.is_default) {\n      await unsetOtherDefaults(ctx, args.product_id, id as string);\n    }`, `    await reconcileProductDefault(ctx, args.product_id, args.is_default && (args.is_active ?? true) ? id as string : undefined);`, "SKU create invariant");
+  s = replace(s, `    if (patch.is_default) {\n      await unsetOtherDefaults(ctx, sku.product_id, id as string);\n    }`, `    const effectiveActive = patch.is_active ?? sku.is_active;\n    const preferredDestination = patch.is_default && effectiveActive ? id as string : undefined;\n    if (preferredDestination) await unsetOtherDefaults(ctx, nextProductId, id as string);\n    if (nextProductId !== sku.product_id) await reconcileProductDefault(ctx, sku.product_id);\n    await reconcileProductDefault(ctx, nextProductId, preferredDestination);`, "SKU move invariant");
+  const deleteStart = s.indexOf("    // ensure a remaining SKU becomes default if we deleted the default");
+  const deleteEnd = s.indexOf("    await recomputeProductListSummary", deleteStart);
+  if (deleteStart < 0 || deleteEnd < 0) throw new Error("Missing patch target: SKU delete repair");
+  s = s.slice(0, deleteStart) + `    await reconcileProductDefault(ctx, sku.product_id);\n` + s.slice(deleteEnd);
   return s;
 });
 
 edit("convex/quickInventory.ts", (s) => {
-  s = replace(s,
-`const SHELF_LIFE_BATCH_LIMIT = 100;`,
-`const SHELF_LIFE_BATCH_LIMIT = 100;
-const RESERVATION_EXPIRY_BATCH_LIMIT = 100;
-const SKU_CENTER_RECONCILE_BATCH_LIMIT = 50;`, "inventory caps");
-  s = replace(s,
-`export const getInventoryBySkuAndCenter = query({`,
-`async function uniqueSkuCenterRow(ctx: { db: any }, sku: string, centerId: CenterId) {
-  const rows = (await ctx.db
-    .query("inventory")
-    .withIndex("by_sku_center", (q: any) => q.eq("sku", sku).eq("fulfillmentCenterId", centerId))
-    .take(2)) as QuickInventoryDoc[];
-  if (rows.length > 1) throw new Error(\`Duplicate inventory rows for SKU \${sku} and fulfillment center\`);
-  return rows[0] ?? null;
-}
-
-export const getInventoryBySkuAndCenter = query({`, "unique SKU-center helper");
-  const oldLookup = `    const rows = (await ctx.db
-      .query("inventory")
-      .withIndex("by_sku_center", (q) => q.eq("sku", args.sku))
-      .collect()) as QuickInventoryDoc[];
-    const row = rows.find(
-      (candidate) => candidate.fulfillmentCenterId === args.fulfillmentCenterId,
-    );`;
-  s = replace(s, oldLookup,
-`    const row = await uniqueSkuCenterRow(ctx, args.sku, args.fulfillmentCenterId);`, "exact SKU-center lookup");
-  const oldSub = `      const inventoryRows = (await ctx.db
-        .query("inventory")
-        .withIndex("by_sku_center", (q) => q.eq("sku", substituteSku))
-        .collect()) as QuickInventoryDoc[];
-      const inventory = inventoryRows.find(
-        (candidate) => candidate.fulfillmentCenterId === args.fulfillmentCenterId,
-      );`;
-  s = replace(s, oldSub,
-`      const inventory = await uniqueSkuCenterRow(ctx, substituteSku, args.fulfillmentCenterId);`, "substitute SKU-center lookup");
-  const oldExpire = `export const expireCartReservations = internalMutation({
-  args: {},
-  handler: async (ctx) => {
-    const t = now();
-    const expired = (await ctx.db
-      .query("cartReservations")
-      .withIndex("by_expiry", (q) => q.lt("expiresAt", t))
-      .collect()) as CartReservationDoc[];
-    let count = 0;
-    for (const reservation of expired) {
-      if (reservation.status !== "active") continue;
-      const row = requireQuickInventory(
-        (await ctx.db.get(reservation.inventoryId)) as QuickInventoryDoc | null,
-      );
-      await ctx.db.patch(reservation.inventoryId, {
-        ...quickInventoryPatch(
-          row.availableQuantity!,
-          Math.max(row.reservedQuantity! - reservation.quantity, 0),
-          row.replenishmentThreshold!,
-          row.isActive,
-        ),
-      });
-      await ctx.db.patch(reservation._id, { status: "expired" });
-      count += 1;
-    }
-    return { expired: count };
-  },
-});`;
-  const newExpire = `export const expireCartReservations = internalMutation({
+  s = replace(s, `const SHELF_LIFE_BATCH_LIMIT = 100;`, `const SHELF_LIFE_BATCH_LIMIT = 100;\nconst RESERVATION_EXPIRY_BATCH_LIMIT = 100;\nconst SKU_CENTER_RECONCILE_BATCH_LIMIT = 50;`, "inventory caps");
+  s = replace(s, `export const getInventoryBySkuAndCenter = query({`, `async function uniqueSkuCenterRow(ctx: { db: any }, sku: string, centerId: CenterId) {\n  const rows = (await ctx.db.query("inventory").withIndex("by_sku_center", (q: any) => q.eq("sku", sku).eq("fulfillmentCenterId", centerId)).take(2)) as QuickInventoryDoc[];\n  if (rows.length > 1) throw new Error(\`Duplicate inventory rows for SKU \${sku} and fulfillment center\`);\n  return rows[0] ?? null;\n}\n\nexport const getInventoryBySkuAndCenter = query({`, "unique SKU-center helper");
+  const lookupStart = s.indexOf(`    const rows = (await ctx.db\n      .query("inventory")\n      .withIndex("by_sku_center", (q) => q.eq("sku", args.sku))`);
+  const lookupEnd = s.indexOf(`    return row ? withComputed(row) : null;`, lookupStart);
+  if (lookupStart < 0 || lookupEnd < 0) throw new Error("Missing patch target: exact SKU-center lookup");
+  s = s.slice(0, lookupStart) + `    const row = await uniqueSkuCenterRow(ctx, args.sku, args.fulfillmentCenterId);\n` + s.slice(lookupEnd);
+  const subStart = s.indexOf(`      const inventoryRows = (await ctx.db`);
+  const subEnd = s.indexOf(`      if (!inventory || inventory.fulfillmentCenterId`, subStart);
+  if (subStart < 0 || subEnd < 0) throw new Error("Missing patch target: substitute lookup");
+  s = s.slice(0, subStart) + `      const inventory = await uniqueSkuCenterRow(ctx, substituteSku, args.fulfillmentCenterId);\n` + s.slice(subEnd);
+  const expireStart = s.indexOf("export const expireCartReservations = internalMutation({");
+  const expireEnd = s.indexOf("\n\n/**\n * Daily shelf-life refresh", expireStart);
+  if (expireStart < 0 || expireEnd < 0) throw new Error("Missing patch target: reservation expiry");
+  const expiry = `export const expireCartReservations = internalMutation({
   args: { evaluatedAt: v.optional(v.number()) },
   handler: async (ctx, args) => {
     const t = args.evaluatedAt ?? now();
-    const expired = (await ctx.db
-      .query("cartReservations")
-      .withIndex("by_status_expiry", (q) => q.eq("status", "active").lt("expiresAt", t))
-      .take(RESERVATION_EXPIRY_BATCH_LIMIT)) as CartReservationDoc[];
+    const expired = (await ctx.db.query("cartReservations").withIndex("by_status_expiry", (q) => q.eq("status", "active").lt("expiresAt", t)).take(RESERVATION_EXPIRY_BATCH_LIMIT)) as CartReservationDoc[];
     let count = 0;
     for (const reservation of expired) {
       const fresh = (await ctx.db.get(reservation._id)) as CartReservationDoc | null;
       if (!fresh || fresh.status !== "active") continue;
       const row = requireQuickInventory((await ctx.db.get(fresh.inventoryId)) as QuickInventoryDoc | null);
-      await ctx.db.patch(fresh.inventoryId, {
-        ...quickInventoryPatch(row.availableQuantity!, Math.max(row.reservedQuantity! - fresh.quantity, 0), row.replenishmentThreshold!, row.isActive),
-      });
+      await ctx.db.patch(fresh.inventoryId, { ...quickInventoryPatch(row.availableQuantity!, Math.max(row.reservedQuantity! - fresh.quantity, 0), row.replenishmentThreshold!, row.isActive) });
       await ctx.db.patch(fresh._id, { status: "expired" });
       count += 1;
     }
-    if (expired.length === RESERVATION_EXPIRY_BATCH_LIMIT) {
-      await ctx.scheduler.runAfter(0, anyApi.quickInventory.expireCartReservations, { evaluatedAt: t });
-    }
+    if (expired.length === RESERVATION_EXPIRY_BATCH_LIMIT) await ctx.scheduler.runAfter(0, anyApi.quickInventory.expireCartReservations, { evaluatedAt: t });
     return { expired: count, processed: expired.length, remainingMayExist: expired.length === RESERVATION_EXPIRY_BATCH_LIMIT };
   },
 });`;
-  s = replace(s, oldExpire, newExpire, "bounded reservation expiry");
+  s = s.slice(0, expireStart) + expiry + s.slice(expireEnd);
   s += `
 
-/** Bounded duplicate audit. Conflicting rows with references are reported, not deleted. */
+/** Bounded duplicate audit. Referenced conflicts are reported, not deleted. */
 export const reconcileSkuCenterDuplicates = internalMutation({
   args: { cursor: v.optional(v.string()) },
   handler: async (ctx, args) => {
@@ -332,7 +185,7 @@ export const reconcileSkuCenterDuplicates = internalMutation({
     const seen = new Set<string>();
     for (const row of result.page as QuickInventoryDoc[]) {
       if (!row.sku || !row.fulfillmentCenterId) continue;
-      const identity = \`${row.sku}:\${row.fulfillmentCenterId}\`;
+      const identity = \`\${row.sku}:\${row.fulfillmentCenterId}\`;
       if (seen.has(identity)) continue;
       seen.add(identity);
       const duplicates = (await ctx.db.query("inventory").withIndex("by_sku_center", (q: any) => q.eq("sku", row.sku!).eq("fulfillmentCenterId", row.fulfillmentCenterId!)).take(3)) as QuickInventoryDoc[];
@@ -350,12 +203,7 @@ export const reconcileSkuCenterDuplicates = internalMutation({
       if (blocked || duplicates.length > 2) { conflicts += 1; continue; }
       const keep = duplicates[0];
       const extraRow = duplicates[1];
-      await ctx.db.patch(keep._id, quickInventoryPatch(
-        (keep.availableQuantity ?? 0) + (extraRow.availableQuantity ?? 0),
-        (keep.reservedQuantity ?? 0) + (extraRow.reservedQuantity ?? 0),
-        Math.max(keep.replenishmentThreshold ?? 0, extraRow.replenishmentThreshold ?? 0),
-        keep.isActive !== false || extraRow.isActive !== false,
-      ));
+      await ctx.db.patch(keep._id, quickInventoryPatch((keep.availableQuantity ?? 0) + (extraRow.availableQuantity ?? 0), (keep.reservedQuantity ?? 0) + (extraRow.reservedQuantity ?? 0), Math.max(keep.replenishmentThreshold ?? 0, extraRow.replenishmentThreshold ?? 0), keep.isActive !== false || extraRow.isActive !== false));
       await ctx.db.delete(extraRow._id);
       repaired += 1;
     }
@@ -367,7 +215,6 @@ export const reconcileSkuCenterDuplicates = internalMutation({
   return s;
 });
 
-fs.writeFileSync("tests/pendingBackendFixes.test.ts", `import { readFileSync } from "node:fs";\nimport { describe, expect, it } from "vitest";\n\nconst read = (name: string) => readFileSync(new URL(\`../convex/\${name}\`, import.meta.url), "utf8");\n\ndescribe("pending backend invariant fixes", () => {\n  it("bounds and indexes promotion listing and target counts", () => {\n    const s = read("promotions.ts");\n    expect(s).toContain('withIndex("by_kind_starts"');\n    expect(s).toContain('withIndex("by_promotion"');\n    expect(s).not.toContain('query("promotion_targets")\\n      .collect()');\n  });\n  it("guards category ancestry with visited and depth bounds", () => {\n    const s = read("categories.ts");\n    expect(s).toContain("const visited = new Set<string>()");\n    expect(s).toContain("CATEGORY_ANCESTRY_DEPTH_LIMIT");\n  });\n  it("repairs source and destination default SKU invariants", () => {\n    const s = read("skus.ts");\n    expect(s).toContain("reconcileProductDefault(ctx, sku.product_id)");\n    expect(s).toContain("reconcileProductDefault(ctx, nextProductId");\n  });\n  it("fully constrains SKU-center lookups and audits duplicates", () => {\n    const s = read("quickInventory.ts");\n    expect(s).toContain('.eq("sku", sku).eq("fulfillmentCenterId", centerId)');\n    expect(s).toContain("reconcileSkuCenterDuplicates");\n  });\n  it("drains only active due reservations in bounded batches", () => {\n    const s = read("quickInventory.ts");\n    expect(s).toContain('withIndex("by_status_expiry"');\n    expect(s).toContain("RESERVATION_EXPIRY_BATCH_LIMIT");\n    expect(s).toContain("remainingMayExist");\n  });\n});\n`);
-
+fs.writeFileSync("tests/pendingBackendFixes.test.ts", `import { readFileSync } from "node:fs";\nimport { describe, expect, it } from "vitest";\nconst read = (name: string) => readFileSync(new URL(\`../convex/\${name}\`, import.meta.url), "utf8");\ndescribe("pending backend invariant fixes", () => {\n  it("bounds promotions", () => { const s = read("promotions.ts"); expect(s).toContain('withIndex("by_kind_starts"'); expect(s).not.toContain('query("promotion_targets")\\n      .collect()'); });\n  it("guards category ancestry", () => { const s = read("categories.ts"); expect(s).toContain("const visited = new Set<string>()"); expect(s).toContain("CATEGORY_ANCESTRY_DEPTH_LIMIT"); });\n  it("repairs default SKU invariants", () => { const s = read("skus.ts"); expect(s).toContain("reconcileProductDefault(ctx, sku.product_id)"); expect(s).toContain("reconcileProductDefault(ctx, nextProductId"); });\n  it("isolates SKU-center rows", () => { const s = read("quickInventory.ts"); expect(s).toContain('.eq("sku", sku).eq("fulfillmentCenterId", centerId)'); expect(s).toContain("reconcileSkuCenterDuplicates"); });\n  it("bounds reservation expiry", () => { const s = read("quickInventory.ts"); expect(s).toContain('withIndex("by_status_expiry"'); expect(s).toContain("RESERVATION_EXPIRY_BATCH_LIMIT"); });\n});\n`);
 fs.rmSync("scripts/apply-five-backend-fixes.mjs");
 fs.rmSync(".github/workflows/apply-five-backend-fixes.yml");
