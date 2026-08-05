@@ -1,10 +1,12 @@
 import { v } from "convex/values";
 import { anyApi } from "convex/server";
 import { query, mutation, internalMutation } from "./functions";
-import { now, paginate } from "./helpers";
+import { now } from "./helpers";
 import type { PromotionDoc, PromotionTargetDoc } from "./model";
 
 const CASCADE_BATCH_LIMIT = 100;
+const PROMOTION_PAGE_LIMIT = 100;
+const PROMOTION_OFFSET_LIMIT = 500;
 
 const promotionKind = v.union(
   v.literal("banner"),
@@ -19,31 +21,25 @@ const discountType = v.union(
 );
 
 export const list = query({
-  args: {
-    kind: v.optional(promotionKind),
-    activeOnly: v.optional(v.boolean()),
-    limit: v.optional(v.number()),
-    offset: v.optional(v.number()),
-  },
+  args: { kind: v.optional(promotionKind), activeOnly: v.optional(v.boolean()), limit: v.optional(v.number()), offset: v.optional(v.number()) },
   handler: async (ctx, args) => {
-    let rows = (await ctx.db.query("promotions").collect()) as PromotionDoc[];
-    if (args.kind) rows = rows.filter((p) => p.kind === args.kind);
-    if (args.activeOnly) {
-      const t = Date.now();
-      rows = rows.filter(
-        (p) => p.is_active && p.starts_at <= t && p.ends_at > t,
-      );
-    }
-    const targets = (await ctx.db
-      .query("promotion_targets")
-      .collect()) as PromotionTargetDoc[];
-    const enriched = rows.map((p) => ({
-      ...p,
-      target_count: targets.filter((t) => t.promotion_id === p._id).length,
-      is_running: p.is_active && p.starts_at <= Date.now() && p.ends_at > Date.now(),
+    const limit = Math.min(Math.max(args.limit ?? 50, 1), PROMOTION_PAGE_LIMIT);
+    const offset = Math.min(Math.max(args.offset ?? 0, 0), PROMOTION_OFFSET_LIMIT);
+    const t = Date.now();
+    const queryBuilder = args.kind
+      ? ctx.db.query("promotions").withIndex("by_kind_starts", (q: any) => q.eq("kind", args.kind!))
+      : args.activeOnly
+        ? ctx.db.query("promotions").withIndex("by_active_starts", (q: any) => q.eq("is_active", true).lte("starts_at", t))
+        : ctx.db.query("promotions").withIndex("by_active_starts");
+    const candidates = (await queryBuilder.order("desc").take(offset + limit + 1)) as PromotionDoc[];
+    const filtered = args.activeOnly ? candidates.filter((p) => p.is_active && p.starts_at <= t && p.ends_at > t) : candidates;
+    const page = filtered.slice(offset, offset + limit);
+    const data = await Promise.all(page.map(async (promotion) => {
+      const targets = await ctx.db.query("promotion_targets").withIndex("by_promotion", (q: any) => q.eq("promotion_id", promotion._id)).take(CASCADE_BATCH_LIMIT + 1);
+      if (targets.length > CASCADE_BATCH_LIMIT) throw new Error("Promotion target count exceeds the supported bound");
+      return { ...promotion, target_count: targets.length, is_running: promotion.is_active && promotion.starts_at <= t && promotion.ends_at > t };
     }));
-    enriched.sort((a, b) => b.starts_at - a.starts_at);
-    return paginate(enriched, args);
+    return { data, total: offset + filtered.length + (candidates.length > offset + limit ? 1 : 0), limit, offset, hasMore: candidates.length > offset + limit };
   },
 });
 
@@ -130,6 +126,7 @@ export const create = mutation({
     ),
   },
   handler: async (ctx, args) => {
+    if ((args.targets?.length ?? 0) > CASCADE_BATCH_LIMIT) throw new Error(`A promotion can have at most ${CASCADE_BATCH_LIMIT} targets`);
     validateWindow(args.starts_at, args.ends_at);
     if (args.coupon_code) await assertUniqueCoupon(ctx, args.coupon_code);
     const id = await ctx.db.insert("promotions", {

@@ -21,6 +21,8 @@ type QuickStatus = "in_stock" | "low_stock" | "out_of_stock" | "unavailable";
 
 const QUICK_INVENTORY_SUMMARY_VERSION = 1;
 const SHELF_LIFE_BATCH_LIMIT = 100;
+const RESERVATION_EXPIRY_BATCH_LIMIT = 100;
+const SKU_CENTER_RECONCILE_BATCH_LIMIT = 50;
 /**
  * Documented hard cap on batches per inventory item for summary
  * maintenance. Exceeding it throws rather than silently truncating.
@@ -491,19 +493,19 @@ export async function listByCenterHandler(
   });
 }
 
+async function uniqueSkuCenterRow(ctx: { db: any }, sku: string, centerId: CenterId) {
+  const rows = (await ctx.db.query("inventory").withIndex("by_sku_center", (q: any) => q.eq("sku", sku).eq("fulfillmentCenterId", centerId)).take(2)) as QuickInventoryDoc[];
+  if (rows.length > 1) throw new Error(`Duplicate inventory rows for SKU ${sku} and fulfillment center`);
+  return rows[0] ?? null;
+}
+
 export const getInventoryBySkuAndCenter = query({
   args: {
     sku: v.string(),
     fulfillmentCenterId: v.id("fulfillmentCenters"),
   },
   handler: async (ctx, args) => {
-    const rows = (await ctx.db
-      .query("inventory")
-      .withIndex("by_sku_center", (q) => q.eq("sku", args.sku))
-      .collect()) as QuickInventoryDoc[];
-    const row = rows.find(
-      (candidate) => candidate.fulfillmentCenterId === args.fulfillmentCenterId,
-    );
+    const row = await uniqueSkuCenterRow(ctx, args.sku, args.fulfillmentCenterId);
     return row ? withComputed(row) : null;
   },
 });
@@ -725,13 +727,7 @@ export const getSubstitutes = query({
         .withIndex("by_sku", (q) => q.eq("sku", substituteSku))
         .first()) as ProductDoc | null;
       if (!substituteProduct) continue;
-      const inventoryRows = (await ctx.db
-        .query("inventory")
-        .withIndex("by_sku_center", (q) => q.eq("sku", substituteSku))
-        .collect()) as QuickInventoryDoc[];
-      const inventory = inventoryRows.find(
-        (candidate) => candidate.fulfillmentCenterId === args.fulfillmentCenterId,
-      );
+      const inventory = await uniqueSkuCenterRow(ctx, substituteSku, args.fulfillmentCenterId);
       if (!inventory || inventory.fulfillmentCenterId !== args.fulfillmentCenterId) continue;
       const computed = withComputed(inventory);
       if (computed.sellableQuantity <= 0) continue;
@@ -1086,31 +1082,21 @@ export const replenishStock = mutation({
 });
 
 export const expireCartReservations = internalMutation({
-  args: {},
-  handler: async (ctx) => {
-    const t = now();
-    const expired = (await ctx.db
-      .query("cartReservations")
-      .withIndex("by_expiry", (q) => q.lt("expiresAt", t))
-      .collect()) as CartReservationDoc[];
+  args: { evaluatedAt: v.optional(v.number()) },
+  handler: async (ctx, args) => {
+    const t = args.evaluatedAt ?? now();
+    const expired = (await ctx.db.query("cartReservations").withIndex("by_status_expiry", (q) => q.eq("status", "active").lt("expiresAt", t)).take(RESERVATION_EXPIRY_BATCH_LIMIT)) as CartReservationDoc[];
     let count = 0;
     for (const reservation of expired) {
-      if (reservation.status !== "active") continue;
-      const row = requireQuickInventory(
-        (await ctx.db.get(reservation.inventoryId)) as QuickInventoryDoc | null,
-      );
-      await ctx.db.patch(reservation.inventoryId, {
-        ...quickInventoryPatch(
-          row.availableQuantity!,
-          Math.max(row.reservedQuantity! - reservation.quantity, 0),
-          row.replenishmentThreshold!,
-          row.isActive,
-        ),
-      });
-      await ctx.db.patch(reservation._id, { status: "expired" });
+      const fresh = (await ctx.db.get(reservation._id)) as CartReservationDoc | null;
+      if (!fresh || fresh.status !== "active") continue;
+      const row = requireQuickInventory((await ctx.db.get(fresh.inventoryId)) as QuickInventoryDoc | null);
+      await ctx.db.patch(fresh.inventoryId, { ...quickInventoryPatch(row.availableQuantity!, Math.max(row.reservedQuantity! - fresh.quantity, 0), row.replenishmentThreshold!, row.isActive) });
+      await ctx.db.patch(fresh._id, { status: "expired" });
       count += 1;
     }
-    return { expired: count };
+    if (expired.length === RESERVATION_EXPIRY_BATCH_LIMIT) await ctx.scheduler.runAfter(0, anyApi.quickInventory.expireCartReservations, { evaluatedAt: t });
+    return { expired: count, processed: expired.length, remainingMayExist: expired.length === RESERVATION_EXPIRY_BATCH_LIMIT };
   },
 });
 
@@ -1299,5 +1285,43 @@ export const backfillInventorySummaries = internalMutation({
       nextCursor: result.continueCursor,
       remainingMayExist: !result.isDone,
     };
+  },
+});
+
+
+/** Bounded duplicate audit. Referenced conflicts are reported, not deleted. */
+export const reconcileSkuCenterDuplicates = internalMutation({
+  args: { cursor: v.optional(v.string()) },
+  handler: async (ctx, args) => {
+    const result = await ctx.db.query("inventory").order("asc").paginate({ numItems: SKU_CENTER_RECONCILE_BATCH_LIMIT, cursor: args.cursor ?? null });
+    let repaired = 0;
+    let conflicts = 0;
+    const seen = new Set<string>();
+    for (const row of result.page as QuickInventoryDoc[]) {
+      if (!row.sku || !row.fulfillmentCenterId) continue;
+      const identity = `${row.sku}:${row.fulfillmentCenterId}`;
+      if (seen.has(identity)) continue;
+      seen.add(identity);
+      const duplicates = (await ctx.db.query("inventory").withIndex("by_sku_center", (q: any) => q.eq("sku", row.sku!).eq("fulfillmentCenterId", row.fulfillmentCenterId!)).take(3)) as QuickInventoryDoc[];
+      if (duplicates.length < 2) continue;
+      const extra = duplicates.slice(1);
+      let blocked = false;
+      for (const duplicate of extra) {
+        const [reservation, batch, pricing] = await Promise.all([
+          ctx.db.query("cartReservations").withIndex("by_inventory", (q: any) => q.eq("inventoryId", duplicate._id)).first(),
+          ctx.db.query("batches").withIndex("by_inventory_expiry", (q: any) => q.eq("inventoryId", duplicate._id)).first(),
+          ctx.db.query("inventoryPricing").withIndex("by_inventory", (q: any) => q.eq("inventoryId", duplicate._id)).first(),
+        ]);
+        if (reservation || batch || pricing) { blocked = true; break; }
+      }
+      if (blocked || duplicates.length > 2) { conflicts += 1; continue; }
+      const keep = duplicates[0];
+      const extraRow = duplicates[1];
+      await ctx.db.patch(keep._id, quickInventoryPatch((keep.availableQuantity ?? 0) + (extraRow.availableQuantity ?? 0), (keep.reservedQuantity ?? 0) + (extraRow.reservedQuantity ?? 0), Math.max(keep.replenishmentThreshold ?? 0, extraRow.replenishmentThreshold ?? 0), keep.isActive !== false || extraRow.isActive !== false));
+      await ctx.db.delete(extraRow._id);
+      repaired += 1;
+    }
+    if (!result.isDone) await ctx.scheduler.runAfter(0, anyApi.quickInventory.reconcileSkuCenterDuplicates, { cursor: result.continueCursor });
+    return { processed: result.page.length, repaired, conflicts, nextCursor: result.continueCursor, remainingMayExist: !result.isDone };
   },
 });

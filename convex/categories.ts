@@ -52,20 +52,26 @@ interface CategoryDbReader {
   get(id: string): Promise<CategoryDoc | null>;
 }
 
+const CATEGORY_ANCESTRY_DEPTH_LIMIT = 100;
+
 async function assertNoCategoryCycle(
   ctx: { db: CategoryDbReader },
   categoryId: string,
   parentId?: string,
 ) {
+  const visited = new Set<string>();
   let current = parentId;
+  let depth = 0;
   while (current) {
-    if (current === categoryId) {
-      throw new Error("Category parent would create a cycle");
-    }
+    if (current === categoryId) throw new Error("Category parent would create a cycle");
+    if (visited.has(current)) throw new Error("Category ancestry already contains a corrupt cycle");
+    if (depth >= CATEGORY_ANCESTRY_DEPTH_LIMIT) throw new Error("Category ancestry exceeds the 100-level safety limit");
+    visited.add(current);
     const parent = await ctx.db.get(current);
     if (!parent) throw new Error("Parent category not found");
     if (parent.deleting_at) throw new Error("Parent category is being deleted");
     current = parent.parent_id;
+    depth += 1;
   }
 }
 
