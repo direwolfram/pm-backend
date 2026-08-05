@@ -613,6 +613,7 @@ export default defineSchema({
   })
     .index("by_user", ["userId"])
     .index("by_expiry", ["expiresAt"])
+    .index("by_status_expiry", ["status", "expiresAt"])
     .index("by_inventory", ["inventoryId"]),
 
   inventoryPricing: defineTable({
@@ -667,6 +668,7 @@ export default defineSchema({
   })
     .index("by_coupon_code", ["coupon_code"])
     .index("by_kind", ["kind"])
+    .index("by_kind_starts", ["kind", "starts_at"])
     .index("by_active", ["is_active"])
     .index("by_active_starts", ["is_active", "starts_at"]),
 

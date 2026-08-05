@@ -127,7 +127,7 @@ async function assertUniqueSkuCode(
   }
 }
 
-/** Keep exactly one default SKU per product. */
+/** Invariant: every product with an active SKU has exactly one active default. */
 async function unsetOtherDefaults(
   ctx: { db: any },
   productId: string,
@@ -144,6 +144,20 @@ async function unsetOtherDefaults(
   }
 }
 
+
+async function reconcileProductDefault(ctx: { db: any }, productId: string, preferredId?: string) {
+  const skus = (await ctx.db.query("skus").withIndex("by_product", (q: any) => q.eq("product_id", productId)).collect()) as SkuDoc[];
+  const active = skus.filter((sku) => sku.is_active && !sku.deleting_at);
+  if (!active.length) {
+    for (const sku of skus) if (sku.is_default) await ctx.db.patch(sku._id, { is_default: false });
+    return;
+  }
+  const current = active.find((sku) => sku._id === preferredId) ?? active.find((sku) => sku.is_default) ?? active[0];
+  for (const sku of skus) {
+    const shouldDefault = sku._id === current._id;
+    if (sku.is_default !== shouldDefault) await ctx.db.patch(sku._id, { is_default: shouldDefault });
+  }
+}
 export const create = mutation({
   args: skuFields,
   handler: async (ctx, args) => {
@@ -169,9 +183,7 @@ export const create = mutation({
       is_default: args.is_default ?? false,
       is_active: args.is_active ?? true,
     });
-    if (args.is_default) {
-      await unsetOtherDefaults(ctx, args.product_id, id as string);
-    }
+    await reconcileProductDefault(ctx, args.product_id, args.is_default && (args.is_active ?? true) ? id as string : undefined);
     await applyListCountChange(ctx, "skus", skuCountKeys, null, {});
     await recomputeProductListSummary(ctx, args.product_id);
     return id;
@@ -251,9 +263,11 @@ export const update = mutation({
         storeInventorySummaryVersion: 1,
       });
     }
-    if (patch.is_default) {
-      await unsetOtherDefaults(ctx, sku.product_id, id as string);
-    }
+    const effectiveActive = patch.is_active ?? sku.is_active;
+    const preferredDestination = patch.is_default && effectiveActive ? id as string : undefined;
+    if (preferredDestination) await unsetOtherDefaults(ctx, nextProductId, id as string);
+    if (nextProductId !== sku.product_id) await reconcileProductDefault(ctx, sku.product_id);
+    await reconcileProductDefault(ctx, nextProductId, preferredDestination);
     await recomputeProductListSummary(ctx, sku.product_id);
     if (nextProductId !== sku.product_id) {
       await recomputeProductListSummary(ctx, nextProductId);
@@ -340,16 +354,7 @@ export const continueSkuDelete = internalMutation({
     }
     await ctx.db.delete(args.id);
     await applyListCountChange(ctx, "skus", skuCountKeys, {}, null);
-    // ensure a remaining SKU becomes default if we deleted the default
-    if (sku.is_default) {
-      const remaining = (await ctx.db
-        .query("skus")
-        .withIndex("by_product", (q) => q.eq("product_id", sku.product_id))
-        .collect()) as SkuDoc[];
-      if (remaining.length > 0) {
-        await ctx.db.patch(remaining[0]._id as any, { is_default: true });
-      }
-    }
+    await reconcileProductDefault(ctx, sku.product_id);
     await recomputeProductListSummary(ctx, sku.product_id);
     return { done: true, operations };
   },
