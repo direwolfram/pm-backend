@@ -10,6 +10,8 @@
 
 import type * as brands from "../brands.js";
 import type * as cascades from "../cascades.js";
+import type * as catalogData from "../catalogData.js";
+import type * as catalogImport from "../catalogImport.js";
 import type * as categories from "../categories.js";
 import type * as crons from "../crons.js";
 import type * as customers from "../customers.js";
@@ -30,6 +32,7 @@ import type * as listCounts from "../listCounts.js";
 import type * as model from "../model.js";
 import type * as orders from "../orders.js";
 import type * as prices from "../prices.js";
+import type * as productImageScrape from "../productImageScrape.js";
 import type * as products from "../products.js";
 import type * as promotions from "../promotions.js";
 import type * as quickInventory from "../quickInventory.js";
@@ -48,6 +51,8 @@ import type {
 declare const fullApi: ApiFromModules<{
   brands: typeof brands;
   cascades: typeof cascades;
+  catalogData: typeof catalogData;
+  catalogImport: typeof catalogImport;
   categories: typeof categories;
   crons: typeof crons;
   customers: typeof customers;
@@ -68,6 +73,7 @@ declare const fullApi: ApiFromModules<{
   model: typeof model;
   orders: typeof orders;
   prices: typeof prices;
+  productImageScrape: typeof productImageScrape;
   products: typeof products;
   promotions: typeof promotions;
   quickInventory: typeof quickInventory;

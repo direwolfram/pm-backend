@@ -266,6 +266,10 @@ async function pageProducts(
  * distinct id referenced by the page) and serves the stored list-summary
  * fields maintained by writers and products.backfillProductListSummaries.
  *
+ * Product media (one by_product index read per row, storage URLs resolved) is
+ * attached so product cards everywhere — not just the detail page — can show
+ * the showcase/feature image as their thumbnail.
+ *
  * Request-time legacy summary scans were removed deliberately: a list query
  * must never inspect thousands of SKUs, prices, or inventory rows for an
  * unsummarized product. Rows whose productListSummaryVersion is stale are
@@ -273,8 +277,36 @@ async function pageProducts(
  * `summariesPending` — the explicit migration-state signal telling callers a
  * backfill is still required. The query path performs no writes.
  */
-async function enrichProductPage(ctx: { db: any }, rows: ProductDoc[]) {
-  const [brands, categories] = await Promise.all([
+async function resolveMediaForPage(
+  ctx: { db: any; storage?: { getUrl(id: any): Promise<string | null> } },
+  rows: ProductDoc[],
+): Promise<Map<string, ProductMediaDoc[]>> {
+  const mediaByProduct = new Map<string, ProductMediaDoc[]>();
+  await Promise.all(
+    rows.map(async (product) => {
+      const media = (await ctx.db
+        .query("product_media")
+        .withIndex("by_product", (q: any) => q.eq("product_id", product._id))
+        .collect()) as ProductMediaDoc[];
+      media.sort((a, b) => a.sort_order - b.sort_order);
+      const resolved = await Promise.all(
+        media.map(async (item) => {
+          if (!item.storage_id || !ctx.storage) return item;
+          const url = await ctx.storage.getUrl(item.storage_id);
+          return url ? { ...item, url } : item;
+        }),
+      );
+      mediaByProduct.set(product._id as string, resolved);
+    }),
+  );
+  return mediaByProduct;
+}
+
+async function enrichProductPage(
+  ctx: { db: any; storage?: { getUrl(id: any): Promise<string | null> } },
+  rows: ProductDoc[],
+) {
+  const [brands, categories, mediaByProduct] = await Promise.all([
     Promise.all(
       Array.from(
         new Set(rows.map((product) => product.brand_id).filter(Boolean)),
@@ -289,11 +321,12 @@ async function enrichProductPage(ctx: { db: any }, rows: ProductDoc[]) {
           [id, (await ctx.db.get(id as any)) as { name?: string } | null] as const,
       ),
     ),
+    resolveMediaForPage(ctx, rows),
   ]);
   const brandName = new Map(brands);
   const catName = new Map(categories);
   let summariesPending = 0;
-  const data = rows.map((p): ProductListRow => {
+  const data = rows.map((p): ProductListRow & { media: ProductMediaDoc[] } => {
     if (p.productListSummaryVersion !== PRODUCT_LIST_SUMMARY_VERSION) {
       summariesPending += 1;
     }
@@ -306,13 +339,14 @@ async function enrichProductPage(ctx: { db: any }, rows: ProductDoc[]) {
       default_sku_id: p.default_sku_id,
       default_price: p.default_price,
       total_stock: p.total_stock ?? 0,
+      media: mediaByProduct.get(p._id as string) ?? [],
     };
   });
   return { data, summariesPending };
 }
 
 export async function listHandler(
-  ctx: { db: any },
+  ctx: { db: any; storage?: { getUrl(id: any): Promise<string | null> } },
   args: {
     search?: string;
     status?: ProductDoc["status"];
