@@ -583,6 +583,8 @@ function configString(config: unknown, key: string): string | undefined {
 }
 
 const SECTION_REFERENCE_LIMIT = 50;
+const HOME_SECTION_SOURCE_CAP = 512;
+const HOME_SECTION_PAGE_LIMIT = 100;
 
 function boundedRefs(ids: string[], label: string) {
   const uniqueIds = unique(ids);
@@ -764,45 +766,81 @@ function emptyResolvedData(): ResolvedSectionData {
   };
 }
 
+async function boundedSourceRows<T>(
+  table: string,
+  read: () => Promise<T[]>,
+): Promise<T[]> {
+  const rows = await read();
+  if (rows.length > HOME_SECTION_SOURCE_CAP) {
+    throw new Error(
+      `Home-section source ${table} exceeded the ${HOME_SECTION_SOURCE_CAP}-row bound; add narrower section references or an indexed resolver`,
+    );
+  }
+  return rows;
+}
+
 async function loadProducts(context: ResolutionContext): Promise<ProductDoc[]> {
   if (!context.required.has("products")) return [];
-  context.products ??= context.db.query("products").collect() as Promise<ProductDoc[]>;
+  context.products ??= boundedSourceRows("products", () =>
+    context.db
+      .query("products")
+      .withIndex("by_status", (q: any) => q.eq("status", "active"))
+      .take(HOME_SECTION_SOURCE_CAP + 1),
+  );
   return await context.products;
 }
 
 async function loadCategories(context: ResolutionContext): Promise<CategoryDoc[]> {
   if (!context.required.has("categories")) return [];
-  context.categories ??= context.db.query("categories").collect() as Promise<CategoryDoc[]>;
+  context.categories ??= boundedSourceRows("categories", () =>
+    context.db.query("categories").take(HOME_SECTION_SOURCE_CAP + 1),
+  );
   return await context.categories;
 }
 
 async function loadPromotions(context: ResolutionContext): Promise<PromotionDoc[]> {
   if (!context.required.has("promotions")) return [];
-  context.promotions ??= context.db.query("promotions").collect() as Promise<PromotionDoc[]>;
+  context.promotions ??= boundedSourceRows("promotions", () =>
+    context.db
+      .query("promotions")
+      .withIndex("by_active", (q: any) => q.eq("is_active", true))
+      .take(HOME_SECTION_SOURCE_CAP + 1),
+  );
   return await context.promotions;
 }
 
 async function loadStores(context: ResolutionContext): Promise<StoreDoc[]> {
   if (!context.required.has("stores")) return [];
-  context.stores ??= context.db.query("stores").collect() as Promise<StoreDoc[]>;
+  context.stores ??= boundedSourceRows("stores", () =>
+    context.db
+      .query("stores")
+      .withIndex("by_status", (q: any) => q.eq("status", "active"))
+      .take(HOME_SECTION_SOURCE_CAP + 1),
+  );
   return await context.stores;
 }
 
 async function loadSkus(context: ResolutionContext): Promise<SkuDoc[]> {
   if (!context.required.has("skus")) return [];
-  context.skus ??= context.db.query("skus").collect() as Promise<SkuDoc[]>;
+  context.skus ??= boundedSourceRows("skus", () =>
+    context.db.query("skus").take(HOME_SECTION_SOURCE_CAP + 1),
+  );
   return await context.skus;
 }
 
 async function loadPrices(context: ResolutionContext): Promise<PriceDoc[]> {
   if (!context.required.has("prices")) return [];
-  context.prices ??= context.db.query("prices").collect() as Promise<PriceDoc[]>;
+  context.prices ??= boundedSourceRows("prices", () =>
+    context.db.query("prices").take(HOME_SECTION_SOURCE_CAP + 1),
+  );
   return await context.prices;
 }
 
 async function loadInventory(context: ResolutionContext): Promise<InventoryDoc[]> {
   if (!context.required.has("inventory")) return [];
-  context.inventory ??= context.db.query("inventory").collect() as Promise<InventoryDoc[]>;
+  context.inventory ??= boundedSourceRows("inventory", () =>
+    context.db.query("inventory").take(HOME_SECTION_SOURCE_CAP + 1),
+  );
   return await context.inventory;
 }
 
@@ -1259,7 +1297,7 @@ export const tabLayouts = query({
 export const list = query({
   args: listArgs,
   handler: async (ctx, args) => {
-    const limit = Math.max(0, args.limit ?? 50);
+    const limit = Math.min(Math.max(0, args.limit ?? 50), HOME_SECTION_PAGE_LIMIT);
     const offset = Math.max(0, args.offset ?? 0);
     const allSections = ((await ctx.db.query("home_sections").collect()) as HomeSectionDoc[])
       .map(normalizeSection)
@@ -1297,9 +1335,14 @@ export const list = query({
     }
     sections = orderSectionsForDisplay(sections);
 
-    const resolutionContext = buildResolutionContext(ctx, sections, args);
+    // Page primary rows before catalog resolution. total intentionally counts
+    // visibility-qualified section rows; allowEmpty may remove a row from the
+    // returned page, but can no longer force resolution of the entire feed.
+    const total = sections.length;
+    const page = sections.slice(offset, offset + limit);
+    const resolutionContext = buildResolutionContext(ctx, page, args);
     const resolvedResponses = await Promise.all(
-      sections.map(async (section) => ({
+      page.map(async (section) => ({
         section,
         response: await responseForSection(resolutionContext, section, args),
       })),
@@ -1333,8 +1376,8 @@ export const list = query({
       })
       .map(({ response }) => response);
     return {
-      data: visibleResponses.slice(offset, offset + limit),
-      total: visibleResponses.length,
+      data: visibleResponses,
+      total,
       limit,
       offset,
     };
@@ -1369,7 +1412,7 @@ export const adminList = query({
     offset: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
-    const limit = Math.max(0, args.limit ?? 200);
+    const limit = Math.min(Math.max(0, args.limit ?? 100), HOME_SECTION_PAGE_LIMIT);
     const offset = Math.max(0, args.offset ?? 0);
     const current = Date.now();
     let rows = ((await ctx.db.query("home_sections").collect()) as HomeSectionDoc[])
