@@ -44,18 +44,11 @@ async function fetchById<T>(ctx: { db: DbReader }, ids: string[]) {
 }
 
 type CountScope = "products" | "skus" | "orders" | "customers" | "inventory" | "support_tickets";
-async function counterOrBoundedCount(
-  ctx: { db: any },
-  scope: CountScope,
-  key: string,
-  countRows: () => Promise<unknown[]>,
-) {
+async function counterOrBoundedCount(ctx: { db: any }, scope: CountScope, key: string, countRows: () => Promise<unknown[]>) {
   const maintained = await exactListTotal(ctx, scope, key);
   if (maintained !== undefined) return maintained;
   const rows = await countRows();
-  if (rows.length > DASHBOARD_SCAN_CAP) {
-    throw new Error(`Dashboard counters are missing for ${scope}/${key} and more than ${DASHBOARD_SCAN_CAP} rows match; run listCounts.reconcileListCounts for scope "${scope}"`);
-  }
+  if (rows.length > DASHBOARD_SCAN_CAP) throw new Error(`Dashboard counters are missing for ${scope}/${key} and more than ${DASHBOARD_SCAN_CAP} rows match; run listCounts.reconcileListCounts for scope "${scope}"`);
   return rows.length;
 }
 async function orderMetricsMigrationComplete(ctx: { db: any }) {
@@ -172,10 +165,36 @@ async function scheduleRestart(ctx: any, runGeneration: number, restarts: number
   await ctx.scheduler.runAfter(0, anyApi.dashboard.cleanupOrderMetricsStaging, { runGeneration, restart: true, restarts: restarts + 1 });
 }
 
+async function finalizeSmallOrderMetricsRun(ctx: any, runGeneration: number, mutationGeneration: number, restarts: number) {
+  const staged = await ctx.db.query("metricAggregates").withIndex("by_key", (q: any) => prefixRange(q, stageDailyPrefix(runGeneration))).take(ORDER_METRICS_FINALIZE_LIMIT + 1);
+  const live = await ctx.db.query("metricAggregates").withIndex("by_key", (q: any) => prefixRange(q, "orders:daily:")).take(ORDER_METRICS_FINALIZE_LIMIT + 1);
+  if (staged.length > ORDER_METRICS_FINALIZE_LIMIT || live.length > ORDER_METRICS_FINALIZE_LIMIT) return false;
+  if (!(await assertRunCurrent(ctx, runGeneration, mutationGeneration))) {
+    await scheduleRestart(ctx, runGeneration, restarts);
+    return false;
+  }
+  const lifetime = await ctx.db.query("metricAggregates").withIndex("by_key", (q: any) => q.eq("key", stageLifetimeKey(runGeneration))).first();
+  await setMetricRow(ctx, ORDER_METRICS_LIFETIME_KEY, undefined, lifetime?.count ?? 0, lifetime?.amount ?? 0);
+  const stagedDays = new Set<string>();
+  for (const row of staged as { day?: string; count: number; amount: number }[]) {
+    if (!row.day) continue;
+    stagedDays.add(row.day);
+    await setMetricRow(ctx, orderMetricsDailyKey(row.day), row.day, row.count, row.amount);
+  }
+  for (const row of live as { _id: string; day?: string }[]) if (row.day && !stagedDays.has(row.day)) await ctx.db.delete(row._id);
+  if (!(await assertRunCurrent(ctx, runGeneration, mutationGeneration))) {
+    await scheduleRestart(ctx, runGeneration, restarts);
+    return false;
+  }
+  const state = await stateRow(ctx);
+  await ctx.db.patch(state._id, { complete: true, cursor: null });
+  await ctx.scheduler.runAfter(0, anyApi.dashboard.cleanupOrderMetricsStaging, { runGeneration, restart: false, restarts });
+  return true;
+}
+
 /**
- * Bounded rebuild. Each scan invocation carries only cursor/generation data.
- * Per-day totals are persisted under a generation-specific staging prefix,
- * then promoted and stale live rows are reconciled in fixed-size pages.
+ * Bounded rebuild. Scheduler payloads carry only cursor and generation data.
+ * Per-day totals are persisted under a generation-specific staging prefix.
  */
 export const backfillOrderMetrics = internalMutation({
   args: {
@@ -191,7 +210,7 @@ export const backfillOrderMetrics = internalMutation({
     if (runGeneration === undefined && args.cursor !== undefined && state?.complete === false) runGeneration = state.horizon;
     if (runGeneration === undefined) {
       runGeneration = (state?.horizon ?? 0) + 1;
-      mutationGeneration = await currentOrderMetricsGeneration(ctx);
+      mutationGeneration ??= await currentOrderMetricsGeneration(ctx);
       if (state) await ctx.db.patch(state._id, { horizon: runGeneration, cursor: null, complete: false });
       else await ctx.db.insert("transitionState", { key: ORDER_METRICS_BACKFILL_STATE_KEY, horizon: runGeneration, cursor: null, complete: false });
       await ctx.db.insert("metricAggregates", { key: stageLifetimeKey(runGeneration), count: 0, amount: 0 });
@@ -227,6 +246,9 @@ export const backfillOrderMetrics = internalMutation({
     if (!(await assertRunCurrent(ctx, runGeneration, mutationGeneration))) {
       await scheduleRestart(ctx, runGeneration, restarts);
       return { done: false, restarted: true, processed: result.page.length, runGeneration, mutationGeneration, restarts: restarts + 1 };
+    }
+    if (await finalizeSmallOrderMetricsRun(ctx, runGeneration, mutationGeneration, restarts)) {
+      return { done: true, processed: result.page.length, runGeneration, mutationGeneration, restarts };
     }
     await ctx.scheduler.runAfter(0, anyApi.dashboard.finalizeOrderMetrics, { runGeneration, mutationGeneration, restarts, phase: "apply" });
     return { done: false, scanDone: true, processed: result.page.length, runGeneration, mutationGeneration, restarts };
