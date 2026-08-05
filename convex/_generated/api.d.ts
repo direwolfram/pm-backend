@@ -32,6 +32,7 @@ import type * as listCounts from "../listCounts.js";
 import type * as model from "../model.js";
 import type * as orders from "../orders.js";
 import type * as prices from "../prices.js";
+import type * as productImageScrape from "../productImageScrape.js";
 import type * as products from "../products.js";
 import type * as promotions from "../promotions.js";
 import type * as quickInventory from "../quickInventory.js";
@@ -72,6 +73,7 @@ declare const fullApi: ApiFromModules<{
   model: typeof model;
   orders: typeof orders;
   prices: typeof prices;
+  productImageScrape: typeof productImageScrape;
   products: typeof products;
   promotions: typeof promotions;
   quickInventory: typeof quickInventory;

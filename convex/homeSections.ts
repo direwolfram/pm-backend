@@ -10,6 +10,7 @@ import type {
   InventoryDoc,
   PriceDoc,
   ProductDoc,
+  ProductMediaDoc,
   PromotionDoc,
   SkuDoc,
   StoreDoc,
@@ -805,6 +806,38 @@ async function loadInventory(context: ResolutionContext): Promise<InventoryDoc[]
   return await context.inventory;
 }
 
+/**
+ * Product media is only resolved for the products a section actually returns
+ * (post maxItems slice, capped), so card thumbnails can use the showcase
+ * image without turning the home feed into an unbounded media scan.
+ */
+const SECTION_MEDIA_PRODUCT_LIMIT = 50;
+
+async function resolveMediaForProducts(
+  context: ResolutionContext,
+  productIds: string[],
+): Promise<Map<string, ProductMediaDoc[]>> {
+  const mediaByProduct = new Map<string, ProductMediaDoc[]>();
+  await Promise.all(
+    productIds.map(async (productId) => {
+      const rows = (await context.db
+        .query("product_media")
+        .withIndex("by_product", (q: any) => q.eq("product_id", productId))
+        .collect()) as ProductMediaDoc[];
+      rows.sort((a, b) => a.sort_order - b.sort_order);
+      const resolved = await Promise.all(
+        rows.map(async (item) => {
+          if (!item.storage_id || !context.storage) return item;
+          const url = await context.storage.getUrl(item.storage_id as any);
+          return url ? { ...item, url } : item;
+        }),
+      );
+      mediaByProduct.set(productId, resolved);
+    }),
+  );
+  return mediaByProduct;
+}
+
 async function resolveSection(
   context: ResolutionContext,
   section: HomeSectionDoc,
@@ -890,6 +923,17 @@ async function resolveSection(
       );
       return { ...product, skus: productSkus, skuCount: productSkus.length, sku_count: productSkus.length };
     });
+  }
+
+  if (requiredForSection.has("products") && resolvedProducts.length) {
+    const mediaByProduct = await resolveMediaForProducts(
+      context,
+      resolvedProducts.slice(0, SECTION_MEDIA_PRODUCT_LIMIT).map((product) => product._id as string),
+    );
+    resolvedProducts = resolvedProducts.map((product) => ({
+      ...product,
+      media: mediaByProduct.get(product._id as string) ?? [],
+    }));
   }
 
   const resolvedCategories = requiredForSection.has("categories")
