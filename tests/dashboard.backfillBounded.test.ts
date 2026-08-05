@@ -51,7 +51,10 @@ describe("bounded dashboard order-metric reconciliation", () => {
     const t = convexTest({ schema, modules });
     await seed(t, 514);
     await t.run(async (ctx) => {
-      for (let n = 0; n < 513; n++) await ctx.db.insert("metricAggregates", { key: orderMetricsDailyKey(`1900-${String(Math.floor(n / 28) + 1).padStart(2, "0")}-${String((n % 28) + 1).padStart(2, "0")}`), day: `1900-${String(Math.floor(n / 28) + 1).padStart(2, "0")}-${String((n % 28) + 1).padStart(2, "0")}`, count: 9, amount: 9 });
+      for (let n = 0; n < 513; n++) {
+        const day = `1900-${String(Math.floor(n / 28) + 1).padStart(2, "0")}-${String((n % 28) + 1).padStart(2, "0")}`;
+        await ctx.db.insert("metricAggregates", { key: orderMetricsDailyKey(day), day, count: 9, amount: 9 });
+      }
     });
     const first = await t.mutation(internal.dashboard.backfillOrderMetrics, {});
     const duplicate = await t.mutation(internal.dashboard.backfillOrderMetrics, { runGeneration: first.runGeneration, mutationGeneration: first.mutationGeneration, restarts: 0 });
@@ -59,5 +62,24 @@ describe("bounded dashboard order-metric reconciliation", () => {
     await t.finishAllScheduledFunctions(vi.runAllTimers);
     const stale = await t.run(async (ctx) => ctx.db.query("metricAggregates").withIndex("by_key", (q) => q.eq("key", orderMetricsDailyKey("1900-01-01"))).first());
     expect(stale).toBeNull();
+  });
+
+  it("preserves a supplied generation and rejects after the restart limit", async () => {
+    const t = convexTest({ schema, modules });
+    const ids = await seed(t, 0);
+    await t.mutation(api.orders.create, {
+      order_number: "LIVE-1",
+      customer_id: ids.customerId,
+      store_id: ids.storeId,
+      address_id: ids.addressId,
+      delivery_mode: "express",
+      subtotal_amount: 1,
+      total_amount: 1,
+      placed_at: DAY,
+    });
+    await expect(t.mutation(internal.dashboard.backfillOrderMetrics, {
+      mutationGeneration: 0,
+      restarts: 5,
+    })).rejects.toThrow(/restarted 5 times/);
   });
 });
